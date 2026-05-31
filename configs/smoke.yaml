@@ -26,10 +26,11 @@ train:
   seed: 1337
   bf16: true
   activation_checkpointing: false
-  batch_size: 16
-  num_workers: 4
+  batch_size: 128
+  num_workers: 16
   prefetch_factor: 2
   persistent_workers: true
+  max_train_samples: 1000000 # full-run sample cap; smoke normally reaches max_train_flops first
   max_train_flops: 5000000000000000 # 5.0e15 — short enough to finish in a few minutes
   log_every: 5
   # Smoke leaves no persistent checkpoints; final probes still use a temporary checkpoint.

@@ -27,14 +27,13 @@ Experiment and benchmark discipline:
 - An improvement should only actually be considered an improvement mean_probe_score improves over .01, anything less is within random variance.
 - Use wandb for logging, plotting, and utilization monitoring throughout pretraining. Log all metrics needed to validate training behavior (i.e., gradient norm).
 - Aim for >80% GPU utilization during GPU runs; investigate and remedy code when utilization is poor.
-- After any completed full run or frozen baseline evaluation worth sharing, run `./labless/submit_to_labless.py output_dir=... contributor=... run_name=... notes=...`; full submissions require `summary.json`, `metrics.jsonl`, and `summary.max_train_flops == 1e18`. Keep smoke checks and failed runs local.
-- Do not submit runs whose W&B source artifact changes `probe.py` or `benchmarking/`; labless marks locked-path changes invalid.
+- After any completed full run or frozen baseline evaluation worth sharing, run `./labless/submit_to_labless.py output_dir=... run_name=... notes=...`; the submitter signs in through GitHub's no-scope device flow, labless records the verified GitHub login, and each login can submit at most 10 runs per 24 hours. Full submissions require `summary.json`, `metrics.jsonl`, `summary.max_train_samples == 1000000`, `summary.tile_presentations <= 1000000`, and `summary.max_train_flops == 1e18`. Keep smoke checks and failed runs local.
+- Do not submit runs whose saved `labless_source` snapshot changes `probe.py` or `benchmarking/`; labless marks locked-path changes invalid.
 
 Cluster and storage:
 - The login node has no GPU access, and has a different /tmp folder than the compute nodes. For full training runs (or anything that would take more than a few minutes) you should submit SLURM jobs to H100 nodes (`n-#`) or CPU nodes (`c-1`). If it's a quick single-GPU assessment you can use `ssh n-#` directly (but only when an idle GPU is available!).
 - Store large files, checkpoints, embeddings, caches, and pretrained models under `/data/$USER/nanopath` (configs use literal `$USER`, expanded by `train.py` at load time), not the repo.
 - Fresh launches should overwrite any existing `project.output_dir` unless `train.resume` is set.
-- Do not define `#SBATCH --cpus-per-task` in sbatch scripts and do not add unnecessary lines like `OMP_NUM_THREADS` or `MKL_NUM_THREADS` exports.
 
 Workflow:
 - Do not stop after the first small fix on a difficult ask. Continue through the adjacent tasks needed to make the change credible, such as config updates, probes, throughput checks, README notes, or cleanup.

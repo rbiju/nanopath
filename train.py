@@ -3,8 +3,8 @@
 # iBOT masked-patch self-distillation, and a KDE uniformity term on the
 # L2-normalised CLS tokens. YAML drives the tunable knobs (backbone variant,
 # LR + LR scheduler, drop path, layerwise decay, KDE weight + concentration,
-# FLOP budget, batch size); other DINOv2 hyperparameters are hardcoded inline
-# at their use sites.
+# FLOP/sample budgets, batch size); other DINOv2 hyperparameters are hardcoded
+# inline at their use sites.
 
 import contextlib
 import fnmatch
@@ -13,7 +13,7 @@ import math
 import os
 import random
 import shutil
-import signal
+import subprocess
 import sys
 import time
 from copy import deepcopy
@@ -115,7 +115,10 @@ def make_masks(batch, patches, device):
 # final weight-norm last_layer parameters get an LR-freeze for the first dino.freeze_last_layer_fraction.
 def build_param_groups(student_backbone, student_dino_head, student_ibot_head, layerwise_decay, patch_embed_lr_mult):
     depth = len(student_backbone.blocks)
-    groups = []
+    # Coalesce params that share (lr_mult, wd_mult, last_layer) into a single group each (~30 groups
+    # instead of one-per-param), so AdamW's foreach path fuses the step across many tensors rather than
+    # launching per-parameter kernels. Per-param lr/wd are unchanged, so the optimization is numerically identical.
+    coalesced = {}
     modules = ((student_backbone, "backbone"), (student_dino_head, "dino_head"), (student_ibot_head, "ibot_head"))
     for module, kind in modules:
         for name, p in module.named_parameters():
@@ -127,14 +130,18 @@ def build_param_groups(student_backbone, student_dino_head, student_ibot_head, l
             elif kind == "backbone" and name.startswith("patch_embed."):
                 lr_mult = (layerwise_decay ** depth) * patch_embed_lr_mult
             wd_mult = 0.0 if name.endswith("bias") or "norm" in name or p.ndim < 2 else 1.0
-            groups.append({"params": [p], "lr_mult": lr_mult, "wd_mult": wd_mult, "last_layer": "last_layer" in name})
-    return groups
+            key = (lr_mult, wd_mult, "last_layer" in name)
+            coalesced.setdefault(key, {"params": [], "lr_mult": lr_mult, "wd_mult": wd_mult, "last_layer": key[2]})["params"].append(p)
+    return list(coalesced.values())
 
 
 # EMA-update teacher modules from student modules with a single multiplicative decay.
+# Params are fused into two _foreach kernels (mul then add) instead of a Python per-tensor loop;
+# numerically identical (pt = pt*m + ps*(1-m) per tensor). Called under torch.no_grad() by the caller.
 def update_ema(student_module, teacher_module, momentum):
-    for ps, pt in zip(student_module.parameters(), teacher_module.parameters()):
-        pt.mul_(momentum).add_(ps.detach(), alpha=1 - momentum)
+    teacher_params, student_params = list(teacher_module.parameters()), list(student_module.parameters())
+    torch._foreach_mul_(teacher_params, momentum)
+    torch._foreach_add_(teacher_params, student_params, alpha=1 - momentum)
     for bs, bt in zip(student_module.buffers(), teacher_module.buffers()):
         bt.copy_(bs)
 
@@ -146,16 +153,7 @@ def main():
     dino_cfg = cfg["dino"]
     save_every = train_cfg["save_every"]
     save_checkpoints = save_every is not None
-    # `stop_requested` flips True when SLURM signals SIGUSR1 (wallclock approaching) or when
-    # train_flops crosses max_train_flops; both paths exit the loop and run final save + probes.
-    stop_requested = False
-
-    def request_stop(signum, frame):
-        nonlocal stop_requested
-        stop_requested = True
-
     device = torch.device("cuda")
-    signal.signal(signal.SIGUSR1, request_stop)
     random.seed(train_cfg["seed"])
     np.random.seed(train_cfg["seed"])
     torch.manual_seed(train_cfg["seed"])
@@ -180,6 +178,7 @@ def main():
     opt = torch.optim.AdamW(build_param_groups(student_backbone, student_dino_head, student_ibot_head, dino_cfg["layerwise_decay"], dino_cfg["patch_embed_lr_mult"]), lr=1.0, betas=(0.9, 0.999))
     step = 0
     batch_size = int(train_cfg["batch_size"])
+    max_train_samples = int(train_cfg["max_train_samples"])
     examples_seen = 0
     visible_patch_presentations = 0
     train_flops = 0
@@ -230,21 +229,27 @@ def main():
         wandb_run.define_metric(key, hidden=True, overwrite=True)
     print(
         f"{console_prefix()} Run  start: {cfg['project']['name']}  "
-        f"config: {cfg['config_path']}  batch_size: {batch_size}  max_train_flops: {train_cfg['max_train_flops']}  "
+        f"config: {cfg['config_path']}  batch_size: {batch_size}  max_train_samples: {max_train_samples}  "
+        f"max_train_flops: {train_cfg['max_train_flops']}  "
         f"probe_count: {cfg['probe']['count']}  warmup_flop_fraction: {dino_cfg['warmup_flop_fraction']}  "
         f"lr: {dino_cfg['lr']}  kde_loss_weight: {dino_cfg['kde_loss_weight']}  "
         f"kde_concentration: {dino_cfg['kde_concentration']}  drop_path: {dino_cfg['drop_path_rate']}  "
         f"layerwise_decay: {dino_cfg['layerwise_decay']}",
         flush=True,
     )
-    source_artifact = wandb.Artifact(f"nanopath-source-{wandb_run.id}", type="code")
     repo_dir = Path(__file__).resolve().parent
+    git_commit = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=repo_dir, text=True).strip()
+    git_remote = subprocess.run(["git", "config", "--get", "remote.origin.url"], cwd=repo_dir, text=True, capture_output=True, check=False).stdout.strip()
+    source_id = f"nanopath-source-{wandb_run.id}"
     artifact_ignore = [
         line.strip() for line in (repo_dir / ".gitignore").read_text().splitlines()
         if line.strip() and not line.startswith("#")
     ] + [".git/", "baselines/", "slurm/"]
+    ignored_roots = [output_dir.resolve(), wandb_dir.resolve()]
 
     def artifact_ignored(path):
+        if any(path.resolve().is_relative_to(root) for root in ignored_roots):
+            return True
         rel, name = path.relative_to(repo_dir).as_posix(), path.name
         for pat in artifact_ignore:
             pat = pat.rstrip("/") if pat.endswith("/") else pat
@@ -252,20 +257,31 @@ def main():
                 return True
         return False
 
+    source_files = []
     for root, dirs, files in os.walk(repo_dir):
         dirs[:] = sorted(d for d in dirs if not artifact_ignored(Path(root) / d))
         for name in sorted(files):
             path = Path(root) / name
             if artifact_ignored(path):
                 continue
-            source_artifact.add_file(str(path), name=str(path.relative_to(repo_dir)))
-    wandb_run.log_artifact(source_artifact)
-    wandb_meta = {"entity": wandb_run.entity, "project": "nanopath", "id": wandb_run.id, "name": cfg["project"]["name"], "url": wandb_run.url}
+            rel = path.relative_to(repo_dir)
+            source_files.append((path, rel))
+    source_snapshot_dir = output_dir / "labless_source"
+    if source_snapshot_dir.exists():
+        shutil.rmtree(source_snapshot_dir)
+    for path, rel in source_files:
+        target = source_snapshot_dir / rel
+        target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(path, target)
+    wandb_meta = {"entity": wandb_run.entity, "project": "nanopath", "id": wandb_run.id, "name": cfg["project"]["name"], "url": wandb_run.url,
+                  "mode": getattr(wandb_run.settings, "mode", ""), "source_artifact": source_id,
+                  "source_dir": str(source_snapshot_dir), "git": {"commit": git_commit, "remote": git_remote}}
     train_ds = TCGATileDataset(cfg, is_train=True)
     val_ds = TCGATileDataset(cfg, is_train=False)
     probe_state = prepare_probe_state(cfg, output_dir) if probe_enabled(cfg) else None
 
-    # Train shuffles + drops last partial batch. Val is sequential and `drop_last=True`.
+    # Train shuffles + drops partials; the loop never starts a batch that would exceed
+    # max_train_samples, so every optimizer step keeps the configured batch size.
     loader_kwargs = dict(batch_size=batch_size, drop_last=True, num_workers=train_cfg["num_workers"], pin_memory=True,
                          prefetch_factor=train_cfg["prefetch_factor"] if train_cfg["num_workers"] > 0 else None,
                          persistent_workers=train_cfg["persistent_workers"] and train_cfg["num_workers"] > 0)
@@ -371,20 +387,20 @@ def main():
         if probe_state is not None:
             collect_probe_results(probe_state, wandb_run, metrics_path)
 
-    # Queue a probe at `checkpoint_step` for the given FLOP target; no-op if already done.
-    def run_probe_at(checkpoint_step, target_flops):
+    # Queue a probe at `checkpoint_step` for the given sample target; no-op if already done.
+    def run_probe_at(checkpoint_step, target_samples):
         if probe_state is None or (probe_state["paths"]["results_dir"] / f"step_{checkpoint_step:07d}.json").exists():
             log_probe_results()
             return
-        queue_probe_job(probe_state, checkpoint_payload(checkpoint_step, full=False), checkpoint_step, target_flops, min(1.0, target_flops / max_train_flops))
+        queue_probe_job(probe_state, checkpoint_payload(checkpoint_step, full=False), checkpoint_step, train_flops, min(1.0, target_samples / max_train_samples))
         log_probe_results()
 
-    # Queue the furthest crossed FLOP milestone so delayed probes do not run on stale checkpoints.
+    # Queue the furthest crossed sample milestone so delayed probes do not run on stale checkpoints.
     def maybe_run_probe(checkpoint_step):
         nonlocal next_probe_idx
-        if probe_state is None or next_probe_idx >= len(probe_targets) or train_flops < probe_targets[next_probe_idx]:
+        if probe_state is None or next_probe_idx >= len(probe_targets) or examples_seen < probe_targets[next_probe_idx]:
             return
-        while next_probe_idx + 1 < len(probe_targets) and train_flops >= probe_targets[next_probe_idx + 1]:
+        while next_probe_idx + 1 < len(probe_targets) and examples_seen >= probe_targets[next_probe_idx + 1]:
             next_probe_idx += 1
         run_probe_at(checkpoint_step, probe_targets[next_probe_idx])
         next_probe_idx += 1
@@ -392,19 +408,17 @@ def main():
     log_probe_results()
     max_train_flops = int(train_cfg["max_train_flops"])
     warmup_train_flops = math.ceil(max_train_flops * dino_cfg["warmup_flop_fraction"])
-    # Probe targets are FLOP milestones, not step milestones, so comparisons survive batch-size changes.
+    # Probe targets are sample milestones: one tile counts once even with many global/local crops.
     probe_count = int(cfg["probe"]["count"]) if probe_enabled(cfg) else 0
-    probe_targets = [math.ceil(max_train_flops * (i + 1) / probe_count) for i in range(probe_count)]
+    probe_targets = [math.ceil(max_train_samples * (i + 1) / probe_count) for i in range(probe_count)]
     if len(set(probe_targets)) != len(probe_targets):
-        raise ValueError(f"probe.count={probe_count} is too large for max_train_flops={max_train_flops}")
+        raise ValueError(f"probe.count={probe_count} is too large for max_train_samples={max_train_samples}")
     next_probe_idx = 0
     if probe_state is not None:
-        completed = [int(json.loads(p.read_text()).get("target_flops", -1)) for p in probe_state["paths"]["results_dir"].glob("step_*.json")]
+        completed = [round(float(json.loads(p.read_text()).get("target_fraction", -1)) * max_train_samples) for p in probe_state["paths"]["results_dir"].glob("step_*.json")]
         if completed:
             next_probe_idx = sum(target <= max(completed) for target in probe_targets)
     train_loop_started_at = time.monotonic()
-    if train_flops >= max_train_flops:
-        stop_requested = True
     last_saved_step = step
     last_console_step = step
     last_console_monotonic = time.monotonic()
@@ -416,9 +430,9 @@ def main():
     # 1e18 leaderboard cap reflects real GPU work.
     measured_flops_per_step = None
 
-    while not stop_requested:
+    while examples_seen + batch_size <= max_train_samples and train_flops < max_train_flops:
         for batch in train_loader:
-            if stop_requested:
+            if examples_seen + batch_size > max_train_samples or train_flops >= max_train_flops:
                 break
             batch_started_at = time.monotonic()
             data_seconds = batch_started_at - data_wait_started_at
@@ -505,7 +519,9 @@ def main():
                 console_now = time.monotonic()
                 console_gap_ms = 1000.0 * (console_now - last_console_monotonic)
                 steps_since_console = max(1, completed_step - last_console_step)
-                steps_remaining = max(0, math.ceil((max_train_flops - train_flops) / max(1, step_train_flops)))
+                flop_steps_remaining = math.ceil(max(0, max_train_flops - train_flops) / max(1, step_train_flops))
+                sample_steps_remaining = max(0, max_train_samples - examples_seen) // batch_size
+                steps_remaining = min(flop_steps_remaining, sample_steps_remaining)
                 total_steps_estimate = completed_step + steps_remaining
                 eta_seconds = int(max(0.0, steps_remaining * console_gap_ms / 1000.0 / steps_since_console))
                 eta_string = f"{eta_seconds // 3600}:{(eta_seconds % 3600) // 60:02d}:{eta_seconds % 60:02d}"
@@ -522,6 +538,7 @@ def main():
                     "console_gap_ms": console_gap_ms,
                     "eta_seconds": eta_seconds,
                     "flop_fraction": min(1.0, float(train_flops) / float(max_train_flops)),
+                    "sample_fraction": min(1.0, float(examples_seen) / float(max_train_samples)),
                     "lr": current_lr,
                     "wd": wd,
                     "teacher_temp": teacher_temp,
@@ -560,10 +577,10 @@ def main():
                 # Atomic rename keeps the previous good latest.pt intact if a
                 # kill lands mid-save.
                 save_latest_checkpoint(completed_step)
-            # Probe at intermediate FLOP milestones (probe.count > 1); the final probe
+            # Probe at intermediate sample milestones (probe.count > 1); the final probe
             # always runs after the loop exits, regardless of milestones.
             maybe_run_probe(completed_step)
-            if completed_step % int(train_cfg["eval_every"]) == 0 or train_flops >= max_train_flops:
+            if completed_step % int(train_cfg["eval_every"]) == 0 or train_flops >= max_train_flops or examples_seen + batch_size > max_train_samples:
                 val = evaluate(completed_step, teacher_temp, kde_scale)
                 val_log = {"step": completed_step, **{f"val_{k}": v for k, v in val.items()}}
                 with metrics_path.open("a") as handle:
@@ -572,12 +589,10 @@ def main():
                 print(f"{console_prefix()} Validation  [{completed_step}]  total: {val['total']:.4f}  dino: {val['dino']:.4f}  ibot: {val['ibot']:.4f}  kde: {val['kde']:.4f}", flush=True)
             step = completed_step
             data_wait_started_at = time.monotonic()
-            if train_flops >= max_train_flops:
-                stop_requested = True
-            if stop_requested:
+            if train_flops >= max_train_flops or examples_seen + batch_size > max_train_samples:
                 break
     train_loop_wall_seconds = time.monotonic() - train_loop_started_at
-    stop_reason = "max_train_flops" if train_flops >= max_train_flops else "wallclock"
+    stop_reason = "max_train_flops" if train_flops >= max_train_flops else "max_train_samples"
     final_unique_counts = flush_unique_counts()
     if step > 0:
         # Final probes have their own readers; close pretraining workers before they compete for CPU/IO.
@@ -589,7 +604,7 @@ def main():
         # at end-of-run when periodic saving is on (save_every set) so smoke runs leave nothing.
         if save_checkpoints and step != last_saved_step:
             save_latest_checkpoint(step)
-        run_probe_at(step, train_flops)
+        run_probe_at(step, examples_seen)
     log_probe_results()
     # Summary is the small, stable artifact downstream scripts and humans compare across runs.
     summary = {
@@ -601,6 +616,7 @@ def main():
         "slurm_job_id": slurm_job_id,
         "backbone_activated_params": backbone_activated_params,
         "batch_size": batch_size,
+        "max_train_samples": max_train_samples,
         "max_train_flops": max_train_flops,
         "train_loop_wall_seconds": train_loop_wall_seconds,
         "stop_reason": stop_reason,
@@ -610,8 +626,8 @@ def main():
         **final_unique_counts,
         "train_flops": train_flops,
         "flop_fraction": min(1.0, float(train_flops) / float(max_train_flops)),
-        # Average throughput over the whole train loop; useful for spotting submissions that
-        # left the FLOP budget unspent (low flops/sec from a wallclock stop with slack).
+        "sample_fraction": min(1.0, float(examples_seen) / float(max_train_samples)),
+        # Average throughput over the train loop; wall time is diagnostic, not an eligibility cap.
         "flops_per_sec": train_flops / max(1.0, train_loop_wall_seconds),
         "visible_patches_per_sec": visible_patch_presentations / max(1.0, train_loop_wall_seconds),
         "warmup_flop_fraction": dino_cfg["warmup_flop_fraction"],
@@ -621,8 +637,8 @@ def main():
         "kde_concentration": dino_cfg["kde_concentration"],
         "drop_path_rate": dino_cfg["drop_path_rate"],
         "layerwise_decay": dino_cfg["layerwise_decay"],
-        "probe_target_flops": probe_targets,
-        "probe_target_fractions": [None if max_train_flops == 0 else target / max_train_flops for target in probe_targets],
+        "probe_target_samples": probe_targets,
+        "probe_target_fractions": [None if max_train_samples == 0 else target / max_train_samples for target in probe_targets],
         **({} if probe_state is None else completed_probe_summary(output_dir)),
     }
     if probe_state is not None and "final_probe_score" not in summary:

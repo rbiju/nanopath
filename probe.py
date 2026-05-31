@@ -95,7 +95,7 @@ SURGEN_TILES_PER_SLIDE = 768
 SURGEN_ROW_GROUP_SIZE = 64
 SURVIVAL_TILES_PER_SLIDE = 768
 SLIDE_LR_CS = (0.001, 0.01, 0.1, 0.5, 1.0, 10.0, 100.0)
-SURVIVAL_COX_ALPHAS = (0.01, 0.02, 0.07)
+SURVIVAL_COX_ALPHAS = (0.03, 0.07, 0.1)
 SURVIVAL_COX_L1_RATIOS = (0.5, 1.0)
 PATHOROB_SUBSETS = {"camelyon": 11, "tolkach_esca": 46}
 # Module-level so dataset adapters can read roots without threading cfg through every call.
@@ -759,12 +759,18 @@ def inline_pathobench_survival(model, mean, std, dataset, device, transform):
     y = np.array(list(zip(pool_events, pool_days)), dtype=[("event", bool), ("days", float)])
     folds = []
     for tr, va in stratified_folds(pool_events.astype(np.int64)):
+        # Standardize on train-fold stats: Coxnet's fixed elastic-net alpha grid is scale-sensitive,
+        # and raw per-encoder LayerNorm magnitudes vary enough to over/underflow it (e.g. EXAONE's
+        # cls token overflows, over-shrunk features collapse to cindex 0.5). Per-feature z-scoring
+        # makes the probe scale-invariant without using labels or leaking val statistics.
+        mu, sd = X[tr].mean(0), X[tr].std(0) + 1e-8
+        Xtr, Xva = (X[tr] - mu) / sd, (X[va] - mu) / sd
         cindex_per_cox = {}
         for l1_ratio in SURVIVAL_COX_L1_RATIOS:
             for alpha in SURVIVAL_COX_ALPHAS:
                 head = CoxnetSurvivalAnalysis(l1_ratio=l1_ratio, alphas=[alpha], max_iter=100000, fit_baseline_model=False)
-                head.fit(X[tr], y[tr])
-                risk = head.predict(X[va])
+                head.fit(Xtr, y[tr])
+                risk = head.predict(Xva)
                 cindex_per_cox[f"{l1_ratio}:{alpha}"] = float(concordance_index_censored(y[va]["event"], y[va]["days"], risk)[0])
         best = max(cindex_per_cox, key=cindex_per_cox.get)
         l1_ratio, alpha = (float(x) for x in best.split(":"))
@@ -927,8 +933,10 @@ def worker_probe_transforms(cfg):
         from model import probe_transforms
         return probe_transforms()
     from torchvision import transforms
+    from torchvision.transforms import InterpolationMode
     image = {
         "resize_crop_224": transforms.Compose([transforms.Resize(224, antialias=True), transforms.CenterCrop(224), transforms.ToTensor()]),
+        "bicubic224_crop224": transforms.Compose([transforms.Resize(224, interpolation=InterpolationMode.BICUBIC, antialias=True), transforms.CenterCrop(224), transforms.ToTensor()]),
         "square_224": transforms.Compose([transforms.Resize((224, 224), antialias=True), transforms.ToTensor()]),
     }[policy]
     patch = transforms.Compose([transforms.Resize((224, 224), antialias=True), transforms.ToTensor()])

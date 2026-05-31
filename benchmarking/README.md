@@ -1,5 +1,5 @@
 # Benchmarking
-This folder contains code specific for probing/downstream evaluation. The normal nanopath loop is to train within 45 minutes on one H100 gpu, freeze the model backbone, run the fixed downstream probe suite, and use that result to decide whether a training idea is worth scaling. The benchmark definition stays fixed for fair model comparisons. For the most part we borrow the same approach used by THUNDER / PathoBench for downstream evaluations, with a notable exception that we entirely hold-out all test split data from this codebase (this means we can still evaluate our finished models on THUNDER & PathoBench official benchmarking without as much risk of overfitting).
+This folder contains code specific for probing/downstream evaluation. The normal nanopath loop is to train within the 1,000,000-sample and 1e18-FLOP caps, freeze the model backbone, run the fixed downstream probe suite, and use that result to decide whether a training idea is worth scaling. The benchmark definition stays fixed for fair model comparisons. For the most part we borrow the same approach used by THUNDER / PathoBench for downstream evaluations, with a notable exception that we entirely hold-out all test split data from this codebase (this means we can still evaluate our finished models on THUNDER & PathoBench official benchmarking without as much risk of overfitting).
 
 ## Metric
 
@@ -29,36 +29,36 @@ mean_probe_score = mean(
 
 All probes keep the backbone frozen. Probe heads are intentionally small: they measure representation quality, not downstream fine-tuning capacity.
 
-Probe heads consume each model's native frozen feature dimension rather than projecting every backbone to a common width. This intentionally evaluates each checkpoint as a deployed feature extractor, but it also means dimensionality is part of the baseline comparison: DINOv2-S emits 384-d features, DINOv2-G/OpenMidnight/H-optimus-0/UNI-2-h emit 1536-d features, Midnight-12K emits 3072-d CLS plus mean-patch features, and GenBio-PathFM emits 4608-d features.
+Probe heads consume each model's native frozen feature dimension rather than projecting every backbone to a common width. This intentionally evaluates each checkpoint as a deployed feature extractor, but it also means dimensionality is part of the baseline comparison: DINOv2-S emits 384-d features, DINOv2-G/OpenMidnight/H-optimus-0/UNI-2-h/GigaPath emit 1536-d features, Virchow emits 2560-d CLS plus mean-patch features, Midnight-12K emits 3072-d CLS plus mean-patch features, and GenBio-PathFM emits 4608-d features.
 
 Linear, KNN, segmentation-head, logistic, and Coxnet hyperparameters are selected on the same internal validation splits that define `mean_probe_score`. Thunder-derived tile classifiers keep Thunder-style linear/KNN/16-shot SimpleShot heads; SimpleShot precomputes 1000 deterministic support sets and majority-votes query predictions. PathoBench-derived slide classifiers use balanced logistic linear probing; SurGen uses sklearn's `liblinear` solver. Tiny train-derived probes use deterministic 3-fold validation over their official-train pool (`monusac`, `consep`, `ucla_lung`, `surgen`, `boehmk_pfs`) while reusing frozen embeddings/features. `probe.py` logs fold variance/std for those repeated probes so noisy improvements are easier to spot.
 
 ## Runtime Strategy
 
-The full suite is designed for the final H100 probe window for the standard small Nanopath model by keeping the benchmark small where it can be small, and precomputing expensive slide tiling.
+The full suite is designed to stay lightweight for the standard small Nanopath model by keeping the benchmark small where it can be small, and precomputing expensive slide tiling.
 
 - Whole-slide tasks use pre-extracted tile grids, so the final probe embeds JPEG/parquet tiles rather than opening full WSIs. PathoBench-derived slide tasks use a 20x, 512 px, 0-overlap tissue grid following the Trident/PathoBench tutorial contract. UCLA Lung embeds the full cached grid; SurGen and BoehmK survival prepare the full grid but stream deterministic up-to-768-tile raster-spaced sub-bags per slide so large-slide tasks fit the final-probe window. UCLA Lung, SurGen, and BoehmK survival use pre-extracted `medarc/nanopath` parquet mirrors by default; `prepare.py` keeps official-source regeneration helpers for rebuilding the SurGen and BoehmK mirrors. The remaining preprocessing simplification is a deterministic thumbnail tissue mask instead of invoking Trident's HEST segmentation model during `prepare.py`.
 - PCam is a fixed subset of the official train/valid H5 files, mirrored as small H5s with the same filenames/schema.
-- Tile classifiers use `Resize((224, 224))` from `model.py::probe_transforms` for trained Nanopath checkpoints. Frozen baseline scripts set their own `probe.transform_policy`. Patch-cache probes keep square resize because their inputs are already extracted tissue tiles.
+- Tile classifiers use `Resize((224, 224))` from `model.py::probe_transforms` for trained Nanopath checkpoints. Frozen baseline scripts set their own `probe.transform_policy`; Virchow and GigaPath use their official timm bicubic 224 center-crop. Patch-cache probes keep square resize because their inputs are already extracted tissue tiles.
 - Segmentation runs in a background thread while classification, slide, survival, and robustness probes run in the main worker for DINOv2-style backbones. CUDA kernels still serialize, but CPU-heavy decode/head work overlaps with segmentation head training.
 - The same loaded frozen backbone serves every probe in one subprocess, avoiding repeated model load overhead.
 - Test splits are not read by `probe.py`, which keeps official labels sealed during model development.
 
-Recent H100 timings from the untouched baselines:
+Recent H100 timings from the latest untouched baseline reruns:
 
-| dataset | DINOv2-random | DINOv2-S | DINOv2-G | UNI-2-h | Midnight-12K | OpenMidnight | H-optimus-0 | GenBio-PathFM |
-|---|---:|---:|---:|---:|---:|---:|---:|---:|
-| `bracs` | 160.3s | 182.8s | 168.5s | 168.5s | 193.2s | 163.8s | 179.9s | 160.6s |
-| `break_his` | 26.4s | 15.1s | 18.7s | 18.3s | 20.3s | 19.0s | 20.4s | 14.6s |
-| `mhist` | 10.9s | 12.3s | 24.7s | 23.9s | 27.0s | 27.6s | 26.3s | 21.2s |
-| `pcam` | 23.9s | 27.8s | 45.7s | 42.5s | 57.2s | 58.5s | 50.0s | 43.1s |
-| `pannuke` | 159.2s | 165.3s | 303.0s | 289.9s | 481.1s | 732.9s | 309.5s | 279.8s |
-| `monusac` | 22.7s | 24.9s | 139.5s | 126.3s | 150.9s | 64.0s | 91.5s | 34.5s |
-| `consep` | 4.4s | 5.1s | 41.6s | 33.7s | 32.4s | 5.0s | 18.5s | 5.9s |
-| `ucla_lung` | 27.2s | 31.7s | 63.4s | 44.4s | 65.4s | 68.7s | 63.6s | 140.3s |
-| `surgen` | 205.0s | 234.5s | 414.5s | 252.0s | 416.5s | 467.3s | 386.8s | 1137.0s |
-| `boehmk_pfs` | 83.7s | 84.0s | 148.9s | 92.7s | 148.5s | 148.9s | 148.5s | 435.8s |
-| `pathorob` | 34.5s | 28.3s | 72.3s | 43.0s | 67.1s | 75.6s | 74.5s | 198.4s |
+| dataset | DINOv2-random | DINOv2-S | DINOv2-G | EXAONE-Path | Virchow | GigaPath | UNI-2-h | Midnight-12K | OpenMidnight | H-optimus-0 | GenBio-PathFM |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| `bracs` | 157.4s | 158.8s | 168.4s | 172.1s | 183.5s | 182.0s | 166.8s | 167.8s | 169.0s | 166.5s | 151.6s |
+| `break_his` | 18.5s | 19.1s | 19.5s | 14.2s | 18.7s | 18.8s | 18.0s | 18.4s | 18.1s | 19.1s | 14.2s |
+| `mhist` | 13.1s | 12.8s | 24.4s | 16.2s | 23.8s | 19.6s | 22.4s | 24.6s | 23.4s | 25.4s | 20.8s |
+| `pcam` | 24.6s | 23.7s | 44.0s | 30.5s | 34.9s | 38.3s | 43.0s | 44.9s | 43.9s | 45.5s | 42.4s |
+| `pannuke` | 154.8s | 154.7s | 281.1s | 192.3s | 249.9s | 235.9s | 274.7s | 288.2s | 291.9s | 292.5s | 268.3s |
+| `monusac` | 24.2s | 24.0s | 120.9s | 29.1s | 57.5s | 43.4s | 118.0s | 129.0s | 131.8s | 135.2s | 32.6s |
+| `consep` | 4.2s | 4.8s | 36.9s | 4.4s | 26.1s | 13.0s | 34.3s | 32.6s | 36.0s | 35.6s | 5.4s |
+| `ucla_lung` | 26.9s | 26.7s | 63.2s | 26.1s | 46.4s | 48.4s | 44.3s | 62.8s | 64.8s | 63.3s | 139.3s |
+| `surgen` | 194.2s | 198.6s | 413.2s | 193.9s | 255.0s | 287.6s | 251.1s | 398.0s | 425.5s | 400.1s | 1131.9s |
+| `boehmk_pfs` | 84.1s | 83.4s | 150.8s | 85.8s | 94.0s | 111.5s | 100.5s | 159.7s | 157.2s | 150.6s | 439.8s |
+| `pathorob` | 20.0s | 19.6s | 67.5s | 20.9s | 43.2s | 50.7s | 43.1s | 67.0s | 67.4s | 67.5s | 191.0s |
 
 GenBio-PathFM is a slow outlier because each RGB tile is encoded as three single-channel ViT-G passes and the heads consume native 4608-d features. GenBio-PathFM baseline also runs segmentation sequentially because its three channel-wise ViT-G passes are already GPU-bound, and background PanNuke contention made the baseline much slower without changing the metric.
 
@@ -75,7 +75,7 @@ GenBio-PathFM is a slow outlier because each RGB tile is encoded as three single
 | `pannuke` | segmentation | multi-organ nuclei | Fold1 | Fold2 | 2656 images | 2523 images | 309.5s | PanNuke folds | Fixed Fold1/Fold2 protocol; Fold3 not scored |
 | `ucla_lung` | slide progression classification | lung | 60 slides/fold | 30 slides/fold | full 20x/512 grid | 3 folds | 63.6s | PathoBench `ucla_lung/progression_regression` / IDR idr0082 | 3-fold balanced logistic AUROC over fold-0 train using the full tissue grid; 22-slide test fold held out |
 | `surgen` | mutation classification | colorectal | ~207 slides/fold | ~104 slides/fold | 1,167,089 cached tiles; up to 768 embedded/slide | 3 folds | 386.8s | PathoBench SR386 / SurGen, mirrored as pre-extracted HF parquet | 3-fold validation over PathoBench fold-0 train; fold-0 test sealed |
-| `boehmk_pfs` | survival | ovarian | ~97 slides/fold | ~49 slides/fold | 271,467 cached tiles; up to 768 embedded/slide | 3 folds | 84.0s | PathoBench BOEHMK PFS / Synapse, mirrored as pre-extracted HF parquet | 3-fold Coxnet `l1_ratio={0.5,1.0}`, `alpha={0.01,0.02,0.07}` validation over fold_0 train; PathoBench test held out |
+| `boehmk_pfs` | survival | ovarian | ~97 slides/fold | ~49 slides/fold | 271,467 cached tiles; up to 768 embedded/slide | 3 folds | 84.0s | PathoBench BOEHMK PFS / Synapse, mirrored as pre-extracted HF parquet | 3-fold Coxnet `l1_ratio={0.5,1.0}`, `alpha={0.03,0.07,0.1}` validation over fold_0 train; PathoBench test held out |
 | `pathorob` | robustness | breast lymph node + esophagus | n/a | n/a | 22402 + 16300 patches | n/a | 74.5s | PathoROB HF datasets | Robustness index over camelyon/tolkach_esca; TCGA subset excluded |
 
 ## Files

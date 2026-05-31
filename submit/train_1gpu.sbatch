@@ -3,13 +3,12 @@
 #SBATCH --nodes=1
 #SBATCH --ntasks-per-node=1
 #SBATCH --gpus-per-task=1
-#SBATCH --time=01:00:00
+#SBATCH --cpus-per-task=16
 #SBATCH --output=slurm/%j.out
 #SBATCH --error=slurm/%j.err
 #SBATCH --partition=n
-#SBATCH --account=sophont
 #SBATCH --qos=normal # low | normal | top
-#SBATCH --signal=B:USR1@900
+
 set -euo pipefail
 
 # Single-GPU SLURM launcher. Optional first arg overrides the YAML config
@@ -33,13 +32,4 @@ echo "CONFIG_FILE=${CONFIG_FILE}"
 echo "SLURM_JOB_ID=${SLURM_JOB_ID:-local}"
 echo "SLURMD_NODENAME=${SLURMD_NODENAME:-local}"
 
-# SLURM sends USR1 to this batch shell; forward it to the python child so
-# train.py saves, probes, and exits cleanly before wall-clock expiry.
-python train.py "${CONFIG_FILE}" "$@" &
-PY_PID=$!
-trap 'kill -USR1 "$PY_PID" 2>/dev/null || true' USR1
-while true; do
-  wait "$PY_PID" && break
-  status=$?
-  kill -0 "$PY_PID" 2>/dev/null || exit "$status"
-done
+python train.py "${CONFIG_FILE}" "$@"

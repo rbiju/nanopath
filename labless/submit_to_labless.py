@@ -9,14 +9,14 @@ import datetime as dt
 import difflib
 import getpass
 import hashlib
+import http.client
 import json
 import os
 import re
 import shutil
 import subprocess
 import sys
-import tempfile
-import urllib.request
+import time
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
@@ -29,6 +29,7 @@ PROJECT_SLUG = "nanopath"
 PRIMARY_METRIC = "mean_probe_score"
 LOCKED_PATHS = ("probe.py", "benchmarking/")
 FULL_RUN_MIN_FLOPS = 1_000_000_000_000_000_000
+FULL_RUN_MAX_SAMPLES = 1_000_000
 MAX_REPO_DIFF_BYTES = 120_000
 MAX_REVIEW_FILES_BYTES = 120_000
 REVIEW_DIFF_PATHS = ("train.py", "model.py", "dataloader.py", "prepare.py")
@@ -99,16 +100,28 @@ def main() -> int:
         raise ValueError("tier must be full or baseline")
     if run_tier == "full" and "smoke" in config_path:
         raise ValueError("smoke runs are local validation only; submit a completed full run")
-    if run_tier == "full" and not validation_errors and number(summary.get("max_train_flops")) != float(FULL_RUN_MIN_FLOPS):
-        raise ValueError("full submissions must report max_train_flops=1e18 in summary.json")
+    if run_tier == "full" and not validation_errors:
+        if number(summary.get("max_train_flops")) != float(FULL_RUN_MIN_FLOPS):
+            raise ValueError("full submissions must report max_train_flops=1e18 in summary.json")
+        if number(summary.get("max_train_samples")) != float(FULL_RUN_MAX_SAMPLES):
+            raise ValueError("full submissions must report max_train_samples=1000000 in summary.json")
+        tile_presentations = number(summary.get("tile_presentations"))
+        if tile_presentations is None or tile_presentations > FULL_RUN_MAX_SAMPLES:
+            raise ValueError("full submissions must not exceed 1000000 tile_presentations")
     run_label = opts.get("run_name") or opts.get("label") or opts.get("title") or run_name
     if run_tier == "full" and len(run_label) > 20:
         raise ValueError("run_name must be 20 characters or fewer")
-    repo = collect_wandb_source(resolve_main(opts), summary, opts) if run_tier == "full" and not validation_errors else {"locked_path_changes": []}
+    repo = collect_source_snapshot(resolve_main(opts), summary, opts, output_dir) if run_tier == "full" and not validation_errors else {"locked_path_changes": []}
     validation_errors.extend(f"locked path changed: {p}" for p in repo.pop("locked_path_changes"))
     validation_errors.extend(repo.pop("policy_errors", []))
     env = collect_environment(opts)
     artifacts = collect_artifacts(summary, opts)
+    dry_run = truthy(opts.get("dry_run", "false"))
+    api_url = (opts.get("api_url") or API_URL).rstrip("/")
+    github_token = ""
+    github_login = os.environ.get("GITHUB_USER") or getpass.getuser()
+    if not dry_run and not validation_errors:
+        github_token, github_login = github_sign_in(api_url)
     baseline_commands = {
         "dinov2-vits14-reg-no-continued-pretraining": "python baselines/dinov2_small_baseline.py configs/main.yaml",
         "dinov2-vitg14-reg-no-continued-pretraining": "python baselines/dinov2_giant_baseline.py configs/main.yaml",
@@ -126,7 +139,7 @@ def main() -> int:
         "status": status,
         "notes": opts.get("notes", ""),
         "contributor": {
-            "login": opts.get("contributor") or os.environ.get("GITHUB_USER") or getpass.getuser(),
+            "login": github_login,
             "name": opts.get("name") or os.environ.get("GIT_AUTHOR_NAME") or "",
         },
         "repo": repo,
@@ -164,22 +177,19 @@ def main() -> int:
             print(f"validation error: {error}", file=sys.stderr)
         return 2
 
-    dry_run = truthy(opts.get("dry_run", "false"))
     if dry_run:
         print(json.dumps({"dry_run": True, "status": status, "metric": metric_value, "submission": str(submission_path)}, indent=2))
         return 0
 
-    req = urllib.request.Request(
-        (opts.get("api_url") or API_URL).rstrip("/") + f"/api/nano-projects/{opts.get('project', PROJECT_SLUG)}/submissions",
-        data=json.dumps(payload).encode(),
-        method="POST",
-        headers={"Content-Type": "application/json", "Accept": "application/json", "User-Agent": "labless-submit/0.1"},
+    status_code, result = api_json(
+        api_url,
+        "POST",
+        f"/api/nano-projects/{opts.get('project', PROJECT_SLUG)}/submissions",
+        payload,
+        {"Authorization": f"Bearer {github_token}"},
     )
-    if os.environ.get("LABLESS_SUBMIT_TOKEN"):
-        req.add_header("Authorization", f"Bearer {os.environ['LABLESS_SUBMIT_TOKEN']}")
-    with urllib.request.urlopen(req, timeout=30) as response:
-        body = response.read().decode()
-    result = json.loads(body) if body else {"ok": True}
+    if status_code >= 400:
+        raise ValueError(result.get("detail") or f"labless submission failed with HTTP {status_code}")
     print(json.dumps(result, indent=2, sort_keys=True))
     return 0
 
@@ -218,18 +228,58 @@ def public_command(value: str) -> str:
     return re.sub(r"(^|\s)(?:~|/)[^\s\"']+", r"\1$PATH", command)
 
 
+def api_json(api_url: str, method: str, path: str, payload: Any = None, headers: dict[str, str] | None = None) -> tuple[int, dict[str, Any]]:
+    parsed = urlparse(api_url)
+    if parsed.scheme not in {"http", "https"}:
+        raise ValueError("api_url must start with http:// or https://")
+    body = json.dumps(payload).encode() if payload is not None else None
+    request_headers = {"Accept": "application/json", "User-Agent": "labless-submit/0.1", **(headers or {})}
+    if body is not None:
+        request_headers["Content-Type"] = "application/json"
+    connection_class = http.client.HTTPSConnection if parsed.scheme == "https" else http.client.HTTPConnection
+    connection = connection_class(parsed.netloc, timeout=30)
+    connection.request(method, f"{parsed.path.rstrip('/')}{path}", body=body, headers=request_headers)
+    response = connection.getresponse()
+    raw = response.read().decode()
+    connection.close()
+    return response.status, json.loads(raw) if raw else {}
+
+
+def github_sign_in(api_url: str) -> tuple[str, str]:
+    status, device = api_json(api_url, "POST", "/api/auth/github/device", {})
+    if status >= 400:
+        raise ValueError(device.get("detail") or f"GitHub sign-in failed with HTTP {status}")
+    print(f"GitHub sign-in required. Open {device['verification_uri']} and enter code {device['user_code']}.", flush=True)
+    deadline = time.monotonic() + int(device["expires_in"])
+    interval = int(device["interval"])
+    while time.monotonic() < deadline:
+        time.sleep(interval)
+        status, token = api_json(api_url, "POST", "/api/auth/github/device/token", {"device_code": device["device_code"]})
+        if status >= 400:
+            raise ValueError(token.get("detail") or f"GitHub sign-in failed with HTTP {status}")
+        if token.get("status") == "authorized":
+            access_token = str(token["access_token"])
+            me_status, me = api_json(api_url, "GET", "/api/auth/github/me", headers={"Authorization": f"Bearer {access_token}"})
+            if me_status >= 400:
+                raise ValueError(me.get("detail") or f"GitHub identity check failed with HTTP {me_status}")
+            print(f"GitHub signed in as {me['login']}", flush=True)
+            return access_token, str(me["login"])
+        if token.get("status") == "slow_down":
+            interval = int(number(token.get("interval")) or interval + 5)
+        elif token.get("status") not in {"authorization_pending", "slow_down"}:
+            raise ValueError(token.get("error") or "GitHub authorization failed")
+    raise ValueError("GitHub sign-in code expired")
+
+
 def resolve_main(opts: dict[str, str]) -> dict[str, str]:
     if opts.get("main_commit") or opts.get("main_run_id"):
         main_ref = {"run_id": required(opts, "main_run_id"), "commit": required(opts, "main_commit")}
     else:
         api_url = (opts.get("api_url") or API_URL).rstrip("/")
         project = opts.get("project", PROJECT_SLUG)
-        req = urllib.request.Request(
-            f"{api_url}/api/nano-projects/{project}/main",
-            headers={"Accept": "application/json", "User-Agent": "labless-submit/0.1"},
-        )
-        with urllib.request.urlopen(req, timeout=30) as response:
-            main_ref = json.loads(response.read().decode())
+        status, main_ref = api_json(api_url, "GET", f"/api/nano-projects/{project}/main")
+        if status >= 400:
+            raise ValueError(main_ref.get("detail") or f"main lookup failed with HTTP {status}")
     if not main_ref.get("run_id"):
         raise ValueError("current main response is missing run_id")
     if not isinstance(main_ref.get("commit"), str) or not GIT_SHA_RE.match(main_ref["commit"]):
@@ -315,44 +365,50 @@ def final_metrics(summary: dict[str, Any], rows: list[dict[str, Any]]) -> dict[s
     return metrics
 
 
-def collect_wandb_source(main_ref: dict[str, str], summary: dict[str, Any], opts: dict[str, str]) -> dict[str, Any]:
-    import wandb
-    run_path = wandb_run_path(summary, opts)
-    api = wandb.Api()
-    run = api.run(run_path)
-    artifact = api.artifact(f"{run.entity}/{run.project}/nanopath-source-{run.id}:latest", type="code")
-    git_meta = run.metadata["git"]
+def collect_source_snapshot(main_ref: dict[str, str], summary: dict[str, Any], opts: dict[str, str], output_dir: Path) -> dict[str, Any]:
+    meta = summary.get("wandb") if isinstance(summary.get("wandb"), dict) else {}
+    git_meta = meta.get("git") if isinstance(meta.get("git"), dict) else {}
+    source = str(meta.get("source_artifact") or f"nanopath-source-{meta.get('id', 'local')}")
+    local_source_dir = output_dir / "labless_source"
+    source_dir = Path(os.path.expandvars(str(opts.get("source_dir") or (local_source_dir if local_source_dir.exists() else meta.get("source_dir") or local_source_dir)))).expanduser().resolve()
+    return collect_source_context(main_ref, summary, source_dir, source, opts.get("source_commit") or opts.get("commit") or git_meta.get("commit"), git_meta)
+
+
+def collect_source_context(main_ref: dict[str, str], summary: dict[str, Any], source_dir: Path, source: str, commit_value: Any, git_meta: dict[str, Any]) -> dict[str, Any]:
+    if not source_dir.exists():
+        raise ValueError(f"source snapshot does not exist: {source_dir}")
+    commit = str(commit_value or "")
+    if not GIT_SHA_RE.match(commit):
+        raise ValueError("source metadata is missing a full 40-character git commit")
     root = Path.cwd()
-    config_path = Path(summary["config_path"])
+    config_path = Path(summary.get("config_path") or "configs/main.yaml")
     config_rel = str(config_path.relative_to(root)) if config_path.is_absolute() else str(config_path)
     subprocess.run(["git", "cat-file", "-e", f"{main_ref['commit']}^{{commit}}"], check=True)
-    with tempfile.TemporaryDirectory() as tmp:
-        source_dir = Path(artifact.download(root=tmp))
-        review_paths = [*REVIEW_DIFF_PATHS, *([] if config_rel in REVIEW_DIFF_PATHS else [config_rel])]
-        main_diff = collect_main_diff(main_ref, git_meta["commit"], source_dir, review_paths)
-        review_files = collect_review_files(artifact.qualified_name, source_dir, review_paths)
-        source_changed_files = changed_source_paths(main_ref["commit"], source_dir)
-        new_source_files = [path for path in source_changed_files if main_file(main_ref["commit"], path) is None and snapshot_file(source_dir, path) is not None]
-        policy_errors = [f"helper file outside allowed surface changed: {path}" for path in source_changed_files if new_source_path_blocked(path)]
-        policy_errors.extend(locked_probe_config_errors(source_dir, review_paths))
-        repo = {
-            "source_artifact": artifact.qualified_name,
-            "review_files": review_files,
-            "remote": git_meta["remote"],
-            "branch": "",
-            "commit": git_meta["commit"],
-            "main_context": main_ref,
-            "dirty": bool(main_diff),
-            "changed_files": main_diff["files"] if main_diff else [],
-            "source_changed_files": source_changed_files,
-            "new_source_files": new_source_files,
-            "diff_summary": main_diff["summary"] if main_diff else {"files": 0, "added": 0, "removed": 0},
-            "locked_path_changes": locked_path_changes(main_ref["commit"], source_dir),
-            "policy_errors": policy_errors,
-        }
-        if main_diff:
-            repo["main_diff"] = main_diff
-        return repo
+    review_paths = [*REVIEW_DIFF_PATHS, *([] if config_rel in REVIEW_DIFF_PATHS else [config_rel])]
+    main_diff = collect_main_diff(main_ref, commit, source_dir, review_paths)
+    review_files = collect_review_files(source, source_dir, review_paths)
+    source_changed_files = changed_source_paths(main_ref["commit"], source_dir)
+    new_source_files = [path for path in source_changed_files if main_file(main_ref["commit"], path) is None and snapshot_file(source_dir, path) is not None]
+    policy_errors = [f"helper file outside allowed surface changed: {path}" for path in source_changed_files if new_source_path_blocked(path)]
+    policy_errors.extend(locked_probe_config_errors(source_dir, review_paths))
+    repo = {
+        "source_artifact": source,
+        "review_files": review_files,
+        "remote": str(git_meta.get("remote") or ""),
+        "branch": "",
+        "commit": commit,
+        "main_context": main_ref,
+        "dirty": bool(main_diff),
+        "changed_files": main_diff["files"] if main_diff else [],
+        "source_changed_files": source_changed_files,
+        "new_source_files": new_source_files,
+        "diff_summary": main_diff["summary"] if main_diff else {"files": 0, "added": 0, "removed": 0},
+        "locked_path_changes": locked_path_changes(main_ref["commit"], source_dir),
+        "policy_errors": policy_errors,
+    }
+    if main_diff:
+        repo["main_diff"] = main_diff
+    return repo
 
 
 def collect_review_files(source: str, source_dir: Path, review_paths: list[str]) -> dict[str, Any]:
@@ -400,18 +456,15 @@ def locked_probe_config_errors(source_dir: Path, review_paths: list[str]) -> lis
     return errors
 
 
-def wandb_run_path(summary: dict[str, Any], opts: dict[str, str]) -> str:
+def checked_wandb_url(summary: dict[str, Any], opts: dict[str, str]) -> str:
     url = opts.get("wandb_url") or (summary.get("wandb") if isinstance(summary.get("wandb"), dict) else {}).get("url")
     if url:
         parsed = urlparse(url)
         parts = [part for part in parsed.path.split("/") if part]
         if parsed.scheme != "https" or parsed.netloc != "wandb.ai" or len(parts) != 4 or parts[2] != "runs":
             raise ValueError("wandb_url must be a W&B run URL like https://wandb.ai/<entity>/<project>/runs/<run_id>")
-        return f"{parts[0]}/{parts[1]}/{parts[3]}"
-    meta = summary.get("wandb")
-    if not isinstance(meta, dict) or not meta.get("entity") or not meta.get("project") or not meta.get("id"):
-        raise ValueError("full submissions require W&B run metadata in summary.json or wandb_url=...")
-    return f"{meta['entity']}/{meta['project']}/{meta['id']}"
+        return str(url)
+    return ""
 
 
 def collect_main_diff(main_ref: dict[str, str], commit: str, source_dir: Path, review_paths: list[str]) -> dict[str, Any] | None:
@@ -521,7 +574,7 @@ def collect_environment(opts: dict[str, str]) -> dict[str, Any]:
 
 
 def collect_artifacts(summary: dict[str, Any], opts: dict[str, str]) -> list[dict[str, Any]]:
-    wandb_url = opts.get("wandb_url") or (summary.get("wandb") if isinstance(summary.get("wandb"), dict) else {}).get("url")
+    wandb_url = checked_wandb_url(summary, opts)
     return [{"kind": "wandb", "uri": wandb_url}] if wandb_url else []
 
 

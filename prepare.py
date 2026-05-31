@@ -41,6 +41,7 @@ import yaml
 from PIL import Image, ImageDraw
 
 
+REPO_ROOT = Path(__file__).resolve().parent
 HF_REPO_ID = "medarc/nanopath"
 HF_PROBE_PREFIX = "probes"
 PROBE_ACCESS_NOTICES = {
@@ -688,6 +689,36 @@ def _resolve(s):
     return Path(os.path.expanduser(os.path.expandvars(str(s))))
 
 
+# Off-cluster default: a configured absolute path that is absent AND whose mount
+# root (e.g. /data or /block) is also absent means a fresh clone with no MedARC
+# mounts. Retarget it by basename into the repo's own data/ folder so a new user
+# never has to edit YAML paths. Paths that already exist, or whose mount root is
+# present (the user clearly intends that drive), are returned unchanged.
+def _localize(s):
+    p = _resolve(s)
+    if p.is_absolute() and not p.exists() and not Path(*p.parts[:2]).exists():
+        return str(REPO_ROOT / "data" / p.name)
+    return str(s)
+
+
+# Off-cluster default: a fresh clone with no /data or /block mount can't use the
+# checked-in cluster paths, so rewrite them in place to point into the repo's own
+# data/ folder (by basename). Surgical replacement on the raw text keeps every
+# comment/format intact and only touches values that actually redirect, so the
+# YAML itself becomes the source of truth that train.py/probe.py read unchanged.
+# Idempotent, and a no-op on the cluster where the paths/mounts already exist.
+def localize_config_file(config_path):
+    raw = config_path.read_text()
+    cfg = yaml.safe_load(raw)
+    roots = [cfg["data"]["dataset_dir"], *cfg["probe"]["dataset_roots"].values(), cfg["project"]["output_dir"], cfg["project"]["wandb_dir"]]
+    changes = {v: nv for v in roots if (nv := _localize(v)) != v}
+    for old, new in changes.items():
+        raw = raw.replace(f": {old}", f": {new}")
+    if changes:
+        config_path.write_text(raw)
+        print(f"[data] no /data or /block mount found; rewrote {len(changes)} root(s) in {config_path} to defaults under {REPO_ROOT / 'data'}.", flush=True)
+
+
 # Flat dict of {label: expanded Path} for every data path declared in cfg.
 def get_paths(cfg):
     paths = {"data.dataset_dir": _resolve(cfg["data"]["dataset_dir"])}
@@ -749,6 +780,10 @@ def main():
         raise SystemExit(usage)
     download = sys.argv[2] == "download=True"
 
+    # Off-cluster, correct this config's cluster paths to repo-local defaults on
+    # disk before preparing, so the YAML matches where data actually lands.
+    if download:
+        localize_config_file(config_path)
     cfg = yaml.safe_load(os.path.expandvars(config_path.read_text()))
     paths = get_paths(cfg)
     dataset_dir = paths["data.dataset_dir"]

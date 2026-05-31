@@ -27,14 +27,14 @@ train:
   bf16: true
   activation_checkpointing: false
   batch_size: 128
-  num_workers: 8
-  prefetch_factor: 4
+  num_workers: 16
+  prefetch_factor: 2
   persistent_workers: true
+  max_train_samples: 1000000 # tile presentations; global/local crops still count as one sample
   max_train_flops: 1000000000000000000 # 1.0e18, the leaderboard FLOP budget
   log_every: 20
   save_every: 1000
   # Validation pass every `eval_every` steps over `val_batches` held-out batches
-  # (the bottom data.val_fraction of patient ids by hash). Cheap diagnostic, not used for selection.
   eval_every: 200
   val_batches: 16
   global_views: 2
@@ -44,9 +44,6 @@ train:
   resume: null # optional explicit checkpoint path; null means always start fresh and wipe output_dir
 
 dino:
-  # DINOv2 recipe knobs. lr / kde_loss_weight / kde_concentration are the most-tuned
-  # from early sweeps; other values are established DINOv2 defaults that train.py
-  # reads but we rarely change. Anything not listed here is hardcoded in train.py.
   lr: 1.0e-4
   lr_min: 1.0e-6
   warmup_flop_fraction: 0.0909
@@ -81,9 +78,6 @@ probe:
     - boehmk_pfs
   robustness_datasets:
     - pathorob
-  # Dataset roots are read by probe.py. Defaults are shared MedARC cluster
-  # paths. Off-cluster, point these at writable directories and run prepare.py
-  # with download=True to fetch/verify the data.
   dataset_roots:
     bracs: /block/eva-data/bracs
     break_his: /block/eva-data/breakhis
