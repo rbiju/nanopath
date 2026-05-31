@@ -2,18 +2,18 @@
 
 ## Role In Nanopath
 
-`break_his` is a breast histology tile-classification probe. It contributes one scalar to `mean_probe_score`: the mean of linear, KNN, and 16-shot SimpleShot validation macro F1.
+`break_his` is a breast histology image-classification probe. It contributes one scalar to `mean_probe_score`: the mean of linear, KNN, and 16-shot SimpleShot validation macro F1.
 
 ## Source
 
-- Dataset: BreaKHis
-- Upstream source: `http://www.inf.ufpr.br/vri/databases/BreaKHis_v1.tar.gz`
+- Dataset: [BreaKHis](https://web.inf.ufpr.br/vri/databases/breast-cancer-histopathological-database-breakhis/)
+- Upstream archive: `http://www.inf.ufpr.br/vri/databases/BreaKHis_v1.tar.gz`
 - Download used by `prepare.py`: `medarc/nanopath`, under `probes/break_his/`
-- Split provenance: EVA / Thunder 40X four-subtype protocol
+- Split provenance: [EVA](https://kaiko-ai.github.io/eva/main/datasets/breakhis/) / [THUNDER](https://mics-lab.github.io/thunder/) 40X four-subtype protocol
 
 ## Split And Labels
 
-Nanopath uses the checked-in split metadata in `break_his.json`.
+The full BreaKHis release contains breast tumor microscopy images from 82 patients at 40X, 100X, 200X, and 400X. Nanopath does not use the all-magnification or all-subtype task. It follows the EVA/THUNDER 40X four-subtype setup and uses the checked-in split metadata in `break_his.json`.
 
 | split | images |
 |---|---:|
@@ -21,9 +21,14 @@ Nanopath uses the checked-in split metadata in `break_his.json`.
 | val | 196 |
 | test | 339 |
 
-Only train and val are read by `probe.py`. The test split remains provenance metadata.
+| label id | class |
+|---:|---|
+| 0 | fibroadenoma |
+| 1 | tubular adenoma |
+| 2 | ductal carcinoma |
+| 3 | mucinous carcinoma |
 
-This is not the full 8-subtype, all-magnification BreaKHis task. Following the EVA/Thunder protocol, Nanopath uses only 40X images from the four subtypes with enough patients for a patient-disjoint split: fibroadenoma, tubular adenoma, ductal carcinoma, and mucinous carcinoma. Train, val, and test contain disjoint patient ids.
+Only train and val are read by `probe.py`; the checked-in test split remains provenance metadata. Train, val, and test contain disjoint patient ids, which matters because BreaKHis has many related image captures per patient.
 
 ## Implementation
 
@@ -33,8 +38,16 @@ This is not the full 8-subtype, all-magnification BreaKHis task. Following the E
 - cosine KNN: k ∈ {1, 3, 5, 10, 20, 30, 40, 50}, k selected by val F1
 - SimpleShot few-shot: 1000 deterministic 16-shot support sets per class, support/query embeddings centered by each support-set mean, class prototypes from class-specific centered support means, cosine nearest-centroid prediction, then per-query majority vote
 
-The dataset score is `mean(linear_val_f1, knn_val_f1, fewshot_val_f1)`.
+The dataset score is `mean(linear_val_f1, knn_val_f1, fewshot_val_f1)`. Macro F1 is intentional here because the split is class-imbalanced, especially between ductal carcinoma and tubular adenoma.
+
+## Null Distribution Audit
+
+![BreaKHis null distributions](break_his_null_distributions.png)
+
+`plot_null_checks.py` generates the figure above. The orange null is a fresh current-code rerun that constructs a new DINOv2-small with randomized weights for each seed before calling `probe.py`: mean 0.342, std 0.005, max 0.350. Fixed checkpoints are shown as vertical references: DINOv2-small 0.465, DINOv2-giant 0.627, GigaPath 0.624, GenBio-PathFM 0.717, and H-optimus-0 0.750.
+
+This is a clean null check. The randomized-weight distribution is tight and far below every pretrained reference, so BreaKHis is behaving like a useful representation probe rather than a probe-head or architecture artifact.
 
 ## Difference From Original Usage
 
-BreaKHis is commonly evaluated with magnification-aware and patient-level protocols. Nanopath instead uses the fixed EVA/Thunder 40X four-subtype validation split as a lightweight representation probe and does not report an official test-set score.
+BreaKHis should be read as a compact breast-subtype morphology probe, not as a full BreaKHis benchmark. It tests whether frozen features separate two benign and two malignant histologic patterns at 40X under a patient-disjoint split. It does not evaluate magnification invariance, binary benign/malignant diagnosis, patient-level aggregation, or the unused four BreaKHis subtypes.

@@ -1,4 +1,4 @@
-# Run the full frozen-probe suite on untouched Meta DINOv2-S/14-reg weights.
+# Run the full frozen-probe suite on untouched Meta DINOv2-small/14-reg weights.
 # Writes train.py-compatible metrics.jsonl + summary.json under output_dir.
 
 import json

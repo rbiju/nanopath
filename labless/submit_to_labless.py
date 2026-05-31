@@ -41,7 +41,7 @@ NANOPATH_LOCKED_PROBE_CONFIG = {
     "segmentation_datasets": ["pannuke", "monusac", "consep"],
     "slide_datasets": ["ucla_lung"],
     "auc_datasets": ["surgen"],
-    "survival_datasets": ["boehmk_pfs"],
+    "survival_datasets": ["cptac_pda_os"],
     "robustness_datasets": ["pathorob"],
 }
 LARGE_DIFF_SUFFIXES = (

@@ -45,7 +45,6 @@ REPO_ROOT = Path(__file__).resolve().parent
 HF_REPO_ID = "medarc/nanopath"
 HF_PROBE_PREFIX = "probes"
 PROBE_ACCESS_NOTICES = {
-    "boehmk_pfs": "you MUST satisfy the BOEHMK Synapse access terms at https://www.synapse.org/Synapse:syn25946117/wiki/611576 before using these data; this mirror download is only for portable setup.",
     "consep": "you MUST satisfy the official CoNSeP/Warwick access terms at https://warwick.ac.uk/fac/sci/dcs/research/tia/data/hovernet/ before using these data; this mirror download is only for portable setup.",
     "mhist": "you MUST complete MHIST's Dataset Research Use Agreement at https://bmirds.github.io/MHIST/ before using these data; this mirror download is only for portable setup.",
 }
@@ -362,6 +361,8 @@ def fetch_break_his(root):
 PATHOBENCH_TILING_VERSION = "pathobench_20x_512_v1"
 PATHOBENCH_TARGET_MPP = 0.5
 PATHOBENCH_PATCH_PX = 512
+CPTAC_PDA_OS_TILING_VERSION = PATHOBENCH_TILING_VERSION + "_full"
+CPTAC_PDA_OS_RAW_BASE = "https://pathdb.cancerimagingarchive.net/system/files/wsi/ross/CPTAC/PDA"
 
 
 def _openslide_mpp(slide, default=PATHOBENCH_TARGET_MPP):
@@ -535,85 +536,59 @@ def fetch_surgen_from_official_sources(root):
     building.unlink(missing_ok=True)
 
 
-# BOEHMK survival probe. Normal setup pulls our pre-extracted HF parquet
-# mirror; the Synapse helper rebuilds it after the user has accepted access terms.
-BOEHMK_PFS_HF_TSV = "boehmk_/PFS/k=all.tsv"
-BOEHMK_PFS_SYNAPSE_TAR = "syn31937603"
-BOEHMK_PFS_TILING_VERSION = PATHOBENCH_TILING_VERSION
-
-
-def synapse_download(syn_id, dst):
-    req = urllib.request.Request(
-        f"https://repo-prod.prod.sagebase.org/repo/v1/entity/{syn_id}/file",
-        headers={"Authorization": f"Bearer {os.environ['SYNAPSE_AUTH_TOKEN']}", "User-Agent": "nanopath"},
-    )
-    dst.parent.mkdir(parents=True, exist_ok=True)
-    with urllib.request.urlopen(req, timeout=120) as r, dst.open("wb") as f:
-        shutil.copyfileobj(r, f, length=1 << 20)
-
-
-def _tile_one_boehmk_pfs(args):
+def _cptac_pda_os_extract_one(args):
     import openslide
-    wsi_path, slide_id, cache_dir = args
+    case_id, slide_id, event, days, raw_dir, cache_dir = args
     cache_path = Path(cache_dir) / f"{slide_id}.parquet"
     if cache_path.exists():
         return slide_id, pq.read_metadata(cache_path).num_rows
-    slide = openslide.OpenSlide(str(wsi_path))
+    svs_path = Path(raw_dir) / f"{slide_id}.svs"
+    http_download(f"{CPTAC_PDA_OS_RAW_BASE}/{slide_id}.svs", svs_path)
+    slide = openslide.OpenSlide(str(svs_path))
     rows = _openslide_grid_rows(slide, slide_id, image_col="image")
     slide.close()
-    tmp_cache = cache_path.with_suffix(".parquet.part")
-    pq.write_table(pa.table({"slide_id": [r["slide_id"] for r in rows], "image": [r["image"] for r in rows]}), tmp_cache, compression="snappy", row_group_size=PARQUET_ROW_GROUP_SIZE)
-    os.replace(tmp_cache, cache_path)
+    for i, row in enumerate(rows):
+        row["case_id"], row["tile_idx"] = case_id, i
+    tmp = cache_path.with_suffix(".parquet.part")
+    pq.write_table(pa.table({k: [r[k] for r in rows] for k in ("case_id", "slide_id", "tile_idx", "image")}), tmp, compression="snappy", row_group_size=PARQUET_ROW_GROUP_SIZE)
+    os.replace(tmp, cache_path)
+    svs_path.unlink()
     return slide_id, len(rows)
 
 
-def fetch_boehmk_pfs(root):
-    from huggingface_hub import snapshot_download
-    print("  using pre-extracted BOEHMK survival tile cache from medarc/nanopath; official Synapse regeneration requires accepted access terms", flush=True)
-    workers = int(os.environ.get("PREPARE_WORKERS", os.cpu_count() or 8))
-    snapshot_download(repo_id=HF_REPO_ID, repo_type="dataset", local_dir=str(root), allow_patterns=["probes/boehmk_pfs/*"], max_workers=workers)
-    src = root / HF_PROBE_PREFIX / "boehmk_pfs"
-    for name in ("patches.parquet", "labels.tsv", "tiling_version.txt"):
-        (root / name).unlink(missing_ok=True)
-        os.replace(src / name, root / name)
-    shutil.rmtree(root / HF_PROBE_PREFIX)
-
-
-def fetch_boehmk_pfs_from_synapse(root):
-    from huggingface_hub import hf_hub_download
-    root.mkdir(parents=True, exist_ok=True)
-    tsv_src = hf_hub_download(repo_id="MahmoodLab/Patho-Bench", repo_type="dataset", filename=BOEHMK_PFS_HF_TSV)
-    shutil.copy(tsv_src, root / "labels.tsv")
-    splits = json.loads((Path(__file__).resolve().parent / "benchmarking" / "boehmk_pfs.json").read_text())
-    slide_ids = sorted(set(splits["train"]["slide_ids"] + splits["val"]["slide_ids"]))
-    wsi_dir, slide_cache = root / "wsi", root / "slides"
-    wsi_dir.mkdir(parents=True, exist_ok=True)
+def fetch_cptac_pda_os(root):
+    bench = Path(__file__).resolve().parent / "benchmarking"
+    splits = json.loads((bench / "cptac_pda_os.json").read_text())
+    raw_dir, slide_cache = root / "raw", root / "slides_full"
+    raw_dir.mkdir(parents=True, exist_ok=True)
     slide_cache.mkdir(parents=True, exist_ok=True)
-    version, building = root / "tiling_version.txt", root / "tiling_in_progress.txt"
-    if not version.exists() or version.read_text().strip() != BOEHMK_PFS_TILING_VERSION:
-        if not building.exists() or building.read_text().strip() != BOEHMK_PFS_TILING_VERSION:
-            if (root / "patches.parquet").exists():
-                (root / "patches.parquet").unlink()
-            shutil.rmtree(slide_cache)
-            slide_cache.mkdir(parents=True, exist_ok=True)
-            building.write_text(BOEHMK_PFS_TILING_VERSION + "\n")
-    if not any(wsi_dir.rglob("*")):
-        tar = root / "data.tar.gz"
-        synapse_download(BOEHMK_PFS_SYNAPSE_TAR, tar)
-        shutil.unpack_archive(tar, wsi_dir)
-    slide_paths = {p.stem: p for p in wsi_dir.rglob("*") if p.is_file()}
-    workers = int(os.environ.get("PREPARE_WORKERS", os.cpu_count() or 8))
-    tiles = 0
+    version = root / "tiling_version.txt"
+    if version.exists() and version.read_text().strip() != CPTAC_PDA_OS_TILING_VERSION:
+        for stale in ("patches.parquet", "labels.tsv"):
+            (root / stale).unlink(missing_ok=True)
+        shutil.rmtree(slide_cache)
+        slide_cache.mkdir(parents=True)
+    events = dict(zip(splits["case_ids"], splits["events"]))
+    days = dict(zip(splits["case_ids"], splits["days"]))
+    cohort = [(case, sid, events[case], days[case], str(raw_dir), str(slide_cache)) for case, slides in zip(splits["case_ids"], splits["case_slides"]) for sid in slides]
+    workers = int(os.environ.get("PREPARE_WORKERS", min(8, os.cpu_count() or 4)))
+    print(f"  rebuilding uncapped CPTAC-PDA OS tile cache from TCIA PathDB SVS files ({len(cohort)} slides, {workers} workers)", flush=True)
     with mp.Pool(workers) as pool:
-        for done, (sid, n) in enumerate(pool.imap_unordered(_tile_one_boehmk_pfs, [(slide_paths[sid], sid, str(slide_cache)) for sid in slide_ids]), start=1):
-            tiles += n
-            if done % 10 == 0 or done == len(slide_ids):
-                print(f"  [{done}/{len(slide_ids)}] patches={tiles:,}", flush=True)
-    table = pa.concat_tables([pq.read_table(slide_cache / f"{sid}.parquet") for sid in slide_ids])
-    pq.write_table(table, root / "patches.parquet", compression="snappy", row_group_size=PARQUET_ROW_GROUP_SIZE)
-    version.write_text(BOEHMK_PFS_TILING_VERSION + "\n")
-    version.chmod(0o664)
-    building.unlink(missing_ok=True)
+        for done, (sid, n) in enumerate(pool.imap_unordered(_cptac_pda_os_extract_one, cohort), start=1):
+            if done % 20 == 0 or done == len(cohort):
+                print(f"  [{done}/{len(cohort)}] latest={sid} tiles={n:,}", flush=True)
+    out_path = root / "patches.parquet"
+    tmp_path = out_path.with_suffix(".parquet.part")
+    writer = None
+    for _, sid, *_ in cohort:
+        table = pq.read_table(slide_cache / f"{sid}.parquet")
+        if writer is None:
+            writer = pq.ParquetWriter(tmp_path, table.schema, compression="snappy")
+        writer.write_table(table, row_group_size=PARQUET_ROW_GROUP_SIZE)
+    writer.close()
+    os.replace(tmp_path, out_path)
+    (root / "labels.tsv").write_text("case_id\tslide_id\tOS_event\tOS_days\n" + "\n".join(f"{case}\t{sid}\t{event}\t{day}" for case, sid, event, day, *_ in cohort) + "\n")
+    version.write_text(CPTAC_PDA_OS_TILING_VERSION + "\n")
 
 
 # PathoROB ships as two HF datasets; TCGA subset is intentionally excluded.
@@ -670,10 +645,10 @@ def fetch_mhist(root):
 
 
 FETCHERS = {
-    "boehmk_pfs": fetch_boehmk_pfs,
     "bracs": fetch_bracs,
     "break_his": fetch_break_his,
     "consep": fetch_consep,
+    "cptac_pda_os": fetch_cptac_pda_os,
     "mhist": fetch_mhist,
     "monusac": fetch_monusac,
     "pcam": fetch_pcam,
@@ -689,21 +664,21 @@ def _resolve(s):
     return Path(os.path.expanduser(os.path.expandvars(str(s))))
 
 
-# Off-cluster default: a configured absolute path that is absent AND whose mount
-# root (e.g. /data or /block) is also absent means a fresh clone with no MedARC
-# mounts. Retarget it by basename into the repo's own data/ folder so a new user
-# never has to edit YAML paths. Paths that already exist, or whose mount root is
-# present (the user clearly intends that drive), are returned unchanged.
+# Off-cluster default: a configured absolute path that is absent and whose mount
+# root (e.g. /data or /block) is missing or not writable means a fresh clone
+# cannot use the MedARC path. Retarget by basename into repo-local data/ so setup
+# works without YAML edits. Existing paths are returned unchanged.
 def _localize(s):
     p = _resolve(s)
-    if p.is_absolute() and not p.exists() and not Path(*p.parts[:2]).exists():
+    mount = Path(*p.parts[:2]) if p.is_absolute() and len(p.parts) > 1 else p
+    if p.is_absolute() and not p.exists() and (not mount.exists() or not os.access(mount, os.W_OK)):
         return str(REPO_ROOT / "data" / p.name)
     return str(s)
 
 
 # Off-cluster default: a fresh clone with no /data or /block mount can't use the
-# checked-in cluster paths, so rewrite them in place to point into the repo's own
-# data/ folder (by basename). Surgical replacement on the raw text keeps every
+# checked-in cluster paths, so rewrite them in place to point into repo-local
+# data/ (by basename). Surgical replacement on the raw text keeps every
 # comment/format intact and only touches values that actually redirect, so the
 # YAML itself becomes the source of truth that train.py/probe.py read unchanged.
 # Idempotent, and a no-op on the cluster where the paths/mounts already exist.
@@ -754,12 +729,12 @@ def is_populated(name, p):
         got = set(pa.concat_tables([pq.read_table(f, columns=["slide_id"]) for f in files]).column("slide_id").to_pylist()) if files else set()
         version = p / "tiling_version.txt"
         return version.exists() and version.read_text().strip() == SURGEN_TILING_VERSION and expected <= labels and expected <= got
-    if name == "boehmk_pfs":
-        splits = json.loads((bench / "boehmk_pfs.json").read_text())
-        expected = set(splits["train"]["slide_ids"] + splits["val"]["slide_ids"])
+    if name == "cptac_pda_os":
+        splits = json.loads((bench / "cptac_pda_os.json").read_text())
+        expected = {sid for slides in splits["case_slides"] for sid in slides}
         got = set(pq.read_table(p / "patches.parquet", columns=["slide_id"]).column("slide_id").to_pylist()) if (p / "patches.parquet").exists() else set()
         version = p / "tiling_version.txt"
-        return version.exists() and version.read_text().strip() == BOEHMK_PFS_TILING_VERSION and (p / "labels.tsv").exists() and expected <= got
+        return version.exists() and version.read_text().strip() == CPTAC_PDA_OS_TILING_VERSION and (p / "labels.tsv").exists() and expected <= got
     if name == "pathorob" and not all(list((p / s / "data").glob("*.parquet")) for s in ("camelyon", "tolkach_esca")):
         return False
     if name == "monusac" and not any((p / "MoNuSAC_images_and_annotations").glob("*/*.npy")):

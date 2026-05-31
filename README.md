@@ -43,31 +43,31 @@ A successful model training prints periodic train lines, appends metrics to `met
   <img src="https://api.labless.dev/api/nano-projects/nanopath/plot.svg" alt="Nanopath progress plot" width="1290">
 </a>
 
-Score is final `mean_probe_score` across our 11-dataset benchmarking suite, assessing tile-level classification (linear probing, knn, few-shot), segmentation, slide-level classification (progression, mutation, survival), and robustness. These benchmarks are derived from [THUNDER](https://mics-lab.github.io/thunder/) and [PathoBench](https://github.com/mahmoodlab/patho-bench), with modifications to keep single-GPU evaluation lightweight. We operate only on the train/validation splits for these datasets, entirely holding out the test splits defined in THUNDER/PathoBench, so these benchmark suites remain valid for `nanopath` models without overfitting. See [benchmarking/README.md](benchmarking/README.md) for more information.
+Score is final `mean_probe_score` across our 11-dataset benchmarking suite, assessing tile-level classification (linear probing, knn, few-shot), segmentation, slide-level classification (progression, mutation, survival), and robustness. These benchmarks are derived from [THUNDER](https://mics-lab.github.io/thunder/) and [PathoBench](https://github.com/mahmoodlab/patho-bench), with modifications to keep single-GPU evaluation lightweight. We operate only on train/validation splits for most datasets; the survival probe uses PathoBench's official five-fold CPTAC-PDA OS evaluation because that task is defined as cross-validation. See [benchmarking/README.md](benchmarking/README.md) for more information.
 
 ### Nanopath models
 
 | # | Description | final score | linear | knn | 16-shot | segmentation | progression | mutation | survival | robustness | Contributors |
 |---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|
-| 1 | DINOv2-S/14-reg trained on TCGA w KDE| 0.5563 | 0.7656 | 0.7046 | 0.6667 | 0.3000 | 0.6644 | 0.5843 | 0.5070 | 0.6142 | @PaulScotti |
+| 1 | DINOv2-small/14-reg trained on TCGA w KDE| 0.5563 | 0.7656 | 0.7046 | 0.6667 | 0.3000 | 0.6644 | 0.5843 | 0.5070 | 0.6142 | @PaulScotti |
 
 ### Baselines
 
 | # | Name | Description | final score | linear | knn | 16-shot | segmentation | progression | mutation | survival | robustness |
 |---|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
-| 1 | GenBio-PathFM | GenBio-PathFM ViT-G/16 | **0.6255** | 0.8076 | 0.7626 | 0.6970 | 0.3252 | 0.7680 | 0.6375 | 0.5356 | 0.9412 |
-| 2 | UNI-2-h | MahmoodLab UNI-2-h ViT-H/14 | 0.6166 | 0.7910 | 0.7547 | 0.6961 | 0.3233 | 0.7330 | 0.6463 | 0.5806 | 0.8637 |
-| 3 | H-optimus-0 | H-optimus-0 ViT-G/14-reg | 0.6120 | 0.7995 | 0.7676 | 0.6931 | 0.3244 | 0.7004 | 0.6584 | 0.4941 | 0.8926 |
-| 4 | EXAONE-Path-2.5 | LG AI Research EXAONE-Path-2.5 ViT-B/14 | 0.5941 | 0.8028 | 0.7582 | 0.6872 | 0.2820 | 0.6859 | 0.6494 | 0.5157 | 0.8409 |
-| 5 | Virchow | Paige/Microsoft Virchow ViT-H/14 | 0.5894 | 0.7915 | 0.7220 | 0.6114 | 0.3156 | 0.6689 | 0.6350 | 0.5006 | 0.8994 |
-| 6 | GigaPath | Prov-GigaPath tile encoder ViT-G/16 | 0.5843 | 0.7977 | 0.7149 | 0.6537 | 0.3212 | 0.7041 | 0.6262 | 0.5004 | 0.7448 |
-| 7 | DINOv2-giant | Untouched Meta `dinov2_vitg14_reg` | 0.5623 | 0.7689 | 0.7208 | 0.5834 | 0.2844 | 0.6000 | 0.6174 | 0.5518 | 0.7985 |
-| 8 | Midnight-12K | Kaiko Midnight-12K ViT-G/14 | 0.5583 | 0.7684 | 0.6807 | 0.5758 | 0.2664 | 0.6840 | 0.6087 | 0.5673 | 0.7823 |
-| 9 | OpenMidnight | OpenMidnight ViT-G/14-reg | 0.5522 | 0.7926 | 0.7135 | 0.4335 | 0.3099 | 0.6993 | 0.6091 | 0.5066 | 0.7438 |
-| 10 | DINOv2-small | Untouched Meta `dinov2_vits14_reg` | 0.5299 | 0.6968 | 0.6249 | 0.5834 | 0.2663 | 0.5827 | 0.6225 | 0.5303 | 0.7543 |
-| 11 | DINOv2-small random | Randomized weights `dinov2_vits14_reg` | 0.4305 | 0.5282 | 0.5066 | 0.4139 | 0.2673 | 0.6922 | 0.5648 | 0.5542 | 0.1905 |
+| 1 | GenBio-PathFM | GenBio-PathFM ViT-G/16 | **0.6266** | 0.8076 | 0.7626 | 0.6970 | 0.3252 | 0.7680 | 0.6375 | 0.5470 | 0.9412 |
+| 2 | H-optimus-0 | H-optimus-0 ViT-G/14-reg | 0.6184 | 0.7995 | 0.7676 | 0.6931 | 0.3244 | 0.7004 | 0.6584 | 0.5645 | 0.8926 |
+| 3 | UNI-2-h | MahmoodLab UNI-2-h ViT-H/14 | 0.6129 | 0.7910 | 0.7547 | 0.6961 | 0.3233 | 0.7330 | 0.6463 | 0.5401 | 0.8637 |
+| 4 | EXAONE-Path-2.5 | LG AI Research EXAONE-Path-2.5 ViT-B/14 | 0.6000 | 0.8028 | 0.7582 | 0.6872 | 0.2820 | 0.6859 | 0.6494 | 0.5803 | 0.8409 |
+| 5 | Virchow | Paige/Microsoft Virchow ViT-H/14 | 0.5934 | 0.7915 | 0.7220 | 0.6114 | 0.3156 | 0.6689 | 0.6350 | 0.5443 | 0.8994 |
+| 6 | GigaPath | Prov-GigaPath tile encoder ViT-G/16 | 0.5882 | 0.7977 | 0.7149 | 0.6537 | 0.3212 | 0.7041 | 0.6262 | 0.5436 | 0.7448 |
+| 7 | DINOv2-giant | Untouched Meta `dinov2_vitg14_reg` | 0.5546 | 0.7689 | 0.7208 | 0.5834 | 0.2844 | 0.6000 | 0.6174 | 0.4671 | 0.7985 |
+| 8 | OpenMidnight | OpenMidnight ViT-G/14-reg | 0.5543 | 0.7926 | 0.7135 | 0.4335 | 0.3099 | 0.6993 | 0.6091 | 0.5297 | 0.7438 |
+| 9 | Midnight-12K | Kaiko Midnight-12K ViT-G/14 | 0.5536 | 0.7684 | 0.6807 | 0.5758 | 0.2664 | 0.6840 | 0.6087 | 0.5151 | 0.7823 |
+| 10 | DINOv2-small | Untouched Meta `dinov2_vits14_reg` | 0.5291 | 0.6968 | 0.6249 | 0.5834 | 0.2663 | 0.5827 | 0.6225 | 0.5218 | 0.7543 |
+| 11 | DINOv2-small random | Randomized weights `dinov2_vits14_reg` | 0.4246 | 0.5282 | 0.5066 | 0.4139 | 0.2673 | 0.6922 | 0.5648 | 0.4894 | 0.1905 |
 
-Baseline rows are frozen reference checkpoints evaluated with the same probe suite. They help calibrate the plot, but pathology-specific baselines are not valid initialization points for nanopath leaderboard submissions. The reference scripts live in `baselines/`; run Virchow and GigaPath separately with `baselines/virchow_baseline.py` and `baselines/gigapath_baseline.py`.
+Baseline rows are frozen reference checkpoints evaluated with the same probe suite. They help calibrate the plot, but pathology-specific baselines are not valid initialization points for nanopath leaderboard submissions. The reference scripts live in `baselines/`; run Virchow and GigaPath separately with `baselines/virchow_baseline.py` and `baselines/gigapath_baseline.py`. Historical Labless rows remain useful provenance, but locked benchmark comparisons should use fresh runs after any benchmark-definition change.
 
 ### How to submit to the leaderboard
 
@@ -142,11 +142,11 @@ The script reads `summary.json` and `metrics.jsonl`, uses the run's saved source
 
 `prepare.py` prepares the necessary data for pretraining and downstream probing. Flag `download=True` to fetch/prepare the configured datasets into the folders specified by the YAML; flag `download=False` to verify that all required paths are already populated.
 
-On the MedARC cluster, the checked-in `/data` and `/block` paths are the intended defaults. On a fresh clone with no such mounts, `prepare.py … download=True` rewrites those roots in place in the config you pass (data, probes, `output_dir`, `wandb_dir`) to point into `nanopath/data/<name>`, preserving all comments — so it just works with no manual YAML edits, and `train.py`/`probe.py` then read the corrected config unchanged. Only roots that are missing *and* whose `/data` or `/block` mount is also absent get rewritten; the rewrite is idempotent and a no-op on the cluster. To point elsewhere, edit `data.dataset_dir` and the `probe.dataset_roots.*` paths to writable storage before downloading.
+On the MedARC cluster, the checked-in `/data` and `/block` paths are the intended defaults. On a fresh clone with no such mounts, `prepare.py … download=True` rewrites those roots in place in the config you pass (data, probes, `output_dir`, `wandb_dir`) to point into `nanopath/data/<name>`, preserving all comments — so it just works with no manual YAML edits, and `train.py`/`probe.py` then read the corrected config unchanged. Only roots that are missing and whose `/data` or `/block` mount is absent or not writable get rewritten; the rewrite is idempotent and a no-op on the cluster. To point elsewhere, edit `data.dataset_dir` and the `probe.dataset_roots.*` paths to writable storage before downloading.
 
 **What `download=True` does**
 1. **TCGA tiles**: `huggingface_hub.snapshot_download` (filtered to `shard-*.parquet`) pulls the 200 parquet shards (~120 GB total, `{path: string, jpeg: binary}` rows with 64-row row groups) from [`medarc/nanopath`](https://huggingface.co/datasets/medarc/nanopath) into `data.dataset_dir`.
-2. **Probe datasets**: for each empty configured root, fetches/unpacks and, where needed, pre-extracts the probe data. BRACS, BreaKHis, PCam, PanNuke, UCLA Lung, MHIST, CoNSeP, SurGen, and BoehmK survival use the [`medarc/nanopath`](https://huggingface.co/datasets/medarc/nanopath) probe mirror for portable noninteractive setup; PathoROB and MoNuSAC still come from their official public sources. Before fetching MHIST, CoNSeP, or BoehmK survival, `prepare.py` prints that users must satisfy the official upstream form/access terms first. Slide-level probes cache 20x/512 tissue grids (`tiles.parquet`, `surgen-*.parquet`, or `patches.parquet`) so `probe.py` never opens raw WSIs; SurGen and BoehmK survival prepare the full grid but stream deterministic raster-spaced sub-bags for runtime.
+2. **Probe datasets**: for each empty configured root, fetches/unpacks and, where needed, pre-extracts the probe data. BRACS, BreaKHis, PCam, PanNuke, UCLA Lung, MHIST, CoNSeP, and SurGen use the [`medarc/nanopath`](https://huggingface.co/datasets/medarc/nanopath) probe mirror for portable noninteractive setup; CPTAC-PDA OS downloads the official TCIA PathDB SVS files and builds its cache locally; PathoROB and MoNuSAC come from their official public sources. Before fetching MHIST or CoNSeP, `prepare.py` prints that users must satisfy the official upstream form/access terms first. Slide-level probes cache 20x/512 tissue grids (`tiles.parquet`, `surgen-*.parquet`, or `patches.parquet`) so `probe.py` never opens raw WSIs during training/probing; SurGen streams deterministic raster-spaced sub-bags for runtime, while CPTAC-PDA OS embeds its full cached grid.
 3. **DINOv2 backbone weights**: `torch.hub.load_state_dict_from_url` fetches the Meta checkpoint for `model.type` from `dl.fbaipublicfiles.com` into `~/.cache/torch/hub/checkpoints/`.
 
 **Prerequisites**

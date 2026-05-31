@@ -1,9 +1,9 @@
 # Inline downstream probes. mean_probe_score = the unweighted mean of one scalar
 # per headline dataset: break_his, bracs, mhist, pcam, monusac, consep,
-# pannuke, ucla_lung, surgen, boehmk_pfs, pathorob. Tile classification
+# pannuke, ucla_lung, surgen, cptac_pda_os, pathorob. Tile classification
 # datasets score the mean of linear, KNN, and 16-shot SimpleShot F1
 # majority-voted over 1000 deterministic support sets.
-# PathoBench-derived slide classification and SurGen score AUROC; BoehmK survival
+# PathoBench-derived slide classification and SurGen score AUROC; CPTAC-PDA survival
 # scores Harrell's c-index; PathoROB scores its robustness index; segmentation
 # datasets score macro Jaccard from the MaskTransformer head below.
 #
@@ -20,7 +20,7 @@
 #   pcam        ~28-50s      fixed 3072 train / 768 val subset of official H5 files
 #   ucla_lung   ~32-140s     full IDR idr0082 tissue grid, mean-pooled
 #   surgen      ~235-1137s   deterministic SR386 sub-bags -> mean-pool -> logistic regression
-#   boehmk_pfs   ~82s        deterministic 768-tile sub-bag -> mean-pool -> Coxnet sweep
+#   cptac_pda_os ~164s       full deterministic tile grid -> case-pool -> CoxPH/PCA2
 #   pathorob    ~28-198s     camelyon + tolkach_esca patch sets
 #   monusac     ~25-93s      3 train-derived folds, features extracted once
 #   consep      ~5-19s       3 train-derived folds, features extracted once
@@ -74,11 +74,11 @@ CLASSIFICATION_DATASETS = ["bracs", "break_his", "mhist", "pcam"]
 SEGMENTATION_DATASETS = ["pannuke", "monusac", "consep"]
 SLIDE_DATASETS = ["ucla_lung"]
 AUC_DATASETS = ["surgen"]
-SURVIVAL_DATASETS = ["boehmk_pfs"]
+SURVIVAL_DATASETS = ["cptac_pda_os"]
 ROBUSTNESS_DATASETS = ["pathorob"]
 MEAN_PROBE_DATASETS = [
     "break_his", "bracs", "mhist", "pcam", "monusac", "consep",
-    "pannuke", "ucla_lung", "surgen", "boehmk_pfs", "pathorob",
+    "pannuke", "ucla_lung", "surgen", "cptac_pda_os", "pathorob",
 ]
 TASK_FIELDS = {
     "classification_datasets": ("datasets", CLASSIFICATION_DATASETS),
@@ -93,10 +93,10 @@ SURGEN_LR_MAX_ITER = 5000
 SURGEN_LR_SOLVER = "liblinear"
 SURGEN_TILES_PER_SLIDE = 768
 SURGEN_ROW_GROUP_SIZE = 64
-SURVIVAL_TILES_PER_SLIDE = 768
+SURVIVAL_TILES_PER_SLIDE_CAP = 0  # logged as 0 to mean "uncapped"
 SLIDE_LR_CS = (0.001, 0.01, 0.1, 0.5, 1.0, 10.0, 100.0)
-SURVIVAL_COX_ALPHAS = (0.03, 0.07, 0.1)
-SURVIVAL_COX_L1_RATIOS = (0.5, 1.0)
+SURVIVAL_COXPH_ALPHA = 100.0
+SURVIVAL_PCA_COMPONENTS = 2
 PATHOROB_SUBSETS = {"camelyon": 11, "tolkach_esca": 46}
 # Module-level so dataset adapters can read roots without threading cfg through every call.
 # Populated from cfg.probe.dataset_roots by prepare_probe_state() and run_probe_job().
@@ -706,30 +706,28 @@ def inline_pathobench_survival(model, mean, std, dataset, device, transform):
     import numpy as np
     import pyarrow.parquet as pq
     from PIL import Image
-    from sksurv.linear_model import CoxnetSurvivalAnalysis
+    from sklearn.decomposition import PCA
+    from sksurv.linear_model import CoxPHSurvivalAnalysis
     from sksurv.metrics import concordance_index_censored
 
     started_at = time.monotonic()
-    splits = json.loads((BENCHMARKING_DIR / f"{dataset}.json").read_text())
-    pool_slides = list(splits["train"]["slide_ids"]) + list(splits["val"]["slide_ids"])
-    pool_events = np.asarray([bool(e) for split in ("train", "val") for e in splits[split]["events"]])
-    pool_days = np.asarray([float(d) for split in ("train", "val") for d in splits[split]["days"]])
+    spec = json.loads((BENCHMARKING_DIR / f"{dataset}.json").read_text())
+    case_ids = list(spec["case_ids"])
+    case_slides = [list(x) for x in spec["case_slides"]]
+    pool_slides = [sid for slides in case_slides for sid in slides]
+    pool_events = np.asarray([bool(e) for e in spec["events"]])
+    pool_days = np.asarray([float(d) for d in spec["days"]])
     needed = set(pool_slides)
     pf = pq.ParquetFile(DATASET_ROOTS[dataset] / "patches.parquet")
+    slide_col = pf.schema_arrow.get_field_index("slide_id")
     row_groups = defaultdict(list)
     for rg in range(pf.num_row_groups):
-        stats = pf.metadata.row_group(rg).column(0).statistics
+        stats = pf.metadata.row_group(rg).column(slide_col).statistics
         sids = [stats.min] if stats.min == stats.max else set(pf.read_row_group(rg, columns=["slide_id"]).column("slide_id").to_pylist())
         for sid in sids:
             if sid in needed:
                 row_groups[sid].append(rg)
-    groups_per_slide = (SURVIVAL_TILES_PER_SLIDE + pf.metadata.row_group(0).num_rows - 1) // pf.metadata.row_group(0).num_rows
-    selected_groups = set()
-    for sid in pool_slides:
-        groups = row_groups[sid]
-        take = range(len(groups)) if len(groups) <= groups_per_slide else np.linspace(0, len(groups) - 1, groups_per_slide, dtype=np.int64)
-        selected_groups.update(groups[int(i)] for i in take)
-    selected_groups = sorted(selected_groups)
+    selected_groups = sorted({rg for sid in pool_slides for rg in row_groups[sid]})
 
     class _Tiles(torch.utils.data.IterableDataset):
         def __iter__(self):
@@ -755,30 +753,26 @@ def inline_pathobench_survival(model, mean, std, dataset, device, transform):
                 counts[sid] += 1
                 tiles += 1
 
-    X = np.stack([sums[sid] / counts[sid] for sid in pool_slides]).astype(np.float64)
+    slide_vecs = {sid: sums[sid] / counts[sid] for sid in pool_slides}
+    X = np.stack([np.stack([slide_vecs[sid] for sid in slides]).mean(0) for slides in case_slides]).astype(np.float64)
     y = np.array(list(zip(pool_events, pool_days)), dtype=[("event", bool), ("days", float)])
+    case_to_i = {case_id: i for i, case_id in enumerate(case_ids)}
     folds = []
-    for tr, va in stratified_folds(pool_events.astype(np.int64)):
-        # Standardize on train-fold stats: Coxnet's fixed elastic-net alpha grid is scale-sensitive,
-        # and raw per-encoder LayerNorm magnitudes vary enough to over/underflow it (e.g. EXAONE's
-        # cls token overflows, over-shrunk features collapse to cindex 0.5). Per-feature z-scoring
-        # makes the probe scale-invariant without using labels or leaking val statistics.
+    for fold in spec["folds"]:
+        tr = np.asarray([case_to_i[c] for c in fold["train"]], dtype=np.int64)
+        va = np.asarray([case_to_i[c] for c in fold["test"]], dtype=np.int64)
+        # The survival head is deliberately low-dimensional. Random-init audits
+        # found high-dimensional Coxnet could inflate c-index; train-fold z-score
+        # + PCA(2) keeps the Cox head scale-invariant and small.
         mu, sd = X[tr].mean(0), X[tr].std(0) + 1e-8
         Xtr, Xva = (X[tr] - mu) / sd, (X[va] - mu) / sd
-        cindex_per_cox = {}
-        for l1_ratio in SURVIVAL_COX_L1_RATIOS:
-            for alpha in SURVIVAL_COX_ALPHAS:
-                head = CoxnetSurvivalAnalysis(l1_ratio=l1_ratio, alphas=[alpha], max_iter=100000, fit_baseline_model=False)
-                head.fit(Xtr, y[tr])
-                risk = head.predict(Xva)
-                cindex_per_cox[f"{l1_ratio}:{alpha}"] = float(concordance_index_censored(y[va]["event"], y[va]["days"], risk)[0])
-        best = max(cindex_per_cox, key=cindex_per_cox.get)
-        l1_ratio, alpha = (float(x) for x in best.split(":"))
-        folds.append({"val_cindex": cindex_per_cox[best], "best_l1_ratio": l1_ratio, "best_alpha": alpha, "val_cindex_per_cox": cindex_per_cox})
-    cindex_per_cox = {f"{l1}:{a}": float(np.mean([f["val_cindex_per_cox"][f"{l1}:{a}"] for f in folds])) for l1 in SURVIVAL_COX_L1_RATIOS for a in SURVIVAL_COX_ALPHAS}
-    best = max(cindex_per_cox, key=cindex_per_cox.get)
-    best_l1, best_alpha = (float(x) for x in best.split(":"))
-    return {"val_cindex": cindex_per_cox[best], "best_l1_ratio": best_l1, "best_alpha": best_alpha, "val_cindex_per_cox": cindex_per_cox, "fold_scores": [float(f["val_cindex_per_cox"][best]) for f in folds], "folds": folds, "tiles": tiles, "tiles_per_slide_cap": SURVIVAL_TILES_PER_SLIDE}, time.monotonic() - started_at
+        pca = PCA(n_components=SURVIVAL_PCA_COMPONENTS, random_state=0).fit(Xtr)
+        Xtr, Xva = pca.transform(Xtr), pca.transform(Xva)
+        head = CoxPHSurvivalAnalysis(alpha=SURVIVAL_COXPH_ALPHA, n_iter=1000).fit(Xtr, y[tr])
+        cindex = float(concordance_index_censored(y[va]["event"], y[va]["days"], head.predict(Xva))[0])
+        folds.append({"val_cindex": cindex, "train_cases": len(tr), "test_cases": len(va)})
+    val_cindex = float(np.mean([f["val_cindex"] for f in folds]))
+    return {"val_cindex": val_cindex, "best_alpha": SURVIVAL_COXPH_ALPHA, "pca_components": SURVIVAL_PCA_COMPONENTS, "fold_scores": [float(f["val_cindex"]) for f in folds], "folds": folds, "tiles": tiles, "tiles_per_slide_cap": SURVIVAL_TILES_PER_SLIDE_CAP}, time.monotonic() - started_at
 
 
 # KNN probe over frozen embeddings; best k is selected on the validation split.
@@ -1031,7 +1025,7 @@ def run_probe_job(request_path):
         print(f"{console_prefix()} ProbeWorker  [{request['train_step']}]  inline_survival_start: {dataset}", flush=True)
         result, wall = inline_pathobench_survival(model, mean, std, dataset, device, patch_transform)
         survival_metrics[dataset] = result
-        print(f"{console_prefix()} ProbeWorker  [{request['train_step']}]  inline_survival_done: {dataset}  cindex={result['val_cindex']:.4f}  best_l1={result['best_l1_ratio']}  best_alpha={result['best_alpha']}  wall={wall:.2f}s", flush=True)
+        print(f"{console_prefix()} ProbeWorker  [{request['train_step']}]  inline_survival_done: {dataset}  cindex={result['val_cindex']:.4f}  coxph_alpha={result['best_alpha']}  pca={result['pca_components']}  wall={wall:.2f}s", flush=True)
 
     rob_indices = {}
     for dataset in robustness:
@@ -1091,13 +1085,10 @@ def run_probe_job(request_path):
         results[dataset] = auc_metrics[dataset]
     for dataset in survival:
         metrics[f"probe_{dataset}_val_cindex"] = survival_metrics[dataset]["val_cindex"]
-        metrics[f"probe_{dataset}_best_l1_ratio"] = survival_metrics[dataset]["best_l1_ratio"]
-        metrics[f"probe_{dataset}_best_alpha"] = survival_metrics[dataset]["best_alpha"]
+        metrics[f"probe_{dataset}_coxph_alpha"] = survival_metrics[dataset]["best_alpha"]
+        metrics[f"probe_{dataset}_pca_components"] = survival_metrics[dataset]["pca_components"]
         metrics[f"probe_{dataset}_tiles"] = survival_metrics[dataset]["tiles"]
         metrics[f"probe_{dataset}_tiles_per_slide_cap"] = survival_metrics[dataset]["tiles_per_slide_cap"]
-        for key, cindex in survival_metrics[dataset]["val_cindex_per_cox"].items():
-            l1_ratio, alpha = key.split(":")
-            metrics[f"probe_{dataset}_val_cindex_l1_{l1_ratio.replace('.', 'p')}_alpha_{alpha.replace('.', 'p')}"] = cindex
         per_dataset_score[dataset] = survival_metrics[dataset]["val_cindex"]
         fold_scores[dataset] = survival_metrics[dataset]["fold_scores"]
         results[dataset] = survival_metrics[dataset]
