@@ -155,6 +155,22 @@ The payload intentionally makes the run inspectable. It includes:
 The public API redacts local machine paths, hostnames, users, repo roots, and
 local artifact paths from legacy and new rows.
 
+Agents can crawl the public experiment ledger directly:
+
+```bash
+curl -fsS "https://api.labless.dev/api/nano-projects/nanopath/experiment-log?limit=100" \
+  | jq '.runs[] | {run_id, title, validation, metric_value, summary}'
+
+curl -fsS "https://api.labless.dev/api/nano-projects/nanopath/experiment-log.jsonl?limit=500" \
+  | jq -r '[.run_id, .metric_value, .validation, .summary] | @tsv'
+```
+
+Use `next_after_updated_at` plus `next_after_run_id` to page through older
+responses, and store `watermark_updated_at` plus `watermark_run_id` when polling
+later. The bulk rows include compact public source context and links to the
+website run page, run-detail JSON, and review patch endpoint. Labless does not
+currently expose raw console logs or full per-step `metrics.jsonl` histories.
+
 The review snapshot is only collected for `train.py`, `model.py`,
 `dataloader.py`, `prepare.py`, and the config YAML used by the run. Labless
 builds capped patches server-side when it compares two logged snapshots. Binary
