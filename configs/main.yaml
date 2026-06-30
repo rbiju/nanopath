@@ -2,7 +2,7 @@ project:
   name: main-dinov2
   family: nanopath
   recipe_id: dinov2-vits14-ortho_prototypes-baseline
-  output_dir: /data/$USER/nanopath/20260630_wt_baseline
+  output_dir: /data/$USER/nanopath/20260630_op_baseline
   wandb_dir: /data/$USER/nanopath/wandb
 
 data:
