@@ -7,7 +7,7 @@
 #SBATCH --output=slurm/%j.out
 #SBATCH --error=slurm/%j.err
 #SBATCH --partition=n
-#SBATCH --qos=high
+#SBATCH --qos=top
 #SBATCH --account=sophont
 
 set -euo pipefail
