@@ -1,25 +1,21 @@
 #!/usr/bin/env bash
-#SBATCH --job-name=ray_wt_baseline
-#SBATCH --nodes=1               # reserve single H100 node
-#SBATCH --ntasks-per-node=1 
-#SBATCH --cpus-per-gpu=16
-#SBATCH --gpus-per-task=8
-#SBATCH --time=infinite
-#SBATCH --output=slurms/%j.out  # save output log for job
-#SBATCH --error=slurms/%j.err   # save error log for job
-#SBATCH --partition=main
+#SBATCH --job-name=main_1gpu
+#SBATCH --nodes=1
+#SBATCH --ntasks-per-node=1
+#SBATCH --gpus-per-task=1
+#SBATCH --cpus-per-task=16
+#SBATCH --output=slurm/%j.out
+#SBATCH --error=slurm/%j.err
+#SBATCH --partition=n
+#SBATCH --qos=high
 #SBATCH --account=sophont
-#SBATCH --qos=high               # low priority job (low/normal/top)
-#SBATCH --mail-type=begin       # send email when job begins
-#SBATCH --mail-type=end         # send email when job ends
-#SBATCH --mail-user=raymondbiju@gmail.com
 
 set -euo pipefail
 
 # Single-GPU SLURM launcher. Run it directly so the login node can collect
 # Labless metadata before scheduling the noninteractive GPU job, e.g.
-#   ./submit/train_1gpu.sbatch configs/main.yaml output_dir=/data/$USER/nanopath/main/myrun
-# Plain `sbatch submit/train_1gpu.sbatch ...` still trains, but cannot auto-submit.
+#   ./submit/train.sbatch configs/main.yaml output_dir=/data/$USER/nanopath/main/myrun
+# Plain `sbatch submit/train.sbatch ...` still trains, but cannot auto-submit.
 REPO_DIR="${SLURM_SUBMIT_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
 CONFIG_FILE="${1:-${REPO_DIR}/configs/main.yaml}"
 [[ $# -gt 0 ]] && shift
