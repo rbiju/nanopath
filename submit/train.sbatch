@@ -8,11 +8,11 @@
 #SBATCH --output=slurms/%j.out  # save output log for job
 #SBATCH --error=slurms/%j.err   # save error log for job
 #SBATCH --partition=main
-#SBATCH --account=training
-#SBATCH --qos low               # low priority job (low/normal/top)
+#SBATCH --account=sophont
+#SBATCH --qos=high               # low priority job (low/normal/top)
 #SBATCH --mail-type=begin       # send email when job begins
 #SBATCH --mail-type=end         # send email when job ends
-#SBATCH --mail-user=email@domain.com
+#SBATCH --mail-user=raymondbiju@gmail.com
 
 set -euo pipefail
 
