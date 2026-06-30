@@ -217,6 +217,7 @@ def main():
     labless_autosubmit_file = maybe_arm_labless_autosubmit(cfg, repo_dir)
     train_cfg = cfg["train"]
     dino_cfg = cfg["dino"]
+    head_cfg = cfg["prototype_head"]
     save_every = train_cfg["save_every"]
     save_checkpoints = save_every is not None
     device = torch.device("cuda")
@@ -232,7 +233,7 @@ def main():
     teacher_backbone.train(False)
     for p in teacher_backbone.parameters():
         p.requires_grad = False
-    student_dino_head = PrototypeHead(student_backbone.embed_dim, dino_cfg["head_bottleneck_dim"], dino_cfg["head_hidden_dim"], dino_cfg["head_bottleneck_dim"], 3).to(device)
+    student_dino_head = PrototypeHead(student_backbone.embed_dim, head_cfg['n_prototypes'], head_cfg["prototype_dim"], head_cfg["hidden_dim"], head_cfg["n_layers"], head_cfg['ns_steps']).to(device)
     student_ibot_head = DINOHead(student_backbone.embed_dim, 131072, dino_cfg["head_hidden_dim"], dino_cfg["head_bottleneck_dim"], 3).to(device)
     teacher_dino_head = deepcopy(student_dino_head)
     teacher_ibot_head = deepcopy(student_ibot_head)

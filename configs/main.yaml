@@ -59,6 +59,13 @@ dino:
   kde_loss_weight: 0.005
   kde_concentration: 10.0
 
+prototype_head:
+  n_prototypes: 128
+  hidden_dim: 768
+  prototype_dim: 256
+  n_layers: 3
+  ns_steps: 5
+
 probe:
   enabled: true
   model_weights: ema

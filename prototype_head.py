@@ -4,9 +4,9 @@ import torch.nn.functional as F
 from torch.nn.init import trunc_normal_
 
 
-def _build_mlp(nlayers, in_dim, bottleneck_dim, hidden_dim=None, use_bn=False, bias=True):
+def _build_mlp(nlayers, in_dim, out_dim, hidden_dim=None, use_bn=False, bias=True):
     if nlayers == 1:
-        return nn.Linear(in_dim, bottleneck_dim, bias=bias)
+        return nn.Linear(in_dim, out_dim, bias=bias)
     else:
         layers = [nn.Linear(in_dim, hidden_dim, bias=bias)]
         if use_bn:
@@ -17,7 +17,7 @@ def _build_mlp(nlayers, in_dim, bottleneck_dim, hidden_dim=None, use_bn=False, b
             if use_bn:
                 layers.append(nn.BatchNorm1d(hidden_dim))
             layers.append(nn.GELU())
-        layers.append(nn.Linear(hidden_dim, bottleneck_dim, bias=bias))
+        layers.append(nn.Linear(hidden_dim, out_dim, bias=bias))
         return nn.Sequential(*layers)
 
 
@@ -50,21 +50,21 @@ class PrototypeHead(nn.Module):
         self,
         in_dim,
         n_prototypes,
-        hidden_dim=2048,
-        bottleneck_dim=256,
-        nlayers=3,
+        hidden_dim=768,
+        prototype_dim=256,
+        n_layers=3,
         ns_steps=5,
     ):
-        assert n_prototypes <= bottleneck_dim, (
+        assert n_prototypes <= prototype_dim, (
             f"PrototypeHead requires n_prototypes ({n_prototypes}) "
-            f"<= bottleneck_dim ({bottleneck_dim}) for orthogonality to be well-defined."
+            f"<= bottleneck_dim ({prototype_dim}) for orthogonality to be well-defined."
         )
         super().__init__()
         self.ns_steps = ns_steps
-        nlayers = max(nlayers, 1)
-        self.mlp = _build_mlp(nlayers, in_dim, bottleneck_dim, hidden_dim=hidden_dim)
+        n_layers = max(n_layers, 1)
+        self.mlp = _build_mlp(n_layers, in_dim, prototype_dim, hidden_dim=hidden_dim)
         self.apply(self._init_weights)
-        self.prototypes = nn.Parameter(torch.empty(n_prototypes, bottleneck_dim))
+        self.prototypes = nn.Parameter(torch.empty(n_prototypes, prototype_dim))
         trunc_normal_(self.prototypes, std=0.02)
 
     def _init_weights(self, m):
