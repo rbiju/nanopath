@@ -30,7 +30,7 @@ from torch.utils.data import DataLoader
 from torch.utils.flop_counter import FlopCounterMode
 
 from dataloader import TCGATileDataset, TILE_SIZE
-from model import DINOHead, DinoV2ViT, load_dinov2_pretrained
+from model import DINOHead, DinoV2ViT, load_dinov2_pretrained, PrototypeHead
 from probe import (
     completed_probe_summary,
     collect_probe_results,
@@ -232,7 +232,7 @@ def main():
     teacher_backbone.train(False)
     for p in teacher_backbone.parameters():
         p.requires_grad = False
-    student_dino_head = DINOHead(student_backbone.embed_dim, 131072, dino_cfg["head_hidden_dim"], dino_cfg["head_bottleneck_dim"], 3).to(device)
+    student_dino_head = PrototypeHead(student_backbone.embed_dim, dino_cfg["head_bottleneck_dim"], dino_cfg["head_hidden_dim"], dino_cfg["head_bottleneck_dim"], 3).to(device)
     student_ibot_head = DINOHead(student_backbone.embed_dim, 131072, dino_cfg["head_hidden_dim"], dino_cfg["head_bottleneck_dim"], 3).to(device)
     teacher_dino_head = deepcopy(student_dino_head)
     teacher_ibot_head = deepcopy(student_ibot_head)
