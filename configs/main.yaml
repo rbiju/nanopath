@@ -56,8 +56,6 @@ dino:
   head_hidden_dim: 2048
   head_bottleneck_dim: 384
   clip_grad: 3.0
-  kde_loss_weight: 0.005
-  kde_concentration: 10.0
 
 prototype_head:
   n_prototypes: 128
@@ -65,6 +63,7 @@ prototype_head:
   prototype_dim: 256
   n_layers: 3
   ns_steps: 5
+  score_reg_weight: 0.1
 
 probe:
   enabled: true
