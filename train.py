@@ -1,10 +1,10 @@
 # Continual DINOv2 pretraining on TCGA tiles (single-GPU). Three loss terms:
 # DINO CLS self-distillation (Sinkhorn-Knopp centred teacher targets),
-# iBOT masked-patch self-distillation, and a KDE uniformity term on the
-# L2-normalised CLS tokens. YAML drives the tunable knobs (backbone variant,
-# LR + LR scheduler, drop path, layerwise decay, KDE weight + concentration,
-# FLOP/sample budgets, batch size); other DINOv2 hyperparameters are hardcoded
-# inline at their use sites.
+# iBOT masked-patch self-distillation, and a VICReg-style regularizer on CLS
+# tokens (center + scale + Sliced Wasserstein to N(0,I)). YAML drives the
+# tunable knobs (backbone variant, LR + LR scheduler, drop path, layerwise
+# decay, visreg weight, FLOP/sample budgets, batch size); other DINOv2
+# hyperparameters are hardcoded inline at their use sites.
 
 import atexit
 import contextlib
@@ -24,6 +24,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.distributions import Normal
 import wandb
 import yaml
 from torch.utils.data import DataLoader
@@ -154,12 +155,26 @@ def dino_ce(student, teacher):
     return -(teacher * F.log_softmax(student / 0.1, dim=-1)).sum(-1).mean()
 
 
-# KDE uniformity loss on L2-normalised CLS tokens.
-def kde_loss(x, concentration):
-    x = F.normalize(x, p=2, dim=-1)
-    sim = concentration * (x @ x.T)
-    sim.fill_diagonal_(-float("inf"))
-    return torch.logsumexp(sim, dim=1).mean() - math.log(max(1, sim.shape[1] - 1))
+# VICReg-style regularizer: enforces CLS token distribution to be N(0, I) via three
+# orthogonal terms — center (mean → 0), scale (std → 1 per dim), and shape (Sliced
+# Wasserstein Distance to a standard Gaussian using K random projection directions).
+def visreg(z, K=64):
+    N, D = z.shape
+    mu = z.mean(dim=0)
+    L_center = mu.pow(2).mean()
+    z_cent = z - mu
+    std = z_cent.std(dim=0, unbiased=False)
+    L_scale = (1.0 - std).pow(2).mean()
+    z_norm = z_cent / std.detach()
+    W = torch.randn(D, K, device=z.device, dtype=z.dtype)
+    W /= W.norm(p=2, dim=0)
+    p = z_norm @ W
+    p_sorted = torch.sort(p, dim=0).values
+    u = torch.arange(1, N + 1, device=z.device, dtype=z.dtype) / (N + 1)
+    target = Normal(0, 1).icdf(u)
+    L_shape = (p_sorted - target.unsqueeze(1)).pow(2).mean()
+    return L_center + L_scale + L_shape
+
 
 
 # Sample iBOT masking pattern: per-image bernoulli on whether to mask, then random patch ratio.
@@ -301,8 +316,8 @@ def main():
         f"config: {cfg['config_path']}  batch_size: {batch_size}  max_train_samples: {max_train_samples}  "
         f"max_train_flops: {train_cfg['max_train_flops']}  "
         f"probe_count: {cfg['probe']['count']}  warmup_fraction: {dino_cfg['warmup_fraction']}  "
-        f"lr: {dino_cfg['lr']}  adam_beta2: {dino_cfg['adam_beta2']}  kde_loss_weight: {dino_cfg['kde_loss_weight']}  "
-        f"kde_concentration: {dino_cfg['kde_concentration']}  drop_path: {dino_cfg['drop_path_rate']}  "
+        f"lr: {dino_cfg['lr']}  adam_beta2: {dino_cfg['adam_beta2']}  visreg_weight: {dino_cfg['visreg_weight']}  "
+        f"drop_path: {dino_cfg['drop_path_rate']}  "
         f"layerwise_decay: {dino_cfg['layerwise_decay']}",
         flush=True,
     )
@@ -407,9 +422,9 @@ def main():
             "unique_patches_seen": unique_tiles_seen * unique_tile_patch_count,
         }
 
-    # Compute (dino_loss, ibot_loss, kde) for one batch of (gf, lf) crops with the given masks +
+    # Compute (dino_loss, ibot_loss, reg) for one batch of (gf, lf) crops with the given masks +
     # schedule values. Used by both the train step and evaluate() (no_grad).
-    def compute_losses(gf, lf, b, masks, mask_idx, mask_w, t_temp, k_scale, ckpt=False):
+    def compute_losses(gf, lf, b, masks, mask_idx, mask_w, t_temp, reg_scale, ckpt=False):
         with torch.no_grad():
             t = teacher_backbone(gf)
             t_cls = teacher_dino_head(t["x_norm_clstoken"]).chunk(train_cfg["global_views"])
@@ -423,13 +438,13 @@ def main():
         global_loss = dino_ce(sg_cls, t_prob.flatten(0, 1)) * 2 / (2 * L + 2)
         s_patch = student_ibot_head(sg["x_norm_patchtokens"].flatten(0, 1)[mask_idx])
         ibot_loss = -(t_patch_prob * F.log_softmax(s_patch / 0.1, dim=-1)).sum(-1).mul(mask_w).sum() / max(1, b * 2)
-        kde = dino_cfg["kde_loss_weight"] * k_scale * sum(kde_loss(x, dino_cfg["kde_concentration"]) for x in sg["x_norm_clstoken"].chunk(train_cfg["global_views"]))
-        return local_loss + global_loss, ibot_loss, kde
+        reg = dino_cfg["visreg_weight"] * reg_scale * visreg(sg["x_norm_clstoken"])
+        return local_loss + global_loss, ibot_loss, reg
 
-    # Held-out validation pass: same DINO + iBOT + KDE losses on `val_batches` of the val split.
-    # Schedule terms (teacher_temp, kde_scale) drift over training, so read val curves as same-step
+    # Held-out validation pass: same DINO + iBOT + reg losses on `val_batches` of the val split.
+    # Schedule terms (teacher_temp, reg_scale) drift over training, so read val curves as same-step
     # diagnostics. RNG is snapshotted/restored so val masks don't perturb the next training step.
-    def evaluate(eval_step, eval_teacher_temp, eval_kde_scale):
+    def evaluate(eval_step, eval_teacher_temp, eval_reg_scale):
         for m in (student_backbone, student_dino_head, student_ibot_head):
             m.eval()
         py_rng, cpu_rng, cuda_rng = random.getstate(), torch.random.get_rng_state(), torch.cuda.get_rng_state(device)
@@ -445,13 +460,13 @@ def main():
             with torch.no_grad(), autocast:
                 gf, lf = vg.transpose(0, 1).flatten(0, 1), vl.transpose(0, 1).flatten(0, 1)
                 masks, mask_idx, mask_w = make_masks(b * train_cfg["global_views"], global_patches, device)
-                dino_l, ibot_l, kde_v = compute_losses(gf, lf, b, masks, mask_idx, mask_w, eval_teacher_temp, eval_kde_scale)
-            sums += torch.tensor([float(dino_l), float(ibot_l), float(kde_v), float(dino_l + ibot_l + kde_v)], device=device)
+                dino_l, ibot_l, reg_v = compute_losses(gf, lf, b, masks, mask_idx, mask_w, eval_teacher_temp, eval_reg_scale)
+            sums += torch.tensor([float(dino_l), float(ibot_l), float(reg_v), float(dino_l + ibot_l + reg_v)], device=device)
             n_batches += 1
         random.setstate(py_rng)
         torch.random.set_rng_state(cpu_rng)
         torch.cuda.set_rng_state(cuda_rng, device)
-        return dict(zip(("dino", "ibot", "kde", "total"), (sums / max(1, n_batches)).tolist()))
+        return dict(zip(("dino", "ibot", "reg", "total"), (sums / max(1, n_batches)).tolist()))
 
     # Ingest completed probe result JSONs into metrics.jsonl and wandb.
     def log_probe_results():
@@ -532,7 +547,7 @@ def main():
                 group["lr"] = base_lr * group["lr_mult"]
                 group["weight_decay"] = wd * group["wd_mult"]
             masks, mask_idx, mask_w = make_masks(batch_size * train_cfg["global_views"], global_patches, device)
-            kde_scale = min(1.0, max(0.0, (frac - 0.1) / 0.4))
+            reg_scale = min(1.0, max(0.0, (frac - 0.1) / 0.4))
             # Wrap forward + backward + opt.step in FlopCounterMode on the first step only;
             # subsequent steps reuse measured_flops_per_step (fixed shapes => fixed cost).
             flop_ctx = FlopCounterMode(display=False) if measured_flops_per_step is None else contextlib.nullcontext()
@@ -542,11 +557,11 @@ def main():
                     # so [crop0_img0, crop0_img1, ..., crop1_img0, ...] for clean teacher/student alignment.
                     gf = global_views.transpose(0, 1).flatten(0, 1)
                     lf = local_views.transpose(0, 1).flatten(0, 1)
-                    dino_loss_value, ibot_loss, kde = compute_losses(
-                        gf, lf, batch_size, masks, mask_idx, mask_w, teacher_temp, kde_scale,
+                    dino_loss_value, ibot_loss, reg = compute_losses(
+                        gf, lf, batch_size, masks, mask_idx, mask_w, teacher_temp, reg_scale,
                         ckpt=activation_checkpointing,
                     )
-                    total_loss = dino_loss_value + ibot_loss + kde
+                    total_loss = dino_loss_value + ibot_loss + reg
                 opt.zero_grad(set_to_none=True)
                 total_loss.backward()
                 grad_norm = nn.utils.clip_grad_norm_(
@@ -571,7 +586,7 @@ def main():
                 reduced = {
                     "dino": float(dino_loss_value.detach()),
                     "ibot": float(ibot_loss.detach()),
-                    "kde": float(kde.detach()),
+                    "reg": float(reg.detach()),
                     "total": float(total_loss.detach()),
                 }
                 unique_counts = flush_unique_counts()
@@ -614,7 +629,7 @@ def main():
                     "wd": wd,
                     "teacher_temp": teacher_temp,
                     "teacher_momentum": m,
-                    "kde_scale": kde_scale,
+                    "reg_scale": reg_scale,
                     "batch_size": batch_size,
                     "examples_seen": examples_seen,
                     "visible_patch_presentations": visible_patch_presentations,
@@ -628,7 +643,7 @@ def main():
                     f"{console_prefix()} Training  "
                     f"[{completed_step}/{total_steps_estimate}]  eta: {eta_string}  gap: {console_gap_ms:.2f} ms  "
                     f"lr: {current_lr:.6f}  total: {reduced['total']:.4f}  "
-                    f"dino: {reduced['dino']:.4f}  ibot: {reduced['ibot']:.4f}  kde: {reduced['kde']:.4f}  "
+                    f"dino: {reduced['dino']:.4f}  ibot: {reduced['ibot']:.4f}  reg: {reduced['reg']:.4f}  "
                     f"grad_norm: {train_log['grad_norm']:.4f}  flops/s: {flops_per_sec:.3e}  "
                     f"time: {step_seconds:.6f}  data: {data_seconds:.6f}  "
                     f"max mem: {int(gpu_peak_mem_gb * 1024)}",
@@ -652,12 +667,12 @@ def main():
             # always runs after the loop exits, regardless of milestones.
             maybe_run_probe(completed_step)
             if completed_step % int(train_cfg["eval_every"]) == 0 or train_flops >= max_train_flops or examples_seen + batch_size > max_train_samples:
-                val = evaluate(completed_step, teacher_temp, kde_scale)
+                val = evaluate(completed_step, teacher_temp, reg_scale)
                 val_log = {"step": completed_step, **{f"val_{k}": v for k, v in val.items()}}
                 with metrics_path.open("a") as handle:
                     handle.write(json.dumps(val_log) + "\n")
                 wandb_run.log({f"val/{k}": v for k, v in val.items()}, step=completed_step)
-                print(f"{console_prefix()} Validation  [{completed_step}]  total: {val['total']:.4f}  dino: {val['dino']:.4f}  ibot: {val['ibot']:.4f}  kde: {val['kde']:.4f}", flush=True)
+                print(f"{console_prefix()} Validation  [{completed_step}]  total: {val['total']:.4f}  dino: {val['dino']:.4f}  ibot: {val['ibot']:.4f}  reg: {val['reg']:.4f}", flush=True)
                 # Reset rate clocks after validation so the next train log is train-rate only.
                 last_console_step, last_console_monotonic = completed_step, time.monotonic()
                 last_time, last_examples, last_visible_patch_presentations, last_train_flops = time.time(), examples_seen, visible_patch_presentations, train_flops
@@ -708,8 +723,7 @@ def main():
         "warmup_train_samples": warmup_train_samples,
         "lr": dino_cfg["lr"],
         "adam_beta2": dino_cfg["adam_beta2"],
-        "kde_loss_weight": dino_cfg["kde_loss_weight"],
-        "kde_concentration": dino_cfg["kde_concentration"],
+        "visreg_weight": dino_cfg["visreg_weight"],
         "drop_path_rate": dino_cfg["drop_path_rate"],
         "layerwise_decay": dino_cfg["layerwise_decay"],
         "probe_target_samples": probe_targets,

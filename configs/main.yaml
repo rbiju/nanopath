@@ -56,8 +56,7 @@ dino:
   head_hidden_dim: 2048
   head_bottleneck_dim: 384
   clip_grad: 3.0
-  kde_loss_weight: 0.005
-  kde_concentration: 10.0
+  visreg_weight: 0.005
 
 probe:
   enabled: true
