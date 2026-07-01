@@ -436,7 +436,12 @@ def main():
         s_patch = student_ibot_head(sg["x_norm_patchtokens"].flatten(0, 1)[mask_idx])
         ibot_loss = -(t_patch_prob * F.log_softmax(s_patch / 0.1, dim=-1)).sum(-1).mul(mask_w).sum() / max(1, b * 2)
         reg = head_cfg["score_reg_weight"] * reg_scale * score_swd(sg_cls)
-        return local_loss + global_loss, ibot_loss, reg
+        with torch.no_grad():
+            p = F.softmax(sg_cls.detach().float(), dim=-1)
+            h_per = -(p * p.log()).sum(-1).mean()
+            p_bar = p.mean(dim=0)
+            h_batch = -(p_bar * p_bar.log()).sum()
+        return local_loss + global_loss, ibot_loss, reg, h_per, h_batch
 
     # Held-out validation pass: same DINO + iBOT + reg losses on `val_batches` of the val split.
     # Schedule terms (teacher_temp, reg_scale) drift over training, so read val curves as same-step
@@ -447,7 +452,7 @@ def main():
         py_rng, cpu_rng, cuda_rng = random.getstate(), torch.random.get_rng_state(), torch.cuda.get_rng_state(device)
         random.seed(train_cfg["seed"] + eval_step)
         torch.manual_seed(train_cfg["seed"] + eval_step)
-        sums = torch.zeros(4, device=device)
+        sums = torch.zeros(6, device=device)
         n_batches = 0
         for vb_idx, vbatch in enumerate(val_loader):
             if vb_idx >= int(train_cfg["val_batches"]):
@@ -457,13 +462,13 @@ def main():
             with torch.no_grad(), autocast:
                 gf, lf = vg.transpose(0, 1).flatten(0, 1), vl.transpose(0, 1).flatten(0, 1)
                 masks, mask_idx, mask_w = make_masks(b * train_cfg["global_views"], global_patches, device)
-                dino_l, ibot_l, reg_v = compute_losses(gf, lf, b, masks, mask_idx, mask_w, eval_teacher_temp, eval_reg_scale)
-            sums += torch.tensor([float(dino_l), float(ibot_l), float(reg_v), float(dino_l + ibot_l + reg_v)], device=device)
+                dino_l, ibot_l, reg_v, h_per_v, h_batch_v = compute_losses(gf, lf, b, masks, mask_idx, mask_w, eval_teacher_temp, eval_reg_scale)
+            sums += torch.tensor([float(dino_l), float(ibot_l), float(reg_v), float(dino_l + ibot_l + reg_v), float(h_per_v), float(h_batch_v)], device=device)
             n_batches += 1
         random.setstate(py_rng)
         torch.random.set_rng_state(cpu_rng)
         torch.cuda.set_rng_state(cuda_rng, device)
-        return dict(zip(("dino", "ibot", "reg", "total"), (sums / max(1, n_batches)).tolist()))
+        return dict(zip(("dino", "ibot", "reg", "total", "h_per", "h_batch"), (sums / max(1, n_batches)).tolist()))
 
     # Ingest completed probe result JSONs into metrics.jsonl and wandb.
     def log_probe_results():
@@ -554,7 +559,7 @@ def main():
                     # so [crop0_img0, crop0_img1, ..., crop1_img0, ...] for clean teacher/student alignment.
                     gf = global_views.transpose(0, 1).flatten(0, 1)
                     lf = local_views.transpose(0, 1).flatten(0, 1)
-                    dino_loss_value, ibot_loss, reg = compute_losses(
+                    dino_loss_value, ibot_loss, reg, h_per, h_batch = compute_losses(
                         gf, lf, batch_size, masks, mask_idx, mask_w, teacher_temp, reg_scale,
                         ckpt=activation_checkpointing,
                     )
@@ -585,6 +590,8 @@ def main():
                     "ibot": float(ibot_loss.detach()),
                     "reg": float(reg.detach()),
                     "total": float(total_loss.detach()),
+                    "h_per": float(h_per),
+                    "h_batch": float(h_batch),
                 }
                 unique_counts = flush_unique_counts()
                 now = time.time()
@@ -641,6 +648,7 @@ def main():
                     f"[{completed_step}/{total_steps_estimate}]  eta: {eta_string}  gap: {console_gap_ms:.2f} ms  "
                     f"lr: {current_lr:.6f}  total: {reduced['total']:.4f}  "
                     f"dino: {reduced['dino']:.4f}  ibot: {reduced['ibot']:.4f}  reg: {reduced['reg']:.4f}  "
+                    f"h_per: {reduced['h_per']:.3f}  h_batch: {reduced['h_batch']:.3f}  "
                     f"grad_norm: {train_log['grad_norm']:.4f}  flops/s: {flops_per_sec:.3e}  "
                     f"time: {step_seconds:.6f}  data: {data_seconds:.6f}  "
                     f"max mem: {int(gpu_peak_mem_gb * 1024)}",
@@ -669,7 +677,7 @@ def main():
                 with metrics_path.open("a") as handle:
                     handle.write(json.dumps(val_log) + "\n")
                 wandb_run.log({f"val/{k}": v for k, v in val.items()}, step=completed_step)
-                print(f"{console_prefix()} Validation  [{completed_step}]  total: {val['total']:.4f}  dino: {val['dino']:.4f}  ibot: {val['ibot']:.4f}  reg: {val['reg']:.4f}", flush=True)
+                print(f"{console_prefix()} Validation  [{completed_step}]  total: {val['total']:.4f}  dino: {val['dino']:.4f}  ibot: {val['ibot']:.4f}  reg: {val['reg']:.4f}  h_per: {val['h_per']:.3f}  h_batch: {val['h_batch']:.3f}", flush=True)
                 # Reset rate clocks after validation so the next train log is train-rate only.
                 last_console_step, last_console_monotonic = completed_step, time.monotonic()
                 last_time, last_examples, last_visible_patch_presentations, last_train_flops = time.time(), examples_seen, visible_patch_presentations, train_flops
