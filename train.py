@@ -30,8 +30,7 @@ from torch.utils.data import DataLoader
 from torch.utils.flop_counter import FlopCounterMode
 
 from dataloader import TCGATileDataset, TILE_SIZE
-from model import DINOHead, DinoV2ViT, load_dinov2_pretrained
-from prototype_head import PrototypeHead
+from model import DINOHead, PrototypeHead, DinoV2ViT, load_dinov2_pretrained
 from probe import (
     completed_probe_summary,
     collect_probe_results,
