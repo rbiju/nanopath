@@ -1,5 +1,5 @@
 project:
-  name: op_sk_removed_no_schedule
+  name: op_sk_removed_no_schedule_no_ent_reg
   family: nanopath
   recipe_id: dinov2-vits14-ortho_prototypes-sk_removed_no_schedule
   output_dir: /data/$USER/nanopath/20260701_op_sk-removed_no_schedule
