@@ -173,6 +173,24 @@ def score_swd(z, K=64):
     return (p_sorted - target.unsqueeze(1)).pow(2).mean()
 
 
+# InfoMax entropy regularizer on the prototype assignments, evaluated at a sharp temperature so a
+# collapsed marginal is genuinely peaked (unlike the temp-1 monitor, whose bounded scores saturate
+# near ln(n_prototypes) regardless of collapse). Returns (h_per, h_batch):
+#   h_per   = mean per-sample assignment entropy   -> minimized  (confident per-image assignments)
+#   h_batch = entropy of the batch-mean assignment -> maximized  (mass spread across prototypes)
+# Maximizing h_batch - h_per maximizes the mutual information between images and prototypes.
+# Unlike score_swd this is repulsive AT collapse: a marginal peaked on one prototype sits at
+# near-minimal h_batch (large gradient to spread it) and a per-sample-uniform state at maximal
+# h_per (large gradient to sharpen). Unlike Sinkhorn it only *encourages* a spread marginal through
+# a tunable weight instead of forcing it uniform, so the equilibrium can track the true tissue mix.
+def entropy_reg(scores, temp, eps=1e-8):
+    p = F.softmax(scores.float() / temp, dim=-1)
+    h_per = -(p * (p + eps).log()).sum(-1).mean()
+    p_bar = p.mean(dim=0)
+    h_batch = -(p_bar * (p_bar + eps).log()).sum()
+    return h_per, h_batch
+
+
 # Sample iBOT masking pattern: per-image bernoulli on whether to mask, then random patch ratio.
 def make_masks(batch, patches, device):
     masks = torch.zeros(batch, patches, dtype=torch.bool, device=device)
@@ -186,8 +204,9 @@ def make_masks(batch, patches, device):
 
 # AdamW parameter groups with layer-wise LR decay on the backbone:
 # block i gets lr * layerwise_decay^(depth - 1 - i); patch_embed gets the deepest decay
-# multiplied by patch_embed_lr_mult; biases and norms get no weight decay; the head's
-# final weight-norm last_layer parameters get an LR-freeze for the first dino.freeze_last_layer_fraction.
+# multiplied by patch_embed_lr_mult; biases, norms, and the orthonormal prototype bank get no
+# weight decay; the head's final weight-norm last_layer parameters get an LR-freeze for the first
+# dino.freeze_last_layer_fraction.
 def build_param_groups(student_backbone, student_dino_head, student_ibot_head, layerwise_decay, patch_embed_lr_mult):
     depth = len(student_backbone.blocks)
     # Coalesce params that share (lr_mult, wd_mult, last_layer) into a single group each (~30 groups
@@ -204,7 +223,11 @@ def build_param_groups(student_backbone, student_dino_head, student_ibot_head, l
                 lr_mult = layerwise_decay ** (depth - 1 - int(name.split(".")[1]))
             elif kind == "backbone" and name.startswith("patch_embed."):
                 lr_mult = (layerwise_decay ** depth) * patch_embed_lr_mult
-            wd_mult = 0.0 if name.endswith("bias") or "norm" in name or p.ndim < 2 else 1.0
+            # The PrototypeHead bank is re-orthonormalized every forward (Newton-Schulz), which is
+            # invariant to its scale/stretch. Weight decay only shrinks that invisible gauge without
+            # affecting the loss, so exclude it (alongside biases and norms).
+            no_wd = name.endswith("bias") or "norm" in name or p.ndim < 2 or name.endswith("prototypes")
+            wd_mult = 0.0 if no_wd else 1.0
             key = (lr_mult, wd_mult, "last_layer" in name)
             coalesced.setdefault(key, {"params": [], "lr_mult": lr_mult, "wd_mult": wd_mult, "last_layer": key[2]})["params"].append(p)
     return list(coalesced.values())
@@ -436,12 +459,14 @@ def main():
         s_patch = student_ibot_head(sg["x_norm_patchtokens"].flatten(0, 1)[mask_idx])
         ibot_loss = -(t_patch_prob * F.log_softmax(s_patch / 0.1, dim=-1)).sum(-1).mul(mask_w).sum() / max(1, b * 2)
         reg = head_cfg["score_reg_weight"] * reg_scale * score_swd(sg_cls)
-        with torch.no_grad():
-            p = F.softmax(sg_cls.detach().float(), dim=-1)
-            h_per = -(p * p.log()).sum(-1).mean()
-            p_bar = p.mean(dim=0)
-            h_batch = -(p_bar * p_bar.log()).sum()
-        return local_loss + global_loss, ibot_loss, reg, h_per, h_batch
+        # InfoMax entropy term: push per-sample assignments to be confident and the batch marginal
+        # to be spread. h_per/h_batch are the sharp-temp entropies and double as the collapse
+        # monitors, replacing the old temp-1 read that saturated near ln(n_prototypes) at collapse.
+        h_per, h_batch = entropy_reg(sg_cls, head_cfg["entropy_reg_temp"])
+        # entropy_reg_weight is the master switch: set it to 0 to disable the InfoMax term while
+        # still computing h_per/h_batch as collapse monitors (e.g. to isolate score_swd's effect).
+        ent_reg = head_cfg["entropy_reg_weight"] * (head_cfg["sample_entropy_weight"] * h_per - head_cfg["batch_entropy_weight"] * h_batch)
+        return local_loss + global_loss, ibot_loss, reg, ent_reg, h_per.detach(), h_batch.detach()
 
     # Held-out validation pass: same DINO + iBOT + reg losses on `val_batches` of the val split.
     # Schedule terms (teacher_temp, reg_scale) drift over training, so read val curves as same-step
@@ -452,7 +477,7 @@ def main():
         py_rng, cpu_rng, cuda_rng = random.getstate(), torch.random.get_rng_state(), torch.cuda.get_rng_state(device)
         random.seed(train_cfg["seed"] + eval_step)
         torch.manual_seed(train_cfg["seed"] + eval_step)
-        sums = torch.zeros(6, device=device)
+        sums = torch.zeros(7, device=device)
         n_batches = 0
         for vb_idx, vbatch in enumerate(val_loader):
             if vb_idx >= int(train_cfg["val_batches"]):
@@ -462,13 +487,13 @@ def main():
             with torch.no_grad(), autocast:
                 gf, lf = vg.transpose(0, 1).flatten(0, 1), vl.transpose(0, 1).flatten(0, 1)
                 masks, mask_idx, mask_w = make_masks(b * train_cfg["global_views"], global_patches, device)
-                dino_l, ibot_l, reg_v, h_per_v, h_batch_v = compute_losses(gf, lf, b, masks, mask_idx, mask_w, eval_teacher_temp, eval_reg_scale)
-            sums += torch.tensor([float(dino_l), float(ibot_l), float(reg_v), float(dino_l + ibot_l + reg_v), float(h_per_v), float(h_batch_v)], device=device)
+                dino_l, ibot_l, reg_v, ent_v, h_per_v, h_batch_v = compute_losses(gf, lf, b, masks, mask_idx, mask_w, eval_teacher_temp, eval_reg_scale)
+            sums += torch.tensor([float(dino_l), float(ibot_l), float(reg_v), float(ent_v), float(dino_l + ibot_l + reg_v + ent_v), float(h_per_v), float(h_batch_v)], device=device)
             n_batches += 1
         random.setstate(py_rng)
         torch.random.set_rng_state(cpu_rng)
         torch.cuda.set_rng_state(cuda_rng, device)
-        return dict(zip(("dino", "ibot", "reg", "total", "h_per", "h_batch"), (sums / max(1, n_batches)).tolist()))
+        return dict(zip(("dino", "ibot", "reg", "ent", "total", "h_per", "h_batch"), (sums / max(1, n_batches)).tolist()))
 
     # Ingest completed probe result JSONs into metrics.jsonl and wandb.
     def log_probe_results():
@@ -549,7 +574,10 @@ def main():
                 group["lr"] = base_lr * group["lr_mult"]
                 group["weight_decay"] = wd * group["wd_mult"]
             masks, mask_idx, mask_w = make_masks(batch_size * train_cfg["global_views"], global_patches, device)
-            reg_scale = min(1.0, max(0.0, (frac - 0.1) / 0.4))
+            # score_swd is active at full strength from step 0: collapse to a single prototype
+            # happens in the earliest steps (sharp teacher temp, no Sinkhorn centering), so the
+            # regularizer has to guard that window rather than ramp in after collapse has set in.
+            reg_scale = 1.0
             # Wrap forward + backward + opt.step in FlopCounterMode on the first step only;
             # subsequent steps reuse measured_flops_per_step (fixed shapes => fixed cost).
             flop_ctx = FlopCounterMode(display=False) if measured_flops_per_step is None else contextlib.nullcontext()
@@ -559,11 +587,11 @@ def main():
                     # so [crop0_img0, crop0_img1, ..., crop1_img0, ...] for clean teacher/student alignment.
                     gf = global_views.transpose(0, 1).flatten(0, 1)
                     lf = local_views.transpose(0, 1).flatten(0, 1)
-                    dino_loss_value, ibot_loss, reg, h_per, h_batch = compute_losses(
+                    dino_loss_value, ibot_loss, reg, ent_reg, h_per, h_batch = compute_losses(
                         gf, lf, batch_size, masks, mask_idx, mask_w, teacher_temp, reg_scale,
                         ckpt=activation_checkpointing,
                     )
-                    total_loss = dino_loss_value + ibot_loss + reg
+                    total_loss = dino_loss_value + ibot_loss + reg + ent_reg
                 opt.zero_grad(set_to_none=True)
                 total_loss.backward()
                 grad_norm = nn.utils.clip_grad_norm_(
@@ -589,6 +617,7 @@ def main():
                     "dino": float(dino_loss_value.detach()),
                     "ibot": float(ibot_loss.detach()),
                     "reg": float(reg.detach()),
+                    "ent": float(ent_reg.detach()),
                     "total": float(total_loss.detach()),
                     "h_per": float(h_per),
                     "h_batch": float(h_batch),
@@ -647,7 +676,7 @@ def main():
                     f"{console_prefix()} Training  "
                     f"[{completed_step}/{total_steps_estimate}]  eta: {eta_string}  gap: {console_gap_ms:.2f} ms  "
                     f"lr: {current_lr:.6f}  total: {reduced['total']:.4f}  "
-                    f"dino: {reduced['dino']:.4f}  ibot: {reduced['ibot']:.4f}  reg: {reduced['reg']:.4f}  "
+                    f"dino: {reduced['dino']:.4f}  ibot: {reduced['ibot']:.4f}  reg: {reduced['reg']:.4f}  ent: {reduced['ent']:.4f}  "
                     f"h_per: {reduced['h_per']:.3f}  h_batch: {reduced['h_batch']:.3f}  "
                     f"grad_norm: {train_log['grad_norm']:.4f}  flops/s: {flops_per_sec:.3e}  "
                     f"time: {step_seconds:.6f}  data: {data_seconds:.6f}  "
@@ -677,7 +706,7 @@ def main():
                 with metrics_path.open("a") as handle:
                     handle.write(json.dumps(val_log) + "\n")
                 wandb_run.log({f"val/{k}": v for k, v in val.items()}, step=completed_step)
-                print(f"{console_prefix()} Validation  [{completed_step}]  total: {val['total']:.4f}  dino: {val['dino']:.4f}  ibot: {val['ibot']:.4f}  reg: {val['reg']:.4f}  h_per: {val['h_per']:.3f}  h_batch: {val['h_batch']:.3f}", flush=True)
+                print(f"{console_prefix()} Validation  [{completed_step}]  total: {val['total']:.4f}  dino: {val['dino']:.4f}  ibot: {val['ibot']:.4f}  reg: {val['reg']:.4f}  ent: {val['ent']:.4f}  h_per: {val['h_per']:.3f}  h_batch: {val['h_batch']:.3f}", flush=True)
                 # Reset rate clocks after validation so the next train log is train-rate only.
                 last_console_step, last_console_monotonic = completed_step, time.monotonic()
                 last_time, last_examples, last_visible_patch_presentations, last_train_flops = time.time(), examples_seen, visible_patch_presentations, train_flops

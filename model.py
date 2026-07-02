@@ -227,15 +227,20 @@ def _build_mlp(nlayers, in_dim, out_dim, hidden_dim=None, use_bn=False, bias=Tru
 
 def newton_schulz(X, steps=5):
     """
-    Compute the orthogonal factor of X via Newton-Schulz iteration.
-    X must have shape (M, N) with M <= N. Returns a semi-orthogonal matrix
-    with orthonormal rows, converging from any full-rank initialization.
-    Implemented entirely as matmuls for GPU efficiency.
+    Orthogonalize X via a quintic Newton-Schulz iteration
     """
-    X = X / (X.norm() + 1e-8)
+    a, b, c = (2.0, -1.5, 0.5)
+    transpose = X.size(-2) > X.size(-1)
+    if transpose:
+        X = X.mT
+    # Frobenius norm bounds the spectral norm by 1, placing all singular values in the basin.
+    X = X / (X.norm(dim=(-2, -1), keepdim=True) + 1e-7)
     for _ in range(steps):
-        A = X @ X.T
-        X = 1.5 * X - 0.5 * A @ X
+        A = X @ X.mT
+        B = b * A + c * A @ A
+        X = a * X + B @ X
+    if transpose:
+        X = X.mT
     return X
 
 
