@@ -1,8 +1,8 @@
 project:
-  name: op_sk_removed_no_schedule_with_ent_reg
+  name: op_skN_swdY_entregY_orthoY
   family: nanopath
-  recipe_id: dinov2-vits14-ortho_prototypes-sk_removed_no_schedule_no_ent_reg
-  output_dir: /data/$USER/nanopath/20260701_op-sk_removed_no_schedule_no_ent_reg
+  recipe_id: dinov2-vits14-op_skN_swdY_entregY_orthoY
+  output_dir: /data/$USER/nanopath/20260702_op_skN_swdY_entregY_orthoY
   wandb_dir: /data/$USER/nanopath/wandb
 
 data:

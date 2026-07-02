@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-#SBATCH --job-name=op_sk_removed_ent_reg
+#SBATCH --job-name=op_skN_swdY_entregY_orthoY
 #SBATCH --nodes=1
 #SBATCH --ntasks-per-node=1
 #SBATCH --gpus-per-task=1
