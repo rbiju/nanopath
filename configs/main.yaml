@@ -1,8 +1,8 @@
 project:
-  name: op_sk_removed_no_schedule_no_ent_reg_no_ortho
+  name: op_skN_swdY_entregN_orthoN
   family: nanopath
-  recipe_id: dinov2-vits14-ortho_prototypes-sk_removed_no_schedule_no_ent_reg
-  output_dir: /data/$USER/nanopath/20260701_op-sk_removed_no_schedule_no_ent_reg
+  recipe_id: dinov2-vits14-op_skN_swdY_entregN_orthoN
+  output_dir: /data/$USER/nanopath/20260702_op_skN_swdY_entregN_orthoN
   wandb_dir: /data/$USER/nanopath/wandb
 
 data:
@@ -68,7 +68,7 @@ prototype_head:
   # trade off confident per-image assignments (sample) against a spread batch marginal (batch).
   # Lower batch_entropy_weight relative to sample to let the marginal follow the true tissue mix
   # rather than being pushed toward uniform (the behavior we dropped Sinkhorn to avoid).
-  entropy_reg_weight: 1.0  # master switch for the InfoMax term; 0 = disabled (isolating score_swd)
+  entropy_reg_weight: 0.0  # master switch for the InfoMax term; 0 = disabled (isolating score_swd)
   entropy_reg_temp: 0.1
   sample_entropy_weight: 1.0
   batch_entropy_weight: 1.0
