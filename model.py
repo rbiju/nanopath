@@ -246,13 +246,14 @@ def newton_schulz(X, steps=5):
 
 class PrototypeHead(nn.Module):
     """
-    Drop-in replacement for DINOHead that compares bottleneck embeddings
-    against a learnable orthonormal prototype bank rather than projecting
-    into a large unstructured space.
+    Drop-in replacement for DINOHead that scores bottleneck embeddings against
+    a learnable prototype bank rather than projecting into a large unstructured
+    space.
 
-    Prototypes live in bottleneck_dim-space (same as the MLP output) and
-    are kept orthonormal via Newton-Schulz during the forward pass.
-    Requires n_prototypes <= bottleneck_dim.
+    Both the embeddings and the prototypes are L2-normalized, so the scores are
+    cosine similarities in [-1, 1]. No orthogonality constraint is imposed on the
+    bank (Newton-Schulz is not applied), so the prototypes are free to be
+    correlated and n_prototypes need not be <= prototype_dim.
     """
 
     def __init__(
@@ -262,14 +263,9 @@ class PrototypeHead(nn.Module):
         hidden_dim=768,
         prototype_dim=256,
         n_layers=3,
-        ns_steps=5,
+        ns_steps=5,  # unused: kept for call-site/config compatibility now that NS is removed
     ):
-        assert n_prototypes <= prototype_dim, (
-            f"PrototypeHead requires n_prototypes ({n_prototypes}) "
-            f"<= bottleneck_dim ({prototype_dim}) for orthogonality to be well-defined."
-        )
         super().__init__()
-        self.ns_steps = ns_steps
         n_layers = max(n_layers, 1)
         self.mlp = _build_mlp(n_layers, in_dim, prototype_dim, hidden_dim=hidden_dim)
         self.apply(self._init_weights)
@@ -285,5 +281,6 @@ class PrototypeHead(nn.Module):
     def forward(self, x):
         x = self.mlp(x)
         x = F.normalize(x, dim=-1, p=2)
-        ortho_prototypes = newton_schulz(self.prototypes, steps=self.ns_steps)
-        return x @ ortho_prototypes.T
+        # Cosine similarity against an unconstrained prototype bank (no orthogonalization).
+        prototypes = F.normalize(self.prototypes, dim=-1, p=2)
+        return x @ prototypes.T
