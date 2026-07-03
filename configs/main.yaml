@@ -67,6 +67,9 @@ prototype_head:
   prototype_dim: 512
   n_layers: 3
   ns_steps: 5
+  # true: keep the prototype bank orthonormal via Newton-Schulz (ns_steps). false: only unit-norm
+  # each prototype, ablating the mutual-orthogonality constraint (scores stay cosine in [-1, 1]).
+  orthogonal: true
   # iBOT patch branch: "sinkhorn" (DINOHead + Sinkhorn-centred targets, restores anti-collapse)
   # or "prototype" (PrototypeHead + plain-softmax targets, mirroring the CLS branch).
   ibot_mode: sinkhorn

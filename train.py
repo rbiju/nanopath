@@ -289,7 +289,7 @@ def main():
     if ibot_mode not in ("sinkhorn", "prototype"):
         raise ValueError(f"prototype_head.ibot_mode must be 'sinkhorn' or 'prototype', got {ibot_mode!r}")
     def make_prototype_head():
-        return PrototypeHead(student_backbone.embed_dim, head_cfg['n_prototypes'], head_cfg["hidden_dim"], head_cfg["prototype_dim"], head_cfg["n_layers"], head_cfg['ns_steps']).to(device)
+        return PrototypeHead(student_backbone.embed_dim, head_cfg['n_prototypes'], head_cfg["hidden_dim"], head_cfg["prototype_dim"], head_cfg["n_layers"], head_cfg['ns_steps'], head_cfg["orthogonal"]).to(device)
     student_dino_head = make_prototype_head()
     student_ibot_head = make_prototype_head() if ibot_mode == "prototype" else DINOHead(student_backbone.embed_dim, 131072, dino_cfg["head_hidden_dim"], dino_cfg["head_bottleneck_dim"], 3).to(device)
     teacher_dino_head = deepcopy(student_dino_head)
@@ -360,7 +360,7 @@ def main():
         f"max_train_flops: {train_cfg['max_train_flops']}  "
         f"probe_count: {cfg['probe']['count']}  warmup_fraction: {dino_cfg['warmup_fraction']}  "
         f"lr: {dino_cfg['lr']}  adam_beta2: {dino_cfg['adam_beta2']}  score_reg_weight: {head_cfg['score_reg_weight']}  "
-        f"ibot_mode: {ibot_mode}  "
+        f"ibot_mode: {ibot_mode}  orthogonal: {head_cfg['orthogonal']}  "
         f"drop_path: {dino_cfg['drop_path_rate']}  "
         f"layerwise_decay: {dino_cfg['layerwise_decay']}",
         flush=True,
@@ -792,6 +792,7 @@ def main():
         "adam_beta2": dino_cfg["adam_beta2"],
         "score_reg_weight": head_cfg["score_reg_weight"],
         "ibot_mode": ibot_mode,
+        "orthogonal": head_cfg["orthogonal"],
         "drop_path_rate": dino_cfg["drop_path_rate"],
         "layerwise_decay": dino_cfg["layerwise_decay"],
         "probe_target_samples": probe_targets,

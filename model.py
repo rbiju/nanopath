@@ -265,13 +265,19 @@ class PrototypeHead(nn.Module):
         prototype_dim=256,
         n_layers=3,
         ns_steps=5,
+        orthogonal=True,
     ):
-        assert n_prototypes <= prototype_dim, (
-            f"PrototypeHead requires n_prototypes ({n_prototypes}) "
-            f"<= bottleneck_dim ({prototype_dim}) for orthogonality to be well-defined."
-        )
+        # The <= constraint only binds when we orthonormalize (can't have more mutually orthonormal
+        # rows than dimensions); with orthogonal=False the bank is merely unit-normed, so any
+        # n_prototypes is admissible.
+        if orthogonal:
+            assert n_prototypes <= prototype_dim, (
+                f"PrototypeHead(orthogonal=True) requires n_prototypes ({n_prototypes}) "
+                f"<= prototype_dim ({prototype_dim}) for orthogonality to be well-defined."
+            )
         super().__init__()
         self.ns_steps = ns_steps
+        self.orthogonal = bool(orthogonal)
         n_layers = max(n_layers, 1)
         self.mlp = _build_mlp(n_layers, in_dim, prototype_dim, hidden_dim=hidden_dim)
         self.apply(self._init_weights)
@@ -293,5 +299,8 @@ class PrototypeHead(nn.Module):
     def forward(self, x):
         x = self.mlp(x)
         x = F.normalize(x, dim=-1, p=2)
-        ortho_prototypes = newton_schulz(self.prototypes, steps=self.ns_steps)
-        return self.logit_scale.clamp(max=math.log(100)).exp() * (x @ ortho_prototypes.T)
+        # orthogonal=True: Newton-Schulz yields a (near-)orthonormal bank (unit-norm rows, mutually
+        # decorrelated). orthogonal=False: just unit-norm each prototype, so scores stay cosine in
+        # [-1, 1] and only the mutual-orthogonality constraint is ablated.
+        prototypes = newton_schulz(self.prototypes, steps=self.ns_steps) if self.orthogonal else F.normalize(self.prototypes, dim=-1, p=2)
+        return self.logit_scale.clamp(max=math.log(100)).exp() * (x @ prototypes.T)
