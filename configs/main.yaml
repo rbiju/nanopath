@@ -1,8 +1,8 @@
 project:
-  name: op_skN_swdN_entregY_orthoY_logit_scale_proto_dim512
+  name: op_skN_swdN_entregY_orthoY_lowerentregweight
   family: nanopath
-  recipe_id: dinov2-vits14-op_skN_swdN_entregY_orthoY_logit_scale_proto_dim512
-  output_dir: /data/$USER/nanopath/20260702_op_skN_swdN_entregY_orthoY_logit_scale_proto_dim512
+  recipe_id: dinov2-vits14-op_skN_swdN_entregY_orthoY_lowerentregweight
+  output_dir: /data/$USER/nanopath/20260702_op_skN_swdN_entregY_orthoY_lowerentregweight
   wandb_dir: /data/$USER/nanopath/wandb
 
 data:
@@ -73,7 +73,7 @@ prototype_head:
   # trade off confident per-image assignments (sample) against a spread batch marginal (batch).
   # Lower batch_entropy_weight relative to sample to let the marginal follow the true tissue mix
   # rather than being pushed toward uniform (the behavior we dropped Sinkhorn to avoid).
-  entropy_reg_weight: 1.0  # master switch for the InfoMax term; 0 = disabled (isolating score_swd)
+  entropy_reg_weight: 0.001  # master switch for the InfoMax term; 0 = disabled (isolating score_swd)
   entropy_reg_temp: 0.1
   sample_entropy_weight: 1.0
   batch_entropy_weight: 1.0
