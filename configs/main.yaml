@@ -1,8 +1,8 @@
 project:
-  name: op_skN_swdN_entregY_orthoY
+  name: op_skN_swdN_entregY_orthoY_logit_scale_proto_dim512
   family: nanopath
-  recipe_id: dinov2-vits14-op_skN_swdN_entregY_orthoY
-  output_dir: /data/$USER/nanopath/20260702_op_skN_swdN_entregY_orthoY
+  recipe_id: dinov2-vits14-op_skN_swdN_entregY_orthoY_logit_scale_proto_dim512
+  output_dir: /data/$USER/nanopath/20260702_op_skN_swdN_entregY_orthoY_logit_scale_proto_dim512
   wandb_dir: /data/$USER/nanopath/wandb
 
 data:
@@ -62,9 +62,9 @@ dino:
   kde_concentration: 10.0  # cosine-similarity scale inside the logsumexp; higher = sharper repulsion
 
 prototype_head:
-  n_prototypes: 128
+  n_prototypes: 256
   hidden_dim: 768
-  prototype_dim: 256
+  prototype_dim: 512
   n_layers: 3
   ns_steps: 5
   reg_type: kde  # anti-collapse shape regularizer: "swd" (score_swd) or "kde" (dino.kde_* knobs)

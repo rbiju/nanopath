@@ -9,6 +9,8 @@
 # DINO CLS / iBOT patch self-distillation losses. It is intentionally trivial
 # (~15 lines) so we have zero runtime dependency on the dinov2 codebase.
 
+import math
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -275,6 +277,12 @@ class PrototypeHead(nn.Module):
         self.apply(self._init_weights)
         self.prototypes = nn.Parameter(torch.empty(n_prototypes, prototype_dim))
         trunc_normal_(self.prototypes, std=0.02)
+        # Learnable logit scale (inverse temperature). Cosine scores against the orthonormal bank
+        # are bounded in [-1, 1], so unlike DINOHead's unbounded weight-normed logits this head
+        # cannot sharpen its assignments on its own. Init at 0 (exp = 1) is a no-op vs the current
+        # behaviour; the optimizer learns how sharp to make the scores. Clamped in forward
+        # (CLIP-style, <= log 100) so it cannot run away. Scalar => no weight decay in train.py.
+        self.logit_scale = nn.Parameter(torch.zeros(()))
 
     def _init_weights(self, m):
         if isinstance(m, nn.Linear):
@@ -286,4 +294,4 @@ class PrototypeHead(nn.Module):
         x = self.mlp(x)
         x = F.normalize(x, dim=-1, p=2)
         ortho_prototypes = newton_schulz(self.prototypes, steps=self.ns_steps)
-        return x @ ortho_prototypes.T
+        return self.logit_scale.clamp(max=math.log(100)).exp() * (x @ ortho_prototypes.T)
