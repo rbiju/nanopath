@@ -1,9 +1,9 @@
 # Continual DINOv2 pretraining on TCGA tiles (single-GPU). Three loss terms:
 # DINO CLS self-distillation (Sinkhorn-Knopp centred teacher targets),
-# iBOT masked-patch self-distillation, and a VICReg-style regularizer on the
-# prototype score vectors (center + scale + SWD to N(0,I)). YAML drives the
+# iBOT masked-patch self-distillation, and a KDE uniformity regularizer on the
+# CLS embeddings (spreads them over the hypersphere). YAML drives the
 # tunable knobs (backbone variant, LR + LR scheduler, drop path, layerwise
-# decay, prototype score reg weight, FLOP/sample budgets, batch size); other
+# decay, KDE reg weight + concentration, FLOP/sample budgets, batch size); other
 # DINOv2 hyperparameters are hardcoded inline at their use sites.
 
 import atexit
@@ -24,7 +24,6 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.distributions import Normal
 import wandb
 import yaml
 from torch.utils.data import DataLoader
@@ -140,7 +139,7 @@ def cosine_schedule(start, end, frac):
 
 # Sinkhorn-Knopp centring across this batch, used as DINO/iBOT teacher targets.
 # Commented out: assumes batch diversity (uniform prototype usage) which isn't guaranteed
-# with spatially-correlated pathology tiles. Replaced by plain teacher softmax + score_swd.
+# with spatially-correlated pathology tiles. Replaced by plain teacher softmax + KDE reg.
 # def sinkhorn(x, temp):
 #     q = torch.exp(x.float() / temp).t()
 #     b = q.shape[1]
@@ -157,20 +156,15 @@ def dino_ce(student, teacher):
     return -(teacher * F.log_softmax(student / 0.1, dim=-1)).sum(-1).mean()
 
 
-# SWD shape regularizer on prototype score vectors. Projects [N, n_prototypes]
-# scores onto K random directions, standardises each projection using detached
-# statistics (so gradients see only shape, not center/scale), then penalises
-# deviation of the sorted values from N(0,1) quantiles.
-def score_swd(z, K=64):
-    N, D = z.shape
-    W = torch.randn(D, K, device=z.device, dtype=z.dtype)
-    W /= W.norm(p=2, dim=0)
-    p = z @ W
-    p = (p - p.mean(dim=0).detach()) / p.std(dim=0).detach().clamp(min=1e-8)
-    p_sorted = torch.sort(p, dim=0).values
-    u = torch.arange(1, N + 1, device=z.device, dtype=z.dtype) / (N + 1)
-    target = Normal(0, 1).icdf(u)
-    return (p_sorted - target.unsqueeze(1)).pow(2).mean()
+# KDE uniformity regularizer on L2-normalised CLS embeddings. For each embedding it computes the
+# log of the mean Gaussian-kernel similarity to every *other* embedding in the crop (concentration
+# is the inverse kernel bandwidth), and minimising the batch mean spreads the embeddings over the
+# hypersphere. The -log(N-1) term recentres the logsumexp to that mean so the value is scale-free.
+def kde_loss(x, concentration):
+    x = F.normalize(x, p=2, dim=-1)
+    sim = concentration * (x @ x.T)
+    sim.fill_diagonal_(-float("inf"))
+    return torch.logsumexp(sim, dim=1).mean() - math.log(max(1, sim.shape[1] - 1))
 
 
 # InfoMax entropy regularizer on the prototype assignments, evaluated at a sharp temperature so a
@@ -179,7 +173,7 @@ def score_swd(z, K=64):
 #   h_per   = mean per-sample assignment entropy   -> minimized  (confident per-image assignments)
 #   h_batch = entropy of the batch-mean assignment -> maximized  (mass spread across prototypes)
 # Maximizing h_batch - h_per maximizes the mutual information between images and prototypes.
-# Unlike score_swd this is repulsive AT collapse: a marginal peaked on one prototype sits at
+# Unlike the KDE reg this is repulsive AT collapse: a marginal peaked on one prototype sits at
 # near-minimal h_batch (large gradient to spread it) and a per-sample-uniform state at maximal
 # h_per (large gradient to sharpen). Unlike Sinkhorn it only *encourages* a spread marginal through
 # a tunable weight instead of forcing it uniform, so the equilibrium can track the true tissue mix.
@@ -336,7 +330,7 @@ def main():
         f"config: {cfg['config_path']}  batch_size: {batch_size}  max_train_samples: {max_train_samples}  "
         f"max_train_flops: {train_cfg['max_train_flops']}  "
         f"probe_count: {cfg['probe']['count']}  warmup_fraction: {dino_cfg['warmup_fraction']}  "
-        f"lr: {dino_cfg['lr']}  adam_beta2: {dino_cfg['adam_beta2']}  score_reg_weight: {head_cfg['score_reg_weight']}  "
+        f"lr: {dino_cfg['lr']}  adam_beta2: {dino_cfg['adam_beta2']}  kde_loss_weight: {dino_cfg['kde_loss_weight']}  "
         f"drop_path: {dino_cfg['drop_path_rate']}  "
         f"layerwise_decay: {dino_cfg['layerwise_decay']}",
         flush=True,
@@ -458,13 +452,13 @@ def main():
         global_loss = dino_ce(sg_cls, t_prob.flatten(0, 1)) * 2 / (2 * L + 2)
         s_patch = student_ibot_head(sg["x_norm_patchtokens"].flatten(0, 1)[mask_idx])
         ibot_loss = -(t_patch_prob * F.log_softmax(s_patch / 0.1, dim=-1)).sum(-1).mul(mask_w).sum() / max(1, b * 2)
-        reg = head_cfg["score_reg_weight"] * reg_scale * score_swd(sg_cls)
+        reg = dino_cfg["kde_loss_weight"] * reg_scale * sum(kde_loss(x, dino_cfg["kde_concentration"]) for x in sg["x_norm_clstoken"].chunk(train_cfg["global_views"]))
         # InfoMax entropy term: push per-sample assignments to be confident and the batch marginal
         # to be spread. h_per/h_batch are the sharp-temp entropies and double as the collapse
         # monitors, replacing the old temp-1 read that saturated near ln(n_prototypes) at collapse.
         h_per, h_batch = entropy_reg(sg_cls, head_cfg["entropy_reg_temp"])
         # entropy_reg_weight is the master switch: set it to 0 to disable the InfoMax term while
-        # still computing h_per/h_batch as collapse monitors (e.g. to isolate score_swd's effect).
+        # still computing h_per/h_batch as collapse monitors (e.g. to isolate the KDE reg's effect).
         ent_reg = head_cfg["entropy_reg_weight"] * (head_cfg["sample_entropy_weight"] * h_per - head_cfg["batch_entropy_weight"] * h_batch)
         return local_loss + global_loss, ibot_loss, reg, ent_reg, h_per.detach(), h_batch.detach()
 
@@ -574,7 +568,7 @@ def main():
                 group["lr"] = base_lr * group["lr_mult"]
                 group["weight_decay"] = wd * group["wd_mult"]
             masks, mask_idx, mask_w = make_masks(batch_size * train_cfg["global_views"], global_patches, device)
-            # score_swd is active at full strength from step 0: collapse to a single prototype
+            # The KDE reg is active at full strength from step 0: collapse to a single prototype
             # happens in the earliest steps (sharp teacher temp, no Sinkhorn centering), so the
             # regularizer has to guard that window rather than ramp in after collapse has set in.
             reg_scale = 1.0
@@ -757,7 +751,8 @@ def main():
         "warmup_train_samples": warmup_train_samples,
         "lr": dino_cfg["lr"],
         "adam_beta2": dino_cfg["adam_beta2"],
-        "score_reg_weight": head_cfg["score_reg_weight"],
+        "kde_loss_weight": dino_cfg["kde_loss_weight"],
+        "kde_concentration": dino_cfg["kde_concentration"],
         "drop_path_rate": dino_cfg["drop_path_rate"],
         "layerwise_decay": dino_cfg["layerwise_decay"],
         "probe_target_samples": probe_targets,

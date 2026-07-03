@@ -1,8 +1,8 @@
 project:
-  name: op_skN_swdY_entregN_orthoN
+  name: op_skN_swdN_entregY_orthoN
   family: nanopath
-  recipe_id: dinov2-vits14-op_skN_swdY_entregN_orthoN
-  output_dir: /data/$USER/nanopath/20260702_op_skN_swdY_entregN_orthoN
+  recipe_id: dinov2-vits14-op_skN_swdN_entregY_orthoN
+  output_dir: /data/$USER/nanopath/20260703_op_skN_swdN_entregY_orthoN
   wandb_dir: /data/$USER/nanopath/wandb
 
 data:
@@ -56,6 +56,9 @@ dino:
   head_hidden_dim: 2048
   head_bottleneck_dim: 384
   clip_grad: 3.0
+  # KDE uniformity regularizer on CLS embeddings
+  kde_loss_weight: 0.002
+  kde_concentration: 10.0
 
 prototype_head:
   n_prototypes: 128

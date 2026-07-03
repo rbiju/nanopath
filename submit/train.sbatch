@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-#SBATCH --job-name=op_skN_swdY_entregN_orthoN
+#SBATCH --job-name=op_skN_swdN_entregY_orthoN
 #SBATCH --nodes=1
 #SBATCH --ntasks-per-node=1
 #SBATCH --gpus-per-task=1
