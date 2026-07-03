@@ -72,7 +72,7 @@ prototype_head:
   orthogonal: true
   # iBOT patch branch: "sinkhorn" (DINOHead + Sinkhorn-centred targets, restores anti-collapse)
   # or "prototype" (PrototypeHead + plain-softmax targets, mirroring the CLS branch).
-  ibot_mode: sinkhorn
+  ibot_mode: prototype
   reg_type: kde  # anti-collapse shape regularizer: "swd" (score_swd) or "kde" (dino.kde_* knobs)
   score_reg_weight: 0.1
   # InfoMax entropy regularizer (anti-collapse). Evaluated at entropy_reg_temp; the two weights
