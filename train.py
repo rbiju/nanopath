@@ -1,7 +1,8 @@
 # Continual DINOv2 pretraining on TCGA tiles (single-GPU). Three loss terms:
 # DINO CLS self-distillation (Sinkhorn-Knopp centred teacher targets),
-# iBOT masked-patch self-distillation, and a VICReg-style regularizer on the
-# prototype score vectors (center + scale + SWD to N(0,I)). YAML drives the
+# iBOT masked-patch self-distillation, and an anti-collapse shape regularizer
+# (prototype_head.reg_type: "swd" on the score vectors, or "kde" uniformity on
+# the CLS embeddings). YAML drives the
 # tunable knobs (backbone variant, LR + LR scheduler, drop path, layerwise
 # decay, prototype score reg weight, FLOP/sample budgets, batch size); other
 # DINOv2 hyperparameters are hardcoded inline at their use sites.
@@ -171,6 +172,18 @@ def score_swd(z, K=64):
     u = torch.arange(1, N + 1, device=z.device, dtype=z.dtype) / (N + 1)
     target = Normal(0, 1).icdf(u)
     return (p_sorted - target.unsqueeze(1)).pow(2).mean()
+
+
+# KDE uniformity regularizer on the L2-normalized CLS embeddings (Wang & Isola style). For each
+# sample it takes the log-mean-exp of `concentration`-scaled cosine similarities to the other
+# samples in the batch (self excluded), penalising clustered embeddings and pushing mass toward a
+# uniform spread on the hypersphere. The trailing log term recenters it to ~0 at perfect uniformity.
+# Alternative to score_swd, selected by prototype_head.reg_type.
+def kde_loss(x, concentration):
+    x = F.normalize(x, p=2, dim=-1)
+    sim = concentration * (x @ x.T)
+    sim.fill_diagonal_(-float("inf"))
+    return torch.logsumexp(sim, dim=1).mean() - math.log(max(1, sim.shape[1] - 1))
 
 
 # InfoMax entropy regularizer on the prototype assignments, evaluated at a sharp temperature so a
@@ -458,7 +471,15 @@ def main():
         global_loss = dino_ce(sg_cls, t_prob.flatten(0, 1)) * 2 / (2 * L + 2)
         s_patch = student_ibot_head(sg["x_norm_patchtokens"].flatten(0, 1)[mask_idx])
         ibot_loss = -(t_patch_prob * F.log_softmax(s_patch / 0.1, dim=-1)).sum(-1).mul(mask_w).sum() / max(1, b * 2)
-        reg = head_cfg["score_reg_weight"] * reg_scale * score_swd(sg_cls)
+        # Anti-collapse shape regularizer, toggled by prototype_head.reg_type: "swd" shapes the
+        # prototype score vectors toward N(0,I) per random slice; "kde" spreads the CLS embeddings
+        # uniformly on the sphere. Both are scaled by the same reg_scale schedule.
+        if head_cfg["reg_type"] == "kde":
+            reg = dino_cfg["kde_loss_weight"] * reg_scale * sum(
+                kde_loss(x, dino_cfg["kde_concentration"]) for x in sg["x_norm_clstoken"].chunk(train_cfg["global_views"])
+            )
+        else:
+            reg = head_cfg["score_reg_weight"] * reg_scale * score_swd(sg_cls)
         # InfoMax entropy term: push per-sample assignments to be confident and the batch marginal
         # to be spread. h_per/h_batch are the sharp-temp entropies and double as the collapse
         # monitors, replacing the old temp-1 read that saturated near ln(n_prototypes) at collapse.

@@ -1,8 +1,8 @@
 project:
-  name: op_skN_swdY_entregY_orthoY
+  name: op_skN_swdN_entregY_orthoY
   family: nanopath
-  recipe_id: dinov2-vits14-op_skN_swdY_entregY_orthoY
-  output_dir: /data/$USER/nanopath/20260702_op_skN_swdY_entregY_orthoY
+  recipe_id: dinov2-vits14-op_skN_swdN_entregY_orthoY
+  output_dir: /data/$USER/nanopath/20260702_op_skN_swdN_entregY_orthoY
   wandb_dir: /data/$USER/nanopath/wandb
 
 data:
@@ -56,6 +56,10 @@ dino:
   head_hidden_dim: 2048
   head_bottleneck_dim: 384
   clip_grad: 3.0
+  # KDE uniformity regularizer on CLS embeddings, used when prototype_head.reg_type == "kde".
+  # Defaults match the historical KDE recipe (see configs/smoke.yaml).
+  kde_loss_weight: 0.002
+  kde_concentration: 10.0  # cosine-similarity scale inside the logsumexp; higher = sharper repulsion
 
 prototype_head:
   n_prototypes: 128
@@ -63,6 +67,7 @@ prototype_head:
   prototype_dim: 256
   n_layers: 3
   ns_steps: 5
+  reg_type: kde  # anti-collapse shape regularizer: "swd" (score_swd) or "kde" (dino.kde_* knobs)
   score_reg_weight: 0.1
   # InfoMax entropy regularizer (anti-collapse). Evaluated at entropy_reg_temp; the two weights
   # trade off confident per-image assignments (sample) against a spread batch marginal (batch).
