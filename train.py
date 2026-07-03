@@ -139,18 +139,19 @@ def cosine_schedule(start, end, frac):
     return end + 0.5 * (start - end) * (1 + math.cos(math.pi * min(1.0, max(0.0, frac))))
 
 
-# Sinkhorn-Knopp centring across this batch, used as DINO/iBOT teacher targets.
-# Commented out: assumes batch diversity (uniform prototype usage) which isn't guaranteed
-# with spatially-correlated pathology tiles. Replaced by plain teacher softmax + score_swd.
-# def sinkhorn(x, temp):
-#     q = torch.exp(x.float() / temp).t()
-#     b = q.shape[1]
-#     k = q.shape[0]
-#     q /= q.sum()
-#     for _ in range(3):
-#         q /= q.sum(1, keepdim=True) * k
-#         q /= q.sum(0, keepdim=True) * b
-#     return (q * b).t()
+# Sinkhorn-Knopp centring across this batch. Dropped for the CLS branch (its uniform-marginal
+# assumption is violated by spatially-correlated tiles), but still available for the iBOT patch
+# branch via prototype_head.ibot_mode="sinkhorn": patch tokens are far more numerous and diverse
+# per step, so a near-uniform marginal is a defensible anti-collapse prior there.
+def sinkhorn(x, temp):
+    q = torch.exp(x.float() / temp).t()
+    b = q.shape[1]
+    k = q.shape[0]
+    q /= q.sum()
+    for _ in range(3):
+        q /= q.sum(1, keepdim=True) * k
+        q /= q.sum(0, keepdim=True) * b
+    return (q * b).t()
 
 
 # Cross-entropy between teacher distribution and softmax(student / 0.1).
@@ -280,8 +281,17 @@ def main():
     teacher_backbone.train(False)
     for p in teacher_backbone.parameters():
         p.requires_grad = False
-    student_dino_head = PrototypeHead(student_backbone.embed_dim, head_cfg['n_prototypes'], head_cfg["hidden_dim"], head_cfg["prototype_dim"], head_cfg["n_layers"], head_cfg['ns_steps']).to(device)
-    student_ibot_head = DINOHead(student_backbone.embed_dim, 131072, dino_cfg["head_hidden_dim"], dino_cfg["head_bottleneck_dim"], 3).to(device)
+    # ibot_mode toggles the iBOT patch branch: "sinkhorn" keeps the baseline DINOHead with
+    # Sinkhorn-centred teacher targets (restores the anti-collapse the plain-softmax path lost),
+    # while "prototype" mirrors the CLS branch (PrototypeHead + plain-softmax targets). The
+    # teacher-target normalization in compute_losses branches on this same value.
+    ibot_mode = head_cfg["ibot_mode"]
+    if ibot_mode not in ("sinkhorn", "prototype"):
+        raise ValueError(f"prototype_head.ibot_mode must be 'sinkhorn' or 'prototype', got {ibot_mode!r}")
+    def make_prototype_head():
+        return PrototypeHead(student_backbone.embed_dim, head_cfg['n_prototypes'], head_cfg["hidden_dim"], head_cfg["prototype_dim"], head_cfg["n_layers"], head_cfg['ns_steps']).to(device)
+    student_dino_head = make_prototype_head()
+    student_ibot_head = make_prototype_head() if ibot_mode == "prototype" else DINOHead(student_backbone.embed_dim, 131072, dino_cfg["head_hidden_dim"], dino_cfg["head_bottleneck_dim"], 3).to(device)
     teacher_dino_head = deepcopy(student_dino_head)
     teacher_ibot_head = deepcopy(student_ibot_head)
     for m in (teacher_dino_head, teacher_ibot_head):
@@ -350,6 +360,7 @@ def main():
         f"max_train_flops: {train_cfg['max_train_flops']}  "
         f"probe_count: {cfg['probe']['count']}  warmup_fraction: {dino_cfg['warmup_fraction']}  "
         f"lr: {dino_cfg['lr']}  adam_beta2: {dino_cfg['adam_beta2']}  score_reg_weight: {head_cfg['score_reg_weight']}  "
+        f"ibot_mode: {ibot_mode}  "
         f"drop_path: {dino_cfg['drop_path_rate']}  "
         f"layerwise_decay: {dino_cfg['layerwise_decay']}",
         flush=True,
@@ -462,7 +473,8 @@ def main():
             t = teacher_backbone(gf)
             t_cls = teacher_dino_head(t["x_norm_clstoken"]).chunk(train_cfg["global_views"])
             t_prob = F.softmax(torch.cat((t_cls[1], t_cls[0])).float() / t_temp, dim=-1).view(2, b, -1)
-            t_patch_prob = F.softmax(teacher_ibot_head(t["x_norm_patchtokens"].flatten(0, 1)[mask_idx]).float() / t_temp, dim=-1)
+            t_patch_logits = teacher_ibot_head(t["x_norm_patchtokens"].flatten(0, 1)[mask_idx])
+            t_patch_prob = sinkhorn(t_patch_logits, t_temp) if ibot_mode == "sinkhorn" else F.softmax(t_patch_logits.float() / t_temp, dim=-1)
         sg = student_backbone(gf, masks=masks, checkpoint=ckpt)
         sl = student_backbone(lf, checkpoint=ckpt)
         sg_cls, sl_cls = student_dino_head(sg["x_norm_clstoken"]), student_dino_head(sl["x_norm_clstoken"])
@@ -779,6 +791,7 @@ def main():
         "lr": dino_cfg["lr"],
         "adam_beta2": dino_cfg["adam_beta2"],
         "score_reg_weight": head_cfg["score_reg_weight"],
+        "ibot_mode": ibot_mode,
         "drop_path_rate": dino_cfg["drop_path_rate"],
         "layerwise_decay": dino_cfg["layerwise_decay"],
         "probe_target_samples": probe_targets,

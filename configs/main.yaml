@@ -1,8 +1,8 @@
 project:
-  name: op_skN_swdN_entregY_orthoY_lowerentregweight
+  name: op1_skN_swdN_entregY_orthoY_skibotN
   family: nanopath
-  recipe_id: dinov2-vits14-op_skN_swdN_entregY_orthoY_lowerentregweight
-  output_dir: /data/$USER/nanopath/20260702_op_skN_swdN_entregY_orthoY_lowerentregweight
+  recipe_id: dinov2-vits14-op1_skN_swdN_entregY_orthoY_skibotN
+  output_dir: /data/$USER/nanopath/20260703_op1_skN_swdN_entregY_orthoY_skibotN
   wandb_dir: /data/$USER/nanopath/wandb
 
 data:
@@ -67,6 +67,9 @@ prototype_head:
   prototype_dim: 512
   n_layers: 3
   ns_steps: 5
+  # iBOT patch branch: "sinkhorn" (DINOHead + Sinkhorn-centred targets, restores anti-collapse)
+  # or "prototype" (PrototypeHead + plain-softmax targets, mirroring the CLS branch).
+  ibot_mode: sinkhorn
   reg_type: kde  # anti-collapse shape regularizer: "swd" (score_swd) or "kde" (dino.kde_* knobs)
   score_reg_weight: 0.1
   # InfoMax entropy regularizer (anti-collapse). Evaluated at entropy_reg_temp; the two weights
