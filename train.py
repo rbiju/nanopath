@@ -1,8 +1,9 @@
 # Continual DINOv2 pretraining on TCGA tiles (single-GPU). Three loss terms:
 # DINO CLS self-distillation (Sinkhorn-Knopp centred teacher targets),
-# iBOT masked-patch self-distillation, and an anti-collapse shape regularizer
-# (prototype_head.reg_type: "swd" on the score vectors, or "kde" uniformity on
-# the CLS embeddings). YAML drives the
+# iBOT masked-patch self-distillation, and two composable anti-collapse shape
+# regularizers ("swd" on the prototype head's bottleneck embeddings, "kde"
+# uniformity on the backbone CLS embeddings; each gated by its own weight,
+# 0 = off). YAML drives the
 # tunable knobs (backbone variant, LR + LR scheduler, drop path, layerwise
 # decay, prototype score reg weight, FLOP/sample budgets, batch size); other
 # DINOv2 hyperparameters are hardcoded inline at their use sites.
@@ -159,10 +160,10 @@ def dino_ce(student, teacher):
     return -(teacher * F.log_softmax(student / 0.1, dim=-1)).sum(-1).mean()
 
 
-# SWD shape regularizer on prototype score vectors. Projects [N, n_prototypes]
-# scores onto K random directions, standardises each projection using detached
-# statistics (so gradients see only shape, not center/scale), then penalises
-# deviation of the sorted values from N(0,1) quantiles.
+# SWD shape regularizer on the prototype head's bottleneck embeddings (the MLP output, before the
+# projection into prototype space and its L2-normalization). Projects [N, bottleneck_dim] onto K
+# random directions, standardises each projection using detached statistics (so gradients see only
+# shape, not center/scale), then penalises deviation of the sorted values from N(0,1) quantiles.
 def score_swd(z, K=64):
     N, D = z.shape
     W = torch.randn(D, K, device=z.device, dtype=z.dtype)
@@ -179,7 +180,8 @@ def score_swd(z, K=64):
 # sample it takes the log-mean-exp of `concentration`-scaled cosine similarities to the other
 # samples in the batch (self excluded), penalising clustered embeddings and pushing mass toward a
 # uniform spread on the hypersphere. The trailing log term recenters it to ~0 at perfect uniformity.
-# Alternative to score_swd, selected by prototype_head.reg_type.
+# Composes with score_swd, which shapes the head's bottleneck embeddings downstream of these;
+# gated by dino.kde_loss_weight (0 = off).
 def kde_loss(x, concentration):
     x = F.normalize(x, p=2, dim=-1)
     sim = concentration * (x @ x.T)
@@ -239,8 +241,11 @@ def build_param_groups(student_backbone, student_dino_head, student_ibot_head, l
                 lr_mult = (layerwise_decay ** depth) * patch_embed_lr_mult
             # The PrototypeHead bank is re-orthonormalized every forward (Newton-Schulz), which is
             # invariant to its scale/stretch. Weight decay only shrinks that invisible gauge without
-            # affecting the loss, so exclude it (alongside biases and norms).
-            no_wd = name.endswith("bias") or "norm" in name or p.ndim < 2 or name.endswith("prototypes")
+            # affecting the loss, so exclude it (alongside biases and norms). PrototypeHead's
+            # projection.weight is excluded for the same reason: its output is L2-normalized, so
+            # scaling it is invisible to the loss and WD would drive its norm to zero unopposed
+            # (the gauge DINOHead pins by freezing weight_g at 1).
+            no_wd = name.endswith("bias") or "norm" in name or p.ndim < 2 or name.endswith("prototypes") or name.endswith("projection.weight")
             wd_mult = 0.0 if no_wd else 1.0
             key = (lr_mult, wd_mult, "last_layer" in name)
             coalesced.setdefault(key, {"params": [], "lr_mult": lr_mult, "wd_mult": wd_mult, "last_layer": key[2]})["params"].append(p)
@@ -288,8 +293,16 @@ def main():
     ibot_mode = head_cfg["ibot_mode"]
     if ibot_mode not in ("sinkhorn", "prototype"):
         raise ValueError(f"prototype_head.ibot_mode must be 'sinkhorn' or 'prototype', got {ibot_mode!r}")
+    # reg_type used to select exactly one regularizer. They now compose and are gated by their own
+    # weights, so a leftover reg_type would silently run both (its "off" term still has a nonzero
+    # weight in old configs) -- reject it rather than ignore it.
+    if "reg_type" in head_cfg:
+        raise ValueError(
+            "prototype_head.reg_type is gone: kde and swd now compose and are each gated by their own "
+            "weight. Set dino.kde_loss_weight=0 and/or prototype_head.score_reg_weight=0 to disable a term."
+        )
     def make_prototype_head():
-        return PrototypeHead(student_backbone.embed_dim, head_cfg['n_prototypes'], head_cfg["hidden_dim"], head_cfg["prototype_dim"], head_cfg["n_layers"], head_cfg['ns_steps'], head_cfg["orthogonal"]).to(device)
+        return PrototypeHead(student_backbone.embed_dim, head_cfg['n_prototypes'], head_cfg["hidden_dim"], head_cfg["bottleneck_dim"], head_cfg["prototype_dim"], head_cfg["n_layers"], head_cfg['ns_steps'], head_cfg["orthogonal"]).to(device)
     student_dino_head = make_prototype_head()
     student_ibot_head = make_prototype_head() if ibot_mode == "prototype" else DINOHead(student_backbone.embed_dim, 131072, dino_cfg["head_hidden_dim"], dino_cfg["head_bottleneck_dim"], 3).to(device)
     teacher_dino_head = deepcopy(student_dino_head)
@@ -477,21 +490,25 @@ def main():
             t_patch_prob = sinkhorn(t_patch_logits, t_temp) if ibot_mode == "sinkhorn" else F.softmax(t_patch_logits.float() / t_temp, dim=-1)
         sg = student_backbone(gf, masks=masks, checkpoint=ckpt)
         sl = student_backbone(lf, checkpoint=ckpt)
-        sg_cls, sl_cls = student_dino_head(sg["x_norm_clstoken"]), student_dino_head(sl["x_norm_clstoken"])
+        sg_cls, sg_bottleneck = student_dino_head(sg["x_norm_clstoken"], return_bottleneck=True)
+        sl_cls = student_dino_head(sl["x_norm_clstoken"])
         L = train_cfg["local_views"]
         local_loss = sum(dino_ce(x, y) for x in sl_cls.chunk(L) for y in t_prob) / (2 * L + 2)
         global_loss = dino_ce(sg_cls, t_prob.flatten(0, 1)) * 2 / (2 * L + 2)
         s_patch = student_ibot_head(sg["x_norm_patchtokens"].flatten(0, 1)[mask_idx])
         ibot_loss = -(t_patch_prob * F.log_softmax(s_patch / 0.1, dim=-1)).sum(-1).mul(mask_w).sum() / max(1, b * 2)
-        # Anti-collapse shape regularizer, toggled by prototype_head.reg_type: "swd" shapes the
-        # prototype score vectors toward N(0,I) per random slice; "kde" spreads the CLS embeddings
-        # uniformly on the sphere. Both are scaled by the same reg_scale schedule.
-        if head_cfg["reg_type"] == "kde":
-            reg = dino_cfg["kde_loss_weight"] * reg_scale * sum(
+        # Anti-collapse shape regularizers. They act on different tensors -- kde on the backbone CLS
+        # embeddings, swd on the prototype head's bottleneck embeddings downstream of them -- so they
+        # compose rather than compete, and each is gated by its own weight (0 = off). Both are scaled
+        # by the same reg_scale schedule.
+        reg_kde = sg_cls.new_zeros(())
+        reg_swd = sg_cls.new_zeros(())
+        if dino_cfg["kde_loss_weight"] != 0:
+            reg_kde = dino_cfg["kde_loss_weight"] * reg_scale * sum(
                 kde_loss(x, dino_cfg["kde_concentration"]) for x in sg["x_norm_clstoken"].chunk(train_cfg["global_views"])
             )
-        else:
-            reg = head_cfg["score_reg_weight"] * reg_scale * score_swd(sg_cls)
+        if head_cfg["score_reg_weight"] != 0:
+            reg_swd = head_cfg["score_reg_weight"] * reg_scale * score_swd(sg_bottleneck)
         # InfoMax entropy term: push per-sample assignments to be confident and the batch marginal
         # to be spread. h_per/h_batch are the sharp-temp entropies and double as the collapse
         # monitors, replacing the old temp-1 read that saturated near ln(n_prototypes) at collapse.
@@ -499,7 +516,7 @@ def main():
         # entropy_reg_weight is the master switch: set it to 0 to disable the InfoMax term while
         # still computing h_per/h_batch as collapse monitors (e.g. to isolate score_swd's effect).
         ent_reg = head_cfg["entropy_reg_weight"] * (head_cfg["sample_entropy_weight"] * h_per - head_cfg["batch_entropy_weight"] * h_batch)
-        return local_loss + global_loss, ibot_loss, reg, ent_reg, h_per.detach(), h_batch.detach()
+        return local_loss + global_loss, ibot_loss, reg_kde, reg_swd, ent_reg, h_per.detach(), h_batch.detach()
 
     # Held-out validation pass: same DINO + iBOT + reg losses on `val_batches` of the val split.
     # Schedule terms (teacher_temp, reg_scale) drift over training, so read val curves as same-step
@@ -510,7 +527,7 @@ def main():
         py_rng, cpu_rng, cuda_rng = random.getstate(), torch.random.get_rng_state(), torch.cuda.get_rng_state(device)
         random.seed(train_cfg["seed"] + eval_step)
         torch.manual_seed(train_cfg["seed"] + eval_step)
-        sums = torch.zeros(7, device=device)
+        sums = torch.zeros(8, device=device)
         n_batches = 0
         for vb_idx, vbatch in enumerate(val_loader):
             if vb_idx >= int(train_cfg["val_batches"]):
@@ -520,13 +537,16 @@ def main():
             with torch.no_grad(), autocast:
                 gf, lf = vg.transpose(0, 1).flatten(0, 1), vl.transpose(0, 1).flatten(0, 1)
                 masks, mask_idx, mask_w = make_masks(b * train_cfg["global_views"], global_patches, device)
-                dino_l, ibot_l, reg_v, ent_v, h_per_v, h_batch_v = compute_losses(gf, lf, b, masks, mask_idx, mask_w, eval_teacher_temp, eval_reg_scale)
-            sums += torch.tensor([float(dino_l), float(ibot_l), float(reg_v), float(ent_v), float(dino_l + ibot_l + reg_v + ent_v), float(h_per_v), float(h_batch_v)], device=device)
+                dino_l, ibot_l, kde_v, swd_v, ent_v, h_per_v, h_batch_v = compute_losses(gf, lf, b, masks, mask_idx, mask_w, eval_teacher_temp, eval_reg_scale)
+            sums += torch.tensor([float(dino_l), float(ibot_l), float(kde_v), float(swd_v), float(ent_v), float(dino_l + ibot_l + kde_v + swd_v + ent_v), float(h_per_v), float(h_batch_v)], device=device)
             n_batches += 1
         random.setstate(py_rng)
         torch.random.set_rng_state(cpu_rng)
         torch.cuda.set_rng_state(cuda_rng, device)
-        return dict(zip(("dino", "ibot", "reg", "ent", "total", "h_per", "h_batch"), (sums / max(1, n_batches)).tolist()))
+        val = dict(zip(("dino", "ibot", "reg_kde", "reg_swd", "ent", "total", "h_per", "h_batch"), (sums / max(1, n_batches)).tolist()))
+        # `reg` stays the combined term so it remains comparable to runs from before the split.
+        val["reg"] = val["reg_kde"] + val["reg_swd"]
+        return val
 
     # Ingest completed probe result JSONs into metrics.jsonl and wandb.
     def log_probe_results():
@@ -620,11 +640,11 @@ def main():
                     # so [crop0_img0, crop0_img1, ..., crop1_img0, ...] for clean teacher/student alignment.
                     gf = global_views.transpose(0, 1).flatten(0, 1)
                     lf = local_views.transpose(0, 1).flatten(0, 1)
-                    dino_loss_value, ibot_loss, reg, ent_reg, h_per, h_batch = compute_losses(
+                    dino_loss_value, ibot_loss, reg_kde, reg_swd, ent_reg, h_per, h_batch = compute_losses(
                         gf, lf, batch_size, masks, mask_idx, mask_w, teacher_temp, reg_scale,
                         ckpt=activation_checkpointing,
                     )
-                    total_loss = dino_loss_value + ibot_loss + reg + ent_reg
+                    total_loss = dino_loss_value + ibot_loss + reg_kde + reg_swd + ent_reg
                 opt.zero_grad(set_to_none=True)
                 total_loss.backward()
                 grad_norm = nn.utils.clip_grad_norm_(
@@ -649,7 +669,10 @@ def main():
                 reduced = {
                     "dino": float(dino_loss_value.detach()),
                     "ibot": float(ibot_loss.detach()),
-                    "reg": float(reg.detach()),
+                    "reg_kde": float(reg_kde.detach()),
+                    "reg_swd": float(reg_swd.detach()),
+                    # Combined, so `reg` stays comparable to runs from before the split.
+                    "reg": float(reg_kde.detach()) + float(reg_swd.detach()),
                     "ent": float(ent_reg.detach()),
                     "total": float(total_loss.detach()),
                     "h_per": float(h_per),
@@ -709,7 +732,8 @@ def main():
                     f"{console_prefix()} Training  "
                     f"[{completed_step}/{total_steps_estimate}]  eta: {eta_string}  gap: {console_gap_ms:.2f} ms  "
                     f"lr: {current_lr:.6f}  total: {reduced['total']:.4f}  "
-                    f"dino: {reduced['dino']:.4f}  ibot: {reduced['ibot']:.4f}  reg: {reduced['reg']:.4f}  ent: {reduced['ent']:.4f}  "
+                    f"dino: {reduced['dino']:.4f}  ibot: {reduced['ibot']:.4f}  "
+                    f"reg_kde: {reduced['reg_kde']:.4f}  reg_swd: {reduced['reg_swd']:.4f}  ent: {reduced['ent']:.4f}  "
                     f"h_per: {reduced['h_per']:.3f}  h_batch: {reduced['h_batch']:.3f}  "
                     f"grad_norm: {train_log['grad_norm']:.4f}  flops/s: {flops_per_sec:.3e}  "
                     f"time: {step_seconds:.6f}  data: {data_seconds:.6f}  "
@@ -739,7 +763,7 @@ def main():
                 with metrics_path.open("a") as handle:
                     handle.write(json.dumps(val_log) + "\n")
                 wandb_run.log({f"val/{k}": v for k, v in val.items()}, step=completed_step)
-                print(f"{console_prefix()} Validation  [{completed_step}]  total: {val['total']:.4f}  dino: {val['dino']:.4f}  ibot: {val['ibot']:.4f}  reg: {val['reg']:.4f}  ent: {val['ent']:.4f}  h_per: {val['h_per']:.3f}  h_batch: {val['h_batch']:.3f}", flush=True)
+                print(f"{console_prefix()} Validation  [{completed_step}]  total: {val['total']:.4f}  dino: {val['dino']:.4f}  ibot: {val['ibot']:.4f}  reg_kde: {val['reg_kde']:.4f}  reg_swd: {val['reg_swd']:.4f}  ent: {val['ent']:.4f}  h_per: {val['h_per']:.3f}  h_batch: {val['h_batch']:.3f}", flush=True)
                 # Reset rate clocks after validation so the next train log is train-rate only.
                 last_console_step, last_console_monotonic = completed_step, time.monotonic()
                 last_time, last_examples, last_visible_patch_presentations, last_train_flops = time.time(), examples_seen, visible_patch_presentations, train_flops

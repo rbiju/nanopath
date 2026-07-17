@@ -248,13 +248,18 @@ def newton_schulz(X, steps=5):
 
 class PrototypeHead(nn.Module):
     """
-    Drop-in replacement for DINOHead that compares bottleneck embeddings
-    against a learnable orthonormal prototype bank rather than projecting
-    into a large unstructured space.
+    Drop-in replacement for DINOHead that compares embeddings against a
+    learnable orthonormal prototype bank rather than projecting into a
+    large unstructured space.
 
-    Prototypes live in bottleneck_dim-space (same as the MLP output) and
-    are kept orthonormal via Newton-Schulz during the forward pass.
-    Requires n_prototypes <= bottleneck_dim.
+    The MLP maps in_dim -> bottleneck_dim, and a final linear layer maps
+    bottleneck_dim -> prototype_dim. Splitting the two decouples the space
+    train.py's shape regularizer acts on (the bottleneck) from the space the
+    prototypes live in, so n_prototypes and the orthogonality constraint no
+    longer dictate the width of the regularized representation.
+
+    Prototypes live in prototype_dim-space and are kept orthonormal via
+    Newton-Schulz during the forward pass. Requires n_prototypes <= prototype_dim.
     """
 
     def __init__(
@@ -262,6 +267,7 @@ class PrototypeHead(nn.Module):
         in_dim,
         n_prototypes,
         hidden_dim=768,
+        bottleneck_dim=512,
         prototype_dim=256,
         n_layers=3,
         ns_steps=5,
@@ -279,7 +285,11 @@ class PrototypeHead(nn.Module):
         self.ns_steps = ns_steps
         self.orthogonal = bool(orthogonal)
         n_layers = max(n_layers, 1)
-        self.mlp = _build_mlp(n_layers, in_dim, prototype_dim, hidden_dim=hidden_dim)
+        self.mlp = _build_mlp(n_layers, in_dim, bottleneck_dim, hidden_dim=hidden_dim)
+        # bias=False keeps the projection linear rather than affine: a bias would translate the
+        # cloud off the origin before L2-normalization, concentrating it on a cap and undoing the
+        # centering the bottleneck regularizer works to establish.
+        self.projection = nn.Linear(bottleneck_dim, prototype_dim, bias=False)
         self.apply(self._init_weights)
         self.prototypes = nn.Parameter(torch.empty(n_prototypes, prototype_dim))
         trunc_normal_(self.prototypes, std=0.02)
@@ -296,11 +306,15 @@ class PrototypeHead(nn.Module):
             if m.bias is not None:
                 nn.init.constant_(m.bias, 0)
 
-    def forward(self, x):
-        x = self.mlp(x)
-        x = F.normalize(x, dim=-1, p=2)
+    # return_bottleneck additionally returns the bottleneck embeddings (the MLP output, before the
+    # projection into prototype space), so train.py can shape them toward N(0, I). Default False
+    # keeps the DINOHead-compatible single-tensor return.
+    def forward(self, x, return_bottleneck=False):
+        h = self.mlp(x)
+        x = F.normalize(self.projection(h), dim=-1, p=2)
         # orthogonal=True: Newton-Schulz yields a (near-)orthonormal bank (unit-norm rows, mutually
         # decorrelated). orthogonal=False: just unit-norm each prototype, so scores stay cosine in
         # [-1, 1] and only the mutual-orthogonality constraint is ablated.
         prototypes = newton_schulz(self.prototypes, steps=self.ns_steps) if self.orthogonal else F.normalize(self.prototypes, dim=-1, p=2)
-        return self.logit_scale.clamp(max=math.log(100)).exp() * (x @ prototypes.T)
+        scores = self.logit_scale.clamp(max=math.log(100)).exp() * (x @ prototypes.T)
+        return (scores, h) if return_bottleneck else scores

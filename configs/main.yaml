@@ -1,8 +1,8 @@
 project:
-  name: op1_skN_swdN_entregY_orthoY_skibotN
+  name: op1_skN_entregY_orthoY_skibotN_swdBottleneck
   family: nanopath
-  recipe_id: dinov2-vits14-op1_skN_swdN_entregY_orthoY_skibotN
-  output_dir: /data/$USER/nanopath/20260703_op1_skN_swdN_entregY_orthoY_skibotN
+  recipe_id: dinov2-vits14-op1_skN_entregY_orthoY_skibotN_swdBottleneck
+  output_dir: /data/$USER/nanopath/20260716_op1_skN_entregY_orthoY_skibotN_swdBottleneck
   wandb_dir: /data/$USER/nanopath/wandb
 
 data:
@@ -56,7 +56,8 @@ dino:
   head_hidden_dim: 2048
   head_bottleneck_dim: 384
   clip_grad: 3.0
-  # KDE uniformity regularizer on CLS embeddings, used when prototype_head.reg_type == "kde".
+  # KDE uniformity regularizer on the backbone CLS embeddings. Composes with the SWD term on the
+  # head's bottleneck embeddings (prototype_head.score_reg_weight); 0 disables this term.
   # Defaults match the historical KDE recipe (see configs/smoke.yaml).
   kde_loss_weight: 0.002
   kde_concentration: 10.0  # cosine-similarity scale inside the logsumexp; higher = sharper repulsion
@@ -64,6 +65,7 @@ dino:
 prototype_head:
   n_prototypes: 256
   hidden_dim: 768
+  bottleneck_dim: 384
   prototype_dim: 512
   n_layers: 3
   ns_steps: 5
@@ -73,7 +75,9 @@ prototype_head:
   # iBOT patch branch: "sinkhorn" (DINOHead + Sinkhorn-centred targets, restores anti-collapse)
   # or "prototype" (PrototypeHead + plain-softmax targets, mirroring the CLS branch).
   ibot_mode: prototype
-  reg_type: kde  # anti-collapse shape regularizer: "swd" (score_swd) or "kde" (dino.kde_* knobs)
+  # SWD anti-collapse regularizer on the head's bottleneck embeddings (shaped toward N(0,I)).
+  # Composes with the KDE term on the backbone CLS embeddings (dino.kde_loss_weight); the two act on
+  # different tensors, so either, both, or neither can be active. 0 disables this term.
   score_reg_weight: 0.1
   # InfoMax entropy regularizer (anti-collapse). Evaluated at entropy_reg_temp; the two weights
   # trade off confident per-image assignments (sample) against a spread batch marginal (batch).
