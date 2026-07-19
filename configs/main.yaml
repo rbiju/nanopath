@@ -1,8 +1,8 @@
 project:
-  name: op1_skN_entregY_orthoY_skibotN_swdBottleneck
+  name: op1_skN_entregY_orthoN_skibotN_swdBottleneck
   family: nanopath
-  recipe_id: dinov2-vits14-op1_skN_entregY_orthoY_skibotN_swdBottleneck
-  output_dir: /data/$USER/nanopath/20260716_op1_skN_entregY_orthoY_skibotN_swdBottleneck
+  recipe_id: dinov2-vits14-op1_skN_entregY_orthoN_skibotN_swdBottleneck
+  output_dir: /data/$USER/nanopath/20260716_op1_skN_entregY_orthoN_skibotN_swdBottleneck
   wandb_dir: /data/$USER/nanopath/wandb
 
 data:
@@ -65,13 +65,13 @@ dino:
 prototype_head:
   n_prototypes: 256
   hidden_dim: 768
-  bottleneck_dim: 384
+  bottleneck_dim: 512
   prototype_dim: 512
   n_layers: 3
   ns_steps: 5
   # true: keep the prototype bank orthonormal via Newton-Schulz (ns_steps). false: only unit-norm
   # each prototype, ablating the mutual-orthogonality constraint (scores stay cosine in [-1, 1]).
-  orthogonal: true
+  orthogonal: false
   # iBOT patch branch: "sinkhorn" (DINOHead + Sinkhorn-centred targets, restores anti-collapse)
   # or "prototype" (PrototypeHead + plain-softmax targets, mirroring the CLS branch).
   ibot_mode: prototype

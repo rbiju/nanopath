@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-#SBATCH --job-name=op1_skN_entregY_orthoY_skibotN_swdBottleneck
+#SBATCH --job-name=op1_skN_entregY_orthoN_skibotN_swdBottleneck
 #SBATCH --nodes=1
 #SBATCH --ntasks-per-node=1
 #SBATCH --gpus-per-task=1
@@ -14,7 +14,7 @@ set -euo pipefail
 
 # Single-GPU SLURM launcher. Run it directly so the login node can collect
 # Labless metadata before scheduling the noninteractive GPU job, e.g.
-#   ./submit/train.sbatch configs/main.yaml output_dir=/data/$USER/nanopath/20260630_op_baseline
+#   ./submit/train.sbatch configs/main.yaml output_dir=/data/$USER/nanopath/main/myrun
 # Plain `sbatch submit/train.sbatch ...` still trains, but cannot auto-submit.
 REPO_DIR="${SLURM_SUBMIT_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
 CONFIG_FILE="${1:-${REPO_DIR}/configs/main.yaml}"
@@ -103,7 +103,7 @@ cleanup_labless_token() {
 }
 trap cleanup_labless_token EXIT
 if [[ "${LABLESS_ELIGIBLE}" == "1" && -z "${LABLESS_AUTOSUBMIT_FILE:-}" ]]; then
-  echo "Labless auto-submit is not armed. Run ./submit/train_1gpu.sbatch from the login node to enable the pre-run prompt."
+  echo "Labless auto-submit is not armed. Run ./submit/train.sbatch from the login node to enable the pre-run prompt."
 fi
 
 python train.py "${CONFIG_FILE}" "$@"
