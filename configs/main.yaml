@@ -1,8 +1,8 @@
 project:
-  name: op1_orthoY_hsampleSWD_hbatchENT
+  name: op1_orthoY_swdY_hsampleENT_hbatchENT_t0_25
   family: nanopath
-  recipe_id: dinov2-vits14-op1_orthoY_hsampleSWD_hbatchENT
-  output_dir: /data/$USER/nanopath/20260719_op1_orthoY_hsampleSWD_hbatchENT
+  recipe_id: dinov2-vits14-op1_orthoY_swdY_hsampleENT_hbatchENT_t0_25
+  output_dir: /data/$USER/nanopath/20260719_op1_orthoY_swdY_hsampleENT_hbatchENT_t0_25
   wandb_dir: /data/$USER/nanopath/wandb
 
 data:
@@ -56,8 +56,8 @@ dino:
   head_hidden_dim: 2048
   head_bottleneck_dim: 384
   clip_grad: 3.0
-  # KDE uniformity regularizer on CLS embeddings, used when prototype_head.reg_type == "kde".
-  # Defaults match the historical KDE recipe (see configs/smoke.yaml).
+  # KDE uniformity regularizer on the CLS embeddings (embedding-space anti-collapse), independent of
+  # the prototype_head score-space ontology. 0 disables it. Defaults match the historical KDE recipe.
   kde_loss_weight: 0.002
   kde_concentration: 10.0  # cosine-similarity scale inside the logsumexp; higher = sharper repulsion
 
@@ -73,23 +73,24 @@ prototype_head:
   # iBOT patch branch: "sinkhorn" (DINOHead + Sinkhorn-centred targets, restores anti-collapse)
   # or "prototype" (PrototypeHead + plain-softmax targets, mirroring the CLS branch).
   ibot_mode: prototype
-  reg_type: kde  # anti-collapse shape regularizer: "swd" (score_swd) or "kde" (dino.kde_* knobs)
-  score_reg_weight: 0.1
-  # Assignment-shaping term (anti-collapse + per-sample code shaping) = per-sample axis - h_batch.
-  # sample_reg_type picks the per-sample axis: "swd" pulls each score row toward a graded Gaussian
-  # (distributed, multi-prototype code) via sample_swd_weight; "entropy" minimizes h_per to sharpen
-  # toward one-hot (original ME-MAX) via sample_entropy_weight. The inactive term is still logged as a
-  # monitor. The two weights are separate because the terms differ in scale (samp_swd ~O(0.1-1),
-  # h_per ~O(0-ln n_prototypes)). Batch axis: h_batch maximization spreads the marginal;
-  # entropy_reg_temp only affects the h_per/h_batch monitors (softmax temp), not sample_swd (raw
-  # scores). Lower batch_entropy_weight lets the marginal follow the true tissue mix rather than being
-  # pushed uniform (the behavior we dropped Sinkhorn to avoid).
-  sample_reg_type: swd  # per-sample axis: "swd" (sample_swd) or "entropy" (h_per minimization)
-  entropy_reg_weight: 0.001  # master switch for the term; 0 = disabled (samp_swd/h_per/h_batch still logged)
-  entropy_reg_temp: 0.25
-  sample_swd_weight: 1.0      # weight when sample_reg_type == "swd"
-  sample_entropy_weight: 1.0  # weight when sample_reg_type == "entropy"
-  batch_entropy_weight: 0.2
+  # Assignment-shaping regularizer on the CLS prototype scores, along two independent axes. Each axis
+  # picks (1) SWD on/off -- a scale-invariant Gaussian *shape* term (sample_swd per row / score_swd
+  # across the batch), and (2) a dispersion type that controls *width*: none | entropy | gini.
+  # per_sample dispersion is MINIMIZED (sharpen/concentrate each row); per_batch dispersion is
+  # MAXIMIZED (widen/spread the marginal, anti-collapse). entropy = Shannon (h_per/h_batch), gini =
+  # Gini-Simpson 1 - sum_k p_k^2 (g_per/g_batch). SWD fixes shape, dispersion fixes width; together
+  # per_sample = a narrow Gaussian row, per_batch = a wide Gaussian marginal. Each term is
+  # absolute-weighted (no master multiplier); on:false or weight:0 or type:none disables just that
+  # term. All monitors (samp_swd/batch_swd/h_per/h_batch/g_per/g_batch) are logged regardless.
+  # reg_temp is the softmax temperature for the dispersion measures only (SWD acts on raw scores).
+  # KDE (embedding-space anti-collapse) is independent: dino.kde_loss_weight (0 disables it).
+  reg_temp: 0.25
+  per_sample:                                    # dispersion minimized -> sharpen / concentrate rows
+    swd: { enabled: true, weight: 0.5 }
+    dispersion: { type: entropy, weight: 0.3 }      # type: none | entropy | gini
+  per_batch:                                     # dispersion maximized -> widen / spread the marginal
+    swd: { enabled: true, weight: 0.1 }
+    dispersion: { type: entropy, weight: 0.2 }
 
 probe:
   enabled: true

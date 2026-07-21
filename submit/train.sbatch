@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-#SBATCH --job-name=op1_orthoY_hsampleENT_hbatchENT_tempAblation
+#SBATCH --job-name=op1_orthoY_swdY_hsampleENT_hbatchENT_t0_25
 #SBATCH --nodes=1
 #SBATCH --ntasks-per-node=1
 #SBATCH --gpus-per-task=1

@@ -1,10 +1,12 @@
-# Continual DINOv2 pretraining on TCGA tiles (single-GPU). Three loss terms:
+# Continual DINOv2 pretraining on TCGA tiles (single-GPU). Loss terms:
 # DINO CLS self-distillation (Sinkhorn-Knopp centred teacher targets),
-# iBOT masked-patch self-distillation, and an anti-collapse shape regularizer
-# (prototype_head.reg_type: "swd" on the score vectors, or "kde" uniformity on
-# the CLS embeddings). YAML drives the
+# iBOT masked-patch self-distillation, KDE uniformity on the CLS embeddings
+# (dino.kde_loss_weight), and a two-axis assignment-shaping regularizer on the
+# prototype scores -- per_sample and per_batch each choose an SWD shape term and
+# a dispersion (none/entropy/gini) that sharpens (per_sample) or widens
+# (per_batch) the distribution (see prototype_head in the config). YAML drives the
 # tunable knobs (backbone variant, LR + LR scheduler, drop path, layerwise
-# decay, prototype score reg weight, FLOP/sample budgets, batch size); other
+# decay, regularizer ontology, FLOP/sample budgets, batch size); other
 # DINOv2 hyperparameters are hardcoded inline at their use sites.
 
 import atexit
@@ -159,10 +161,11 @@ def dino_ce(student, teacher):
     return -(teacher * F.log_softmax(student / 0.1, dim=-1)).sum(-1).mean()
 
 
-# SWD shape regularizer on prototype score vectors. Projects [N, n_prototypes]
-# scores onto K random directions, standardises each projection using detached
-# statistics (so gradients see only shape, not center/scale), then penalises
-# deviation of the sorted values from N(0,1) quantiles.
+# Per-batch SWD shape regularizer (the per_batch axis): projects the [N, n_prototypes] score vectors
+# onto K random directions and shapes the across-batch distribution (dim=0) toward N(0,1). Each
+# projection is standardised with detached statistics (gradients see shape, not center/scale), then
+# the sorted values are penalised against N(0,1) quantiles. Anti-collapse: a collapsed batch projects
+# to a degenerate (non-Gaussian) 1D distribution.
 def score_swd(z, K=64):
     N, D = z.shape
     W = torch.randn(D, K, device=z.device, dtype=z.dtype)
@@ -181,7 +184,8 @@ def score_swd(z, K=64):
 # penalises deviation from N(0,1) quantiles. Minimising it pulls every row toward a graded,
 # bell-shaped profile: it penalises a one-hot row (a spike) AND a uniform row (a flat line), so it
 # encourages informative similarity to *several* prototypes rather than a single winner -- a
-# distributed code. Used in place of h_per minimization, which instead forced one-hot assignments.
+# distributed code. The per_sample SWD term; SWD fixes row shape while the per_sample dispersion
+# (entropy/gini) sets its width.
 def sample_swd(z):
     D = z.shape[1]
     z = (z - z.mean(dim=1, keepdim=True).detach()) / z.std(dim=1, keepdim=True).detach().clamp(min=1e-8)
@@ -195,7 +199,8 @@ def sample_swd(z):
 # sample it takes the log-mean-exp of `concentration`-scaled cosine similarities to the other
 # samples in the batch (self excluded), penalising clustered embeddings and pushing mass toward a
 # uniform spread on the hypersphere. The trailing log term recenters it to ~0 at perfect uniformity.
-# Alternative to score_swd, selected by prototype_head.reg_type.
+# Embedding-space anti-collapse, independent of the score-space assignment ontology; gated by
+# dino.kde_loss_weight (0 = off).
 def kde_loss(x, concentration):
     x = F.normalize(x, p=2, dim=-1)
     sim = concentration * (x @ x.T)
@@ -219,6 +224,23 @@ def entropy_reg(scores, temp, eps=1e-8):
     p_bar = p.mean(dim=0)
     h_batch = -(p_bar * (p_bar + eps).log()).sum()
     return h_per, h_batch
+
+
+# Gini-Simpson dispersion (Renyi-2 / collision) of the prototype assignments: 1 - sum_k p_k^2, the
+# permutation-invariant "width" of a categorical. Mirrors entropy_reg but with a mode-focused,
+# tail-insensitive gradient (linear -2p_k) instead of Shannon's -log, so it leaves a soft tail and
+# does not force the marginal uniform. Returns (g_per, g_batch):
+#   g_per   = mean per-sample dispersion             -> minimized  (concentrate each row on fewer prototypes)
+#   g_batch = dispersion of the batch-mean assignment -> maximized  (spread the marginal, anti-collapse)
+# Composes with the SWD terms, which are scale-invariant (they shape but do not set width): SWD fixes
+# the Gaussian *shape*, Gini fixes the *width*. Min g_per + per-sample SWD = a narrow Gaussian row;
+# max g_batch + per-batch SWD = a wide Gaussian marginal.
+def gini_reg(scores, temp):
+    p = F.softmax(scores.float() / temp, dim=-1)
+    g_per = (1.0 - p.pow(2).sum(-1)).mean()
+    p_bar = p.mean(dim=0)
+    g_batch = 1.0 - p_bar.pow(2).sum()
+    return g_per, g_batch
 
 
 # Sample iBOT masking pattern: per-image bernoulli on whether to mask, then random patch ratio.
@@ -304,13 +326,19 @@ def main():
     ibot_mode = head_cfg["ibot_mode"]
     if ibot_mode not in ("sinkhorn", "prototype"):
         raise ValueError(f"prototype_head.ibot_mode must be 'sinkhorn' or 'prototype', got {ibot_mode!r}")
-    # sample_reg_type picks the per-sample axis of the assignment-shaping term: "swd" pulls each
-    # score row toward a graded Gaussian (distributed, multi-prototype code) via sample_swd; "entropy"
-    # minimizes h_per to sharpen toward one-hot (the original ME-MAX behavior). Both keep h_batch. The
-    # inactive term is still computed and logged as a monitor. compute_losses branches on this value.
-    sample_reg_type = head_cfg["sample_reg_type"]
-    if sample_reg_type not in ("swd", "entropy"):
-        raise ValueError(f"prototype_head.sample_reg_type must be 'swd' or 'entropy', got {sample_reg_type!r}")
+    # Assignment-shaping ontology (see configs/main.yaml): each axis independently picks an SWD shape
+    # term (on/off + weight) and a dispersion type (none|entropy|gini) + weight. per_sample dispersion
+    # is minimized (sharpen), per_batch dispersion is maximized (widen). These locals are closed over
+    # by compute_losses. No master multiplier -- each term is absolute-weighted.
+    ps_cfg, pb_cfg = head_cfg["per_sample"], head_cfg["per_batch"]
+    sample_swd_on, sample_swd_w = bool(ps_cfg["swd"]["enabled"]), ps_cfg["swd"]["weight"]
+    batch_swd_on, batch_swd_w = bool(pb_cfg["swd"]["enabled"]), pb_cfg["swd"]["weight"]
+    sample_disp, sample_disp_w = ps_cfg["dispersion"]["type"], ps_cfg["dispersion"]["weight"]
+    batch_disp, batch_disp_w = pb_cfg["dispersion"]["type"], pb_cfg["dispersion"]["weight"]
+    reg_temp = head_cfg["reg_temp"]
+    for axis_name, disp in (("per_sample", sample_disp), ("per_batch", batch_disp)):
+        if disp not in ("none", "entropy", "gini"):
+            raise ValueError(f"prototype_head.{axis_name}.dispersion.type must be 'none', 'entropy', or 'gini', got {disp!r}")
     def make_prototype_head():
         return PrototypeHead(student_backbone.embed_dim, head_cfg['n_prototypes'], head_cfg["hidden_dim"], head_cfg["prototype_dim"], head_cfg["n_layers"], head_cfg['ns_steps'], head_cfg["orthogonal"]).to(device)
     student_dino_head = make_prototype_head()
@@ -382,7 +410,8 @@ def main():
         f"config: {cfg['config_path']}  batch_size: {batch_size}  max_train_samples: {max_train_samples}  "
         f"max_train_flops: {train_cfg['max_train_flops']}  "
         f"probe_count: {cfg['probe']['count']}  warmup_fraction: {dino_cfg['warmup_fraction']}  "
-        f"lr: {dino_cfg['lr']}  adam_beta2: {dino_cfg['adam_beta2']}  score_reg_weight: {head_cfg['score_reg_weight']}  "
+        f"lr: {dino_cfg['lr']}  adam_beta2: {dino_cfg['adam_beta2']}  "
+        f"per_sample: swd={sample_swd_on}/{sample_disp}  per_batch: swd={batch_swd_on}/{batch_disp}  "
         f"ibot_mode: {ibot_mode}  orthogonal: {head_cfg['orthogonal']}  "
         f"drop_path: {dino_cfg['drop_path_rate']}  "
         f"layerwise_decay: {dino_cfg['layerwise_decay']}",
@@ -506,32 +535,37 @@ def main():
         global_loss = dino_ce(sg_cls, t_prob.flatten(0, 1)) * 2 / (2 * L + 2)
         s_patch = student_ibot_head(sg["x_norm_patchtokens"].flatten(0, 1)[mask_idx])
         ibot_loss = -(t_patch_prob * F.log_softmax(s_patch / 0.1, dim=-1)).sum(-1).mul(mask_w).sum() / max(1, b * 2)
-        # Anti-collapse shape regularizer, toggled by prototype_head.reg_type: "swd" shapes the
-        # prototype score vectors toward N(0,I) per random slice; "kde" spreads the CLS embeddings
-        # uniformly on the sphere. Both are scaled by the same reg_scale schedule.
-        if head_cfg["reg_type"] == "kde":
-            reg = dino_cfg["kde_loss_weight"] * reg_scale * sum(
-                kde_loss(x, dino_cfg["kde_concentration"]) for x in sg["x_norm_clstoken"].chunk(train_cfg["global_views"])
-            )
-        else:
-            reg = head_cfg["score_reg_weight"] * reg_scale * score_swd(sg_cls)
-        # Assignment-shaping term = per-sample axis (sample_reg_type) - batch axis (h_batch).
-        # Per-sample "swd": minimize sample_swd (dim=1) to pull each score row toward a graded Gaussian
-        # -- a distributed, multi-prototype code. Per-sample "entropy": minimize h_per to sharpen rows
-        # toward one-hot (original ME-MAX). Both keep h_batch maximization to spread the marginal
-        # (anti-collapse). Both samp_swd and h_per are always computed so the inactive one stays a
-        # monitor. Note the two per-sample terms are on different scales (samp_swd ~O(0.1-1),
-        # h_per ~O(0-ln n_prototypes)), so sample_swd_weight and sample_entropy_weight are separate.
+        # KDE embedding-space anti-collapse (uniformity on the CLS hypersphere), independent of the
+        # score-space assignment ontology below. dino.kde_loss_weight = 0 disables it.
+        reg = dino_cfg["kde_loss_weight"] * reg_scale * sum(
+            kde_loss(x, dino_cfg["kde_concentration"]) for x in sg["x_norm_clstoken"].chunk(train_cfg["global_views"])
+        )
+        # Assignment-shaping term over the CLS scores, per the two-axis ontology (configs/main.yaml):
+        # each axis has an SWD shape term (on/off) and a dispersion term (none|entropy|gini). SWD fixes
+        # shape, dispersion fixes width. per_sample terms are minimized (sharpen); per_batch SWD is
+        # minimized (anti-collapse shape) while per_batch dispersion is maximized (widen the marginal),
+        # hence the sign flip. All of samp_swd/batch_swd/h_per/h_batch/g_per/g_batch are computed
+        # unconditionally so the inactive mechanisms stay logged as monitors.
         samp_swd = sample_swd(sg_cls)
-        h_per, h_batch = entropy_reg(sg_cls, head_cfg["entropy_reg_temp"])
-        if sample_reg_type == "swd":
-            sample_term = head_cfg["sample_swd_weight"] * samp_swd
-        else:
-            sample_term = head_cfg["sample_entropy_weight"] * h_per
-        # entropy_reg_weight is the master switch: 0 disables this term while still computing samp_swd,
-        # h_per, h_batch as monitors.
-        ent_reg = head_cfg["entropy_reg_weight"] * (sample_term - head_cfg["batch_entropy_weight"] * h_batch)
-        return local_loss + global_loss, ibot_loss, reg, ent_reg, samp_swd.detach(), h_per.detach(), h_batch.detach()
+        batch_swd_val = score_swd(sg_cls)
+        h_per, h_batch = entropy_reg(sg_cls, reg_temp)
+        g_per, g_batch = gini_reg(sg_cls, reg_temp)
+        ent_reg = samp_swd.new_zeros(())
+        if sample_swd_on:
+            ent_reg = ent_reg + sample_swd_w * samp_swd
+        if sample_disp == "entropy":
+            ent_reg = ent_reg + sample_disp_w * h_per
+        elif sample_disp == "gini":
+            ent_reg = ent_reg + sample_disp_w * g_per
+        if batch_swd_on:
+            ent_reg = ent_reg + batch_swd_w * batch_swd_val
+        if batch_disp == "entropy":
+            ent_reg = ent_reg - batch_disp_w * h_batch
+        elif batch_disp == "gini":
+            ent_reg = ent_reg - batch_disp_w * g_batch
+        return (local_loss + global_loss, ibot_loss, reg, ent_reg,
+                samp_swd.detach(), batch_swd_val.detach(), h_per.detach(), h_batch.detach(),
+                g_per.detach(), g_batch.detach())
 
     # Held-out validation pass: same DINO + iBOT + reg losses on `val_batches` of the val split.
     # Schedule terms (teacher_temp, reg_scale) drift over training, so read val curves as same-step
@@ -542,7 +576,7 @@ def main():
         py_rng, cpu_rng, cuda_rng = random.getstate(), torch.random.get_rng_state(), torch.cuda.get_rng_state(device)
         random.seed(train_cfg["seed"] + eval_step)
         torch.manual_seed(train_cfg["seed"] + eval_step)
-        sums = torch.zeros(8, device=device)
+        sums = torch.zeros(11, device=device)
         n_batches = 0
         for vb_idx, vbatch in enumerate(val_loader):
             if vb_idx >= int(train_cfg["val_batches"]):
@@ -552,13 +586,13 @@ def main():
             with torch.no_grad(), autocast:
                 gf, lf = vg.transpose(0, 1).flatten(0, 1), vl.transpose(0, 1).flatten(0, 1)
                 masks, mask_idx, mask_w = make_masks(b * train_cfg["global_views"], global_patches, device)
-                dino_l, ibot_l, reg_v, ent_v, samp_swd_v, h_per_v, h_batch_v = compute_losses(gf, lf, b, masks, mask_idx, mask_w, eval_teacher_temp, eval_reg_scale)
-            sums += torch.tensor([float(dino_l), float(ibot_l), float(reg_v), float(ent_v), float(dino_l + ibot_l + reg_v + ent_v), float(samp_swd_v), float(h_per_v), float(h_batch_v)], device=device)
+                dino_l, ibot_l, reg_v, ent_v, samp_swd_v, batch_swd_v, h_per_v, h_batch_v, g_per_v, g_batch_v = compute_losses(gf, lf, b, masks, mask_idx, mask_w, eval_teacher_temp, eval_reg_scale)
+            sums += torch.tensor([float(dino_l), float(ibot_l), float(reg_v), float(ent_v), float(dino_l + ibot_l + reg_v + ent_v), float(samp_swd_v), float(batch_swd_v), float(h_per_v), float(h_batch_v), float(g_per_v), float(g_batch_v)], device=device)
             n_batches += 1
         random.setstate(py_rng)
         torch.random.set_rng_state(cpu_rng)
         torch.cuda.set_rng_state(cuda_rng, device)
-        return dict(zip(("dino", "ibot", "reg", "ent", "total", "samp_swd", "h_per", "h_batch"), (sums / max(1, n_batches)).tolist()))
+        return dict(zip(("dino", "ibot", "reg", "ent", "total", "samp_swd", "batch_swd", "h_per", "h_batch", "g_per", "g_batch"), (sums / max(1, n_batches)).tolist()))
 
     # Ingest completed probe result JSONs into metrics.jsonl and wandb.
     def log_probe_results():
@@ -652,7 +686,7 @@ def main():
                     # so [crop0_img0, crop0_img1, ..., crop1_img0, ...] for clean teacher/student alignment.
                     gf = global_views.transpose(0, 1).flatten(0, 1)
                     lf = local_views.transpose(0, 1).flatten(0, 1)
-                    dino_loss_value, ibot_loss, reg, ent_reg, samp_swd, h_per, h_batch = compute_losses(
+                    dino_loss_value, ibot_loss, reg, ent_reg, samp_swd, batch_swd, h_per, h_batch, g_per, g_batch = compute_losses(
                         gf, lf, batch_size, masks, mask_idx, mask_w, teacher_temp, reg_scale,
                         ckpt=activation_checkpointing,
                     )
@@ -684,9 +718,12 @@ def main():
                     "reg": float(reg.detach()),
                     "ent": float(ent_reg.detach()),
                     "samp_swd": float(samp_swd),
+                    "batch_swd": float(batch_swd),
                     "total": float(total_loss.detach()),
                     "h_per": float(h_per),
                     "h_batch": float(h_batch),
+                    "g_per": float(g_per),
+                    "g_batch": float(g_batch),
                 }
                 unique_counts = flush_unique_counts()
                 now = time.time()
@@ -736,6 +773,11 @@ def main():
                     "gpu_mem_gb": gpu_mem_gb,
                     "gpu_peak_mem_gb": gpu_peak_mem_gb,
                     "grad_norm": float(grad_norm.detach()),
+                    # Effective inverse-temperature the CLS head applies to its cosine scores
+                    # (exp of the clamped logit_scale). Mediates assignment sharpness: g_per can fall
+                    # simply because this climbs toward the exp(log 100)=100 clamp rather than from real
+                    # per-sample structure, so read it alongside g_per/samp_swd.
+                    "logit_scale": float(student_dino_head.logit_scale.detach().clamp(max=math.log(100)).exp()),
                 }
                 train_log.update(unique_counts)
                 print(
@@ -743,7 +785,9 @@ def main():
                     f"[{completed_step}/{total_steps_estimate}]  eta: {eta_string}  gap: {console_gap_ms:.2f} ms  "
                     f"lr: {current_lr:.6f}  total: {reduced['total']:.4f}  "
                     f"dino: {reduced['dino']:.4f}  ibot: {reduced['ibot']:.4f}  reg: {reduced['reg']:.4f}  ent: {reduced['ent']:.4f}  "
-                    f"samp_swd: {reduced['samp_swd']:.4f}  h_per: {reduced['h_per']:.3f}  h_batch: {reduced['h_batch']:.3f}  "
+                    f"samp_swd: {reduced['samp_swd']:.4f}  batch_swd: {reduced['batch_swd']:.4f}  h_per: {reduced['h_per']:.3f}  h_batch: {reduced['h_batch']:.3f}  "
+                    f"g_per: {reduced['g_per']:.3f}  g_batch: {reduced['g_batch']:.3f}  "
+                    f"logit_scale: {train_log['logit_scale']:.3f}  "
                     f"grad_norm: {train_log['grad_norm']:.4f}  flops/s: {flops_per_sec:.3e}  "
                     f"time: {step_seconds:.6f}  data: {data_seconds:.6f}  "
                     f"max mem: {int(gpu_peak_mem_gb * 1024)}",
@@ -772,7 +816,7 @@ def main():
                 with metrics_path.open("a") as handle:
                     handle.write(json.dumps(val_log) + "\n")
                 wandb_run.log({f"val/{k}": v for k, v in val.items()}, step=completed_step)
-                print(f"{console_prefix()} Validation  [{completed_step}]  total: {val['total']:.4f}  dino: {val['dino']:.4f}  ibot: {val['ibot']:.4f}  reg: {val['reg']:.4f}  ent: {val['ent']:.4f}  samp_swd: {val['samp_swd']:.4f}  h_per: {val['h_per']:.3f}  h_batch: {val['h_batch']:.3f}", flush=True)
+                print(f"{console_prefix()} Validation  [{completed_step}]  total: {val['total']:.4f}  dino: {val['dino']:.4f}  ibot: {val['ibot']:.4f}  reg: {val['reg']:.4f}  ent: {val['ent']:.4f}  samp_swd: {val['samp_swd']:.4f}  batch_swd: {val['batch_swd']:.4f}  h_per: {val['h_per']:.3f}  h_batch: {val['h_batch']:.3f}  g_per: {val['g_per']:.3f}  g_batch: {val['g_batch']:.3f}", flush=True)
                 # Reset rate clocks after validation so the next train log is train-rate only.
                 last_console_step, last_console_monotonic = completed_step, time.monotonic()
                 last_time, last_examples, last_visible_patch_presentations, last_train_flops = time.time(), examples_seen, visible_patch_presentations, train_flops
@@ -823,7 +867,10 @@ def main():
         "warmup_train_samples": warmup_train_samples,
         "lr": dino_cfg["lr"],
         "adam_beta2": dino_cfg["adam_beta2"],
-        "score_reg_weight": head_cfg["score_reg_weight"],
+        "per_sample_swd": sample_swd_on,
+        "per_sample_dispersion": sample_disp,
+        "per_batch_swd": batch_swd_on,
+        "per_batch_dispersion": batch_disp,
         "ibot_mode": ibot_mode,
         "orthogonal": head_cfg["orthogonal"],
         "drop_path_rate": dino_cfg["drop_path_rate"],
