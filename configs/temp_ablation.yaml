@@ -1,8 +1,8 @@
 project:
-  name: op1_orthoY_hsampleSWD_hbatchENT
+  name: op1_orthoY_hsampleENT_hbatchENT_tempAblation
   family: nanopath
-  recipe_id: dinov2-vits14-op1_orthoY_hsampleSWD_hbatchENT
-  output_dir: /data/$USER/nanopath/20260719_op1_orthoY_hsampleSWD_hbatchENT
+  recipe_id: dinov2-vits14-op1_orthoY_hsampleENT_hbatchENT_tempAblation
+  output_dir: /data/$USER/nanopath/20260719_op1_orthoY_hsampleENT_hbatchENT_tempAblation
   wandb_dir: /data/$USER/nanopath/wandb
 
 data:
@@ -84,12 +84,12 @@ prototype_head:
   # entropy_reg_temp only affects the h_per/h_batch monitors (softmax temp), not sample_swd (raw
   # scores). Lower batch_entropy_weight lets the marginal follow the true tissue mix rather than being
   # pushed uniform (the behavior we dropped Sinkhorn to avoid).
-  sample_reg_type: swd  # per-sample axis: "swd" (sample_swd) or "entropy" (h_per minimization)
+  sample_reg_type: entropy  # per-sample axis: "swd" (sample_swd) or "entropy" (h_per minimization)
   entropy_reg_weight: 0.001  # master switch for the term; 0 = disabled (samp_swd/h_per/h_batch still logged)
   entropy_reg_temp: 0.25
   sample_swd_weight: 1.0      # weight when sample_reg_type == "swd"
   sample_entropy_weight: 1.0  # weight when sample_reg_type == "entropy"
-  batch_entropy_weight: 0.2
+  batch_entropy_weight: 1.0
 
 probe:
   enabled: true

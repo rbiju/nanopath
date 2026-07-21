@@ -1,8 +1,8 @@
 project:
-  name: op1_orthoY_hsampleSWD_hbatchENT
+  name: op1_orthoY_hsampleSWD_hbatchENT_lowTemp
   family: nanopath
-  recipe_id: dinov2-vits14-op1_orthoY_hsampleSWD_hbatchENT
-  output_dir: /data/$USER/nanopath/20260719_op1_orthoY_hsampleSWD_hbatchENT
+  recipe_id: dinov2-vits14-op1_orthoY_hsampleSWD_hbatchENT_lowTemp
+  output_dir: /data/$USER/nanopath/20260719_op1_orthoY_hsampleSWD_hbatchENT_lowTemp
   wandb_dir: /data/$USER/nanopath/wandb
 
 data:
@@ -74,6 +74,7 @@ prototype_head:
   # or "prototype" (PrototypeHead + plain-softmax targets, mirroring the CLS branch).
   ibot_mode: prototype
   reg_type: kde  # anti-collapse shape regularizer: "swd" (score_swd) or "kde" (dino.kde_* knobs)
+  score_reg_weight: 0.1
   score_reg_weight: 0.1
   # Assignment-shaping term (anti-collapse + per-sample code shaping) = per-sample axis - h_batch.
   # sample_reg_type picks the per-sample axis: "swd" pulls each score row toward a graded Gaussian
