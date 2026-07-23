@@ -232,8 +232,8 @@ def main():
     teacher_backbone.train(False)
     for p in teacher_backbone.parameters():
         p.requires_grad = False
-    student_dino_head = DINOHead(student_backbone.embed_dim, 131072, dino_cfg["head_hidden_dim"], dino_cfg["head_bottleneck_dim"], 3).to(device)
-    student_ibot_head = DINOHead(student_backbone.embed_dim, 131072, dino_cfg["head_hidden_dim"], dino_cfg["head_bottleneck_dim"], 3).to(device)
+    student_dino_head = DINOHead(student_backbone.embed_dim, 256, dino_cfg["head_hidden_dim"], dino_cfg["head_bottleneck_dim"], 3).to(device)
+    student_ibot_head = DINOHead(student_backbone.embed_dim, 256, dino_cfg["head_hidden_dim"], dino_cfg["head_bottleneck_dim"], 3).to(device)
     teacher_dino_head = deepcopy(student_dino_head)
     teacher_ibot_head = deepcopy(student_ibot_head)
     for m in (teacher_dino_head, teacher_ibot_head):

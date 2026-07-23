@@ -1,5 +1,5 @@
 project:
-  name: main-dinov2
+  name: main-dinov2_reduced_pdim
   family: nanopath
   recipe_id: dinov2-vits14-reg-kde
   output_dir: /data/$USER/nanopath/main/default
