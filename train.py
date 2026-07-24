@@ -195,6 +195,16 @@ def sample_swd(z):
     return (z_sorted - target.unsqueeze(0)).pow(2).mean()
 
 
+def column_swd(z):
+    N = z.shape[0]
+    z = (z - z.mean(dim=0, keepdim=True).detach()) / z.std(dim=0, keepdim=True).detach().clamp(min=1e-8)
+    z_sorted = torch.sort(z, dim=0).values
+    u = torch.arange(1, N + 1, device=z.device, dtype=z.dtype) / (N + 1)
+    target = Normal(0, 1).icdf(u)
+    return (z_sorted - target.unsqueeze(1)).pow(2).mean()
+
+
+
 # KDE uniformity regularizer on the L2-normalized CLS embeddings (Wang & Isola style). For each
 # sample it takes the log-mean-exp of `concentration`-scaled cosine similarities to the other
 # samples in the batch (self excluded), penalising clustered embeddings and pushing mass toward a
