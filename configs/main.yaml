@@ -1,8 +1,8 @@
 project:
-  name: main-dinov2_reduced_pdim
+  name: cs_qkv4_baseline
   family: nanopath
-  recipe_id: dinov2-vits14-reg-kde
-  output_dir: /data/$USER/nanopath/main/default
+  recipe_id: cs_qkv4_baseline
+  output_dir: /data/$USER/nanopath/20260727-cs_qkv4_baseline
   wandb_dir: /data/$USER/nanopath/wandb
 
 data:
@@ -22,6 +22,7 @@ data:
 
 model:
   type: dinov2_vits14_reg
+  qkv_blocks: 4 # blocks (from the input side) that get a [CLS]/register-specialized qkv projection; LayerNorms are specialized in all blocks
 
 train:
   seed: 7777
@@ -62,6 +63,7 @@ dino:
 probe:
   enabled: true
   model_weights: ema
+  model_loader: model:load_specialized_probe_model # probe.py's default path builds a plain DinoV2ViT, which cannot strict-load specialized weights
   count: 1 # 4 means probing at 25%, 50%, 75%, and 100% of the sample cap. 1 means probing just at the end.
   datasets:
     - bracs

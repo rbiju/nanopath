@@ -22,6 +22,7 @@ data:
 
 model:
   type: dinov2_vits14_reg
+  qkv_blocks: 4 # blocks (from the input side) that get a [CLS]/register-specialized qkv projection; LayerNorms are specialized in all blocks
 
 train:
   seed: 1337
@@ -62,6 +63,7 @@ dino:
 probe:
   enabled: true
   model_weights: ema
+  model_loader: model:load_specialized_probe_model # probe.py's default path builds a plain DinoV2ViT, which cannot strict-load specialized weights
   count: 1
   datasets:
     - bracs
