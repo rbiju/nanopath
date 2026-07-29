@@ -5,9 +5,13 @@
 # Meta's checkpoint key layout exactly, so `load_dinov2_pretrained(model)` does
 # a strict load.
 #
+# SpecializedDinoV2ViT is the same ViT with CLS/patch weight specialization (Marouani et al.).
+#
 # DINOHead is the small MLP + weight-normed classifier used by train.py for the
 # DINO CLS self-distillation loss. It is intentionally trivial
 # (~15 lines) so we have zero runtime dependency on the dinov2 codebase.
+
+from copy import deepcopy
 
 import torch
 import torch.nn as nn
@@ -204,12 +208,56 @@ class DinoV2ViT(nn.Module):
         return torch.cat(feats, dim=-1)
 
 
+# Runs `cls` weights over the leading [CLS]+register tokens and `patch` weights over the rest, then
+# rejoins the sequence. Wrapping a token-wise layer (LayerNorm, LayerScale, qkv Linear) this way means
+# Block and Attention need no forward changes, and attention still sees one unmasked sequence so SDPA
+# keeps its Flash-2 path. The two copies are loaded from the same pretrained tensor, so they only
+# diverge through training. Splitting a Linear costs no extra FLOPs: every token still passes through
+# exactly one.
+class Specialized(nn.Module):
+    def __init__(self, layer, n_cls):
+        super().__init__()
+        self.n_cls, self.patch, self.cls = n_cls, layer, deepcopy(layer)
+
+    def forward(self, x):
+        return torch.cat([self.cls(x[:, : self.n_cls]), self.patch(x[:, self.n_cls :])], dim=1)
+
+
+# CLS/patch weight specialization (Marouani et al.): [CLS] and register tokens carry global semantics
+# while patch tokens carry local ones, so give them their own LayerNorm and LayerScale weights in every
+# block (the paper's "specialized normalization") plus their own qkv projection in the first
+# `qkv_blocks` blocks, where specialization pays off.
+# Registers group with [CLS] since they are global scratch space, not spatial features.
+class SpecializedDinoV2ViT(DinoV2ViT):
+    def __init__(self, variant="dinov2_vits14_reg", drop_path_rate=0.0, qkv_blocks=4, variant_cfg=None):
+        super().__init__(variant, drop_path_rate, variant_cfg)
+        n_cls = 1 + self.registers
+        for i, blk in enumerate(self.blocks):
+            blk.norm1, blk.norm2 = Specialized(blk.norm1, n_cls), Specialized(blk.norm2, n_cls)
+            blk.ls1, blk.ls2 = Specialized(blk.ls1, n_cls), Specialized(blk.ls2, n_cls)
+            if i < qkv_blocks:
+                blk.attn.qkv = Specialized(blk.attn.qkv, n_cls)
+
+
 # Strict-load Meta's pretrained weights for the model's declared variant.
 # Strict matches our key layout against Meta's; any drift fails loudly per AGENTS.md.
+# The rewrite points both halves of every Specialized layer at the one pretrained tensor, so a fresh
+# SpecializedDinoV2ViT is numerically identical to DINOv2 at step 0; it is a no-op for a plain ViT.
 def load_dinov2_pretrained(model):
     *_, url = DINOV2_VARIANTS[model.variant]
     state = torch.hub.load_state_dict_from_url(url, progress=False, map_location="cpu")
+    state = {k: state[k.replace(".cls.", ".").replace(".patch.", ".")] for k in model.state_dict()}
     model.load_state_dict(state, strict=True)
+    return model
+
+
+# probe.py rebuilds a plain DinoV2ViT and strict-loads it, so specialized runs route around that
+# locked path via `probe.model_loader`; the probe checkpoint carries the config it was trained with.
+def load_specialized_probe_model(checkpoint_path, device):
+    ckpt = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
+    cfg = ckpt["config"]
+    model = SpecializedDinoV2ViT(variant=cfg["model"]["type"], qkv_blocks=cfg["model"]["qkv_blocks"]).to(device).eval()
+    model.load_state_dict(ckpt[{"ema": "model_ema", "model": "model"}[str(cfg["probe"]["model_weights"])]], strict=True)
     return model
 
 

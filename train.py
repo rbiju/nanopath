@@ -30,7 +30,7 @@ from torch.utils.data import DataLoader
 from torch.utils.flop_counter import FlopCounterMode
 
 from dataloader import TCGATileDataset, TILE_SIZE
-from model import DINOHead, DinoV2ViT, GradScale, JEPAPredictor, load_dinov2_pretrained
+from model import DINOHead, GradScale, JEPAPredictor, SpecializedDinoV2ViT, load_dinov2_pretrained
 from probe import (
     completed_probe_summary,
     collect_probe_results,
@@ -244,7 +244,7 @@ def main():
     torch.backends.cuda.matmul.allow_tf32 = True
     torch.backends.cudnn.allow_tf32 = True
     variant = cfg["model"]["type"]
-    student_backbone = load_dinov2_pretrained(DinoV2ViT(variant=variant, drop_path_rate=dino_cfg["drop_path_rate"])).to(device)
+    student_backbone = load_dinov2_pretrained(SpecializedDinoV2ViT(variant=variant, drop_path_rate=dino_cfg["drop_path_rate"], qkv_blocks=cfg["model"]["qkv_blocks"])).to(device)
     teacher_backbone = deepcopy(student_backbone)
     teacher_backbone.train(False)
     for p in teacher_backbone.parameters():
