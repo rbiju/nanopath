@@ -1,8 +1,8 @@
 project:
-  name: ryan-validation-s12
+  name: bscsc_qkv4
   family: nanopath
-  recipe_id: dinov2-vits14-reg-jepa-mask10
-  output_dir: /data/$USER/nanopath/ryan-validation/s12
+  recipe_id: bscsc_qkv4
+  output_dir: /data/$USER/nanopath/20260729-bscsc_qkv4
   wandb_dir: /data/$USER/nanopath/wandb
 data:
   dataset_dir: /data/nanopath_parquet
