@@ -22,6 +22,7 @@ data:
 
 model:
   type: dinov2_vits14_reg
+  qkv_blocks: 4 # blocks (from the input side) that get a [CLS]-specialized qkv projection; LayerNorms and LayerScales are specialized in all blocks. Registers stay on the patch weights
 
 train:
   seed: 1337
@@ -60,8 +61,8 @@ dino:
   kde_concentration: 10.0
   jepa_pred_depth: 4
   jepa_pred_width: 0
-  jepa_blocks: 4
-  jepa_block_scale: 0.10
+  jepa_blocks: 5
+  jepa_block_side: 4 # must divide the 16x16 patch grid; 5 disjoint 4x4 blocks = exactly 80 of 256 patches masked
 
 probe:
   enabled: true

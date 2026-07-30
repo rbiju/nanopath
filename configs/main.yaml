@@ -1,8 +1,8 @@
 project:
-  name: bscsc_qkv4
+  name: bscsc_qkv4_registersWPatches_xattnJEPA
   family: nanopath
-  recipe_id: bscsc_qkv4
-  output_dir: /data/$USER/nanopath/20260729-bscsc_qkv4
+  recipe_id: bscsc_qkv4_registersWPatches_xattnJEPA
+  output_dir: /data/$USER/nanopath/20260729-bscsc_qkv4_registersWPatches_xattnJEPA
   wandb_dir: /data/$USER/nanopath/wandb
 data:
   dataset_dir: /data/nanopath_parquet
@@ -28,7 +28,7 @@ data:
   tissue_thresh: 0.0
 model:
   type: dinov2_vits14_reg
-  qkv_blocks: 4 # blocks (from the input side) that get a [CLS]/register-specialized qkv projection; LayerNorms and LayerScales are specialized in all blocks
+  qkv_blocks: 4 # blocks (from the input side) that get a [CLS]-specialized qkv projection; LayerNorms and LayerScales are specialized in all blocks. Registers stay on the patch weights
 train:
   seed: 12
   bf16: true
@@ -64,13 +64,12 @@ dino:
   kde_concentration: 10.0
   jepa_pred_depth: 4
   jepa_pred_width: 0
-  jepa_blocks: 4
-  jepa_block_scale: 0.1
+  jepa_blocks: 5
+  jepa_block_side: 4 # must divide the 16x16 patch grid; 5 disjoint 4x4 blocks = exactly 80 of 256 patches masked
   freeze_backbone_fraction: 0.0
 probe:
   enabled: true
   model_weights: ema
-  model_loader: model:load_specialized_probe_model # probe.py's default path builds a plain DinoV2ViT, which cannot strict-load specialized weights
   count: 1
   datasets:
   - bracs

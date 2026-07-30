@@ -146,25 +146,30 @@ class DinoV2ViT(nn.Module):
         patch_pos = patch_pos.permute(0, 2, 3, 1).reshape(1, h * w, -1).to(self.pos_embed.dtype)
         return torch.cat([cls_pos, patch_pos], dim=1) if cls_pos is not None else patch_pos
 
-    # Build [cls, registers, patches] tokens; masked patch positions are replaced by mask_token.
-    def _prepare_tokens(self, x, masks=None):
+    # Build [cls, registers, patches] tokens. `keep_idx` (B, V) selects which patch positions survive:
+    # MAE-style, masked patches are dropped before the blocks rather than replaced by a mask token, so
+    # the encoder never spends compute on them. Positional embeddings are added BEFORE the gather, so the
+    # surviving tokens carry their true grid positions and absence is what marks a hole.
+    # `mask_token` is consequently unused (it stays only because Meta's checkpoint carries it and
+    # load_dinov2_pretrained is a strict load); it gets no gradient and AdamW skips it.
+    def _prepare_tokens(self, x, keep_idx=None):
         B, _, H, W = x.shape
         h, w = H // self.patch_size, W // self.patch_size
         x = self.patch_embed.proj(x).flatten(2).transpose(1, 2)
-        if masks is not None:
-            x = torch.where(masks.unsqueeze(-1), self.mask_token.to(x.dtype).expand_as(x), x)
-        cls = self.cls_token.expand(B, -1, -1)
-        regs = self.register_tokens.expand(B, -1, -1)
-        if self._pos_has_cls:
-            x = torch.cat([cls, x], dim=1) + self._interpolate_pos_embed(h, w)
-            return torch.cat([x[:, :1], regs, x[:, 1:]], dim=1)
-        return torch.cat([cls, regs, x + self._interpolate_pos_embed(h, w)], dim=1)
+        pos = self._interpolate_pos_embed(h, w)
+        cls_pos, patch_pos = (pos[:, :1], pos[:, 1:]) if self._pos_has_cls else (0.0, pos)
+        x = x + patch_pos
+        if keep_idx is not None:
+            x = x.gather(1, keep_idx[..., None].expand(-1, -1, x.shape[-1]))
+        cls = self.cls_token.expand(B, -1, -1) + cls_pos
+        return torch.cat([cls, self.register_tokens.expand(B, -1, -1), x], dim=1)
 
     # Returns the dict shape Meta's `forward_features` returns; used by train.py and probe.py.
+    # With `keep_idx` set, `x_norm_patchtokens` holds only the V kept patches, in grid order.
     # `checkpoint=True` re-runs each block under torch.utils.checkpoint to trade compute for memory;
     # useful when the 1-GPU batch of 128 (2 globals + 8 locals) does not fit in 80 GB.
-    def forward(self, x, masks=None, checkpoint=False):
-        x = self._prepare_tokens(x, masks)
+    def forward(self, x, keep_idx=None, checkpoint=False):
+        x = self._prepare_tokens(x, keep_idx)
         for blk in self.blocks:
             if checkpoint and self.training:
                 x = torch.utils.checkpoint.checkpoint(blk, x, use_reentrant=False)
@@ -207,36 +212,55 @@ class DinoV2ViT(nn.Module):
                 feats.append(self.norm(xt)[:, 0])
         return torch.cat(feats, dim=-1)
 
+    # probe.py is a locked path: it builds a plain DinoV2ViT and strict-loads the run's checkpoint.
+    # CLS/patch specialization is purely structural -- no forward override -- so a plain ViT rewrapped to
+    # match the incoming keys *is* the specialized model. Adopting that structure from the state dict lets
+    # specialized checkpoints load through the locked path; a plain checkpoint rewraps nothing.
+    def load_state_dict(self, state_dict, *args, **kwargs):
+        blocks = range(len(self.blocks))
+        if any(f"blocks.{i}.norm1.cls.weight" in state_dict for i in blocks):
+            specialize_cls_weights(self, sum(f"blocks.{i}.attn.qkv.cls.weight" in state_dict for i in blocks))
+        return super().load_state_dict(state_dict, *args, **kwargs)
 
-# Runs `cls` weights over the leading [CLS]+register tokens and `patch` weights over the rest, then
-# rejoins the sequence. Wrapping a token-wise layer (LayerNorm, LayerScale, qkv Linear) this way means
+
+# Runs `cls` weights over the leading [CLS] token and `patch` weights over the register+patch tail,
+# then rejoins the sequence. The token layout is [cls, registers, patches], so the split is the single
+# slice at index 1. Wrapping a token-wise layer (LayerNorm, LayerScale, qkv Linear) this way means
 # Block and Attention need no forward changes, and attention still sees one unmasked sequence so SDPA
 # keeps its Flash-2 path. The two copies are loaded from the same pretrained tensor, so they only
 # diverge through training. Splitting a Linear costs no extra FLOPs: every token still passes through
 # exactly one.
 class Specialized(nn.Module):
-    def __init__(self, layer, n_cls):
+    def __init__(self, layer):
         super().__init__()
-        self.n_cls, self.patch, self.cls = n_cls, layer, deepcopy(layer)
+        self.patch, self.cls = layer, deepcopy(layer)
 
     def forward(self, x):
-        return torch.cat([self.cls(x[:, : self.n_cls]), self.patch(x[:, self.n_cls :])], dim=1)
+        return torch.cat([self.cls(x[:, :1]), self.patch(x[:, 1:])], dim=1)
 
 
-# CLS/patch weight specialization (Marouani et al.): [CLS] and register tokens carry global semantics
-# while patch tokens carry local ones, so give them their own LayerNorm and LayerScale weights in every
-# block (the paper's "specialized normalization") plus their own qkv projection in the first
-# `qkv_blocks` blocks, where specialization pays off.
-# Registers group with [CLS] since they are global scratch space, not spatial features.
+# CLS/patch weight specialization (Marouani et al.): [CLS] carries global semantics while patch tokens
+# carry local ones, so give them their own LayerNorm and LayerScale weights in every block (the paper's
+# "specialized normalization") plus their own qkv projection in the first `qkv_blocks` blocks, where
+# specialization pays off.
+# Registers group with the patches: they are filled from the patch field and carry its activation
+# statistics, so only the readout token [CLS] gets the specialized weights.
+# Idempotent, so it is a no-op on an already-specialized model (resume, `load_dinov2_pretrained`).
+def specialize_cls_weights(model, qkv_blocks):
+    for i, blk in enumerate(model.blocks):
+        if isinstance(blk.norm1, Specialized):
+            continue
+        blk.norm1, blk.norm2 = Specialized(blk.norm1), Specialized(blk.norm2)
+        blk.ls1, blk.ls2 = Specialized(blk.ls1), Specialized(blk.ls2)
+        if i < qkv_blocks:
+            blk.attn.qkv = Specialized(blk.attn.qkv)
+    return model
+
+
 class SpecializedDinoV2ViT(DinoV2ViT):
     def __init__(self, variant="dinov2_vits14_reg", drop_path_rate=0.0, qkv_blocks=4, variant_cfg=None):
         super().__init__(variant, drop_path_rate, variant_cfg)
-        n_cls = 1 + self.registers
-        for i, blk in enumerate(self.blocks):
-            blk.norm1, blk.norm2 = Specialized(blk.norm1, n_cls), Specialized(blk.norm2, n_cls)
-            blk.ls1, blk.ls2 = Specialized(blk.ls1, n_cls), Specialized(blk.ls2, n_cls)
-            if i < qkv_blocks:
-                blk.attn.qkv = Specialized(blk.attn.qkv, n_cls)
+        specialize_cls_weights(self, qkv_blocks)
 
 
 # Strict-load Meta's pretrained weights for the model's declared variant.
@@ -248,16 +272,6 @@ def load_dinov2_pretrained(model):
     state = torch.hub.load_state_dict_from_url(url, progress=False, map_location="cpu")
     state = {k: state[k.replace(".cls.", ".").replace(".patch.", ".")] for k in model.state_dict()}
     model.load_state_dict(state, strict=True)
-    return model
-
-
-# probe.py rebuilds a plain DinoV2ViT and strict-loads it, so specialized runs route around that
-# locked path via `probe.model_loader`; the probe checkpoint carries the config it was trained with.
-def load_specialized_probe_model(checkpoint_path, device):
-    ckpt = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
-    cfg = ckpt["config"]
-    model = SpecializedDinoV2ViT(variant=cfg["model"]["type"], qkv_blocks=cfg["model"]["qkv_blocks"]).to(device).eval()
-    model.load_state_dict(ckpt[{"ema": "model_ema", "model": "model"}[str(cfg["probe"]["model_weights"])]], strict=True)
     return model
 
 
@@ -285,24 +299,58 @@ class DINOHead(nn.Module):
         return self.last_layer(x)
 
 
-# I-JEPA predictor head: regresses EMA-teacher patch representations at masked target blocks from the student's
-# block-masked patch tokens. FINO/JEPA-T option: n_cond>0 adds a learned per-class embedding (idx 0 = missing/-1)
-# of a discrete metadata factor to every patch token, so the latent-regression target is metadata-aware
+# CrossMAE decoder block: queries attend into `ctx` and never to each other, so a masked position's only
+# route to information is the visible field -- there is no self-attention path by which masked positions
+# could pool each other's guesses. `ctx` is visible-only by construction (the encoder dropped the rest),
+# so no key mask is needed and SDPA keeps its Flash backend. No LayerScale/DropPath: the wrapped Block
+# ran with drop_path=0.0 and gamma=1, so both were identities here.
+class CrossBlock(nn.Module):
+    def __init__(self, dim, heads, mlp_ratio=4.0):
+        super().__init__()
+        hidden = int(dim * mlp_ratio)
+        self.heads = heads
+        self.norm1, self.norm_ctx, self.norm2 = (nn.LayerNorm(dim, eps=1e-6) for _ in range(3))
+        self.q, self.kv, self.proj = nn.Linear(dim, dim), nn.Linear(dim, dim * 2), nn.Linear(dim, dim)
+        self.fc1, self.fc2 = nn.Linear(dim, hidden), nn.Linear(hidden, dim)
+
+    def forward(self, x, ctx):
+        B, N, C = x.shape
+        q = self.q(self.norm1(x)).reshape(B, N, self.heads, C // self.heads).transpose(1, 2)
+        k, v = self.kv(self.norm_ctx(ctx)).reshape(B, ctx.shape[1], 2, self.heads, C // self.heads).permute(2, 0, 3, 1, 4).unbind(0)
+        attn = F.scaled_dot_product_attention(q, k, v).transpose(1, 2).reshape(B, N, C)
+        x = x + self.proj(attn)
+        return x + self.fc2(F.gelu(self.fc1(self.norm2(x))))
+
+
+# I-JEPA predictor head: regresses EMA-teacher patch representations at masked target blocks from the
+# student's visible-only encoding. CrossMAE-style: the K masked positions are the queries, the V encoded
+# visible tokens are the keys/values, held fixed at the encoder output for every block rather than re-read
+# from the evolving query stream. The encoder never sees masked positions, so queries cannot be gathered
+# from it -- they are built here as a shared learned token plus a positional embedding indexed by
+# `mask_idx`, which is the only thing telling a query which patch it is responsible for.
+# FINO/JEPA-T option: n_cond>0 adds a learned per-class embedding (idx 0 = missing/-1)
+# of a discrete metadata factor to both sides, so the latent-regression target is metadata-aware
 # (a dense-path alternative to CLS-token steering). n_cond=0 is plain I-JEPA.
 class JEPAPredictor(nn.Module):
-    def __init__(self, dim, depth=4, width=0, heads=6, n_cond=0):
+    def __init__(self, dim, n_pos, depth=4, width=0, heads=6, n_cond=0):
         super().__init__()
         width = width or dim
         self.proj_in = nn.Linear(dim, width) if width != dim else nn.Identity()
         self.cond_emb = nn.Embedding(n_cond + 1, width) if n_cond else None
-        self.blocks = nn.ModuleList(Block(width, heads, 4.0, 0.0) for _ in range(depth))
+        self.query = nn.Parameter(torch.zeros(1, 1, width))
+        self.pos = nn.Parameter(torch.zeros(1, n_pos, width))
+        nn.init.trunc_normal_(self.query, std=0.02)
+        nn.init.trunc_normal_(self.pos, std=0.02)
+        self.blocks = nn.ModuleList(CrossBlock(width, heads) for _ in range(depth))
         self.norm = nn.LayerNorm(width, eps=1e-6)
         self.proj = nn.Linear(width, dim, bias=True)
 
-    def forward(self, patch_tokens, cond=None):
-        x = self.proj_in(patch_tokens)
+    def forward(self, visible_tokens, mask_idx, cond=None):
+        ctx = self.proj_in(visible_tokens)  # (B, V, width)
+        q = self.query + self.pos.expand(ctx.shape[0], -1, -1).gather(1, mask_idx[..., None].expand(-1, -1, ctx.shape[-1]))
         if self.cond_emb is not None and cond is not None:
-            x = x + self.cond_emb(cond + 1).unsqueeze(1)  # broadcast factor embedding over patches; cond=-1 -> idx 0
+            c = self.cond_emb(cond + 1).unsqueeze(1)  # broadcast factor embedding over tokens; cond=-1 -> idx 0
+            ctx, q = ctx + c, q + c
         for blk in self.blocks:
-            x = blk(x)
-        return self.proj(self.norm(x))
+            q = blk(q, ctx)
+        return self.proj(self.norm(q))
