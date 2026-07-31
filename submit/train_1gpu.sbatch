@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-#SBATCH --job-name=bscsc_qkv4_registersWPatches_xattnJEPA
+#SBATCH --job-name=bscsc_xattn_wd
 #SBATCH --nodes=1
 #SBATCH --ntasks-per-node=1
 #SBATCH --gpus-per-task=1

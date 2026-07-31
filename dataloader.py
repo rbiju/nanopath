@@ -50,7 +50,7 @@ RGB_FROM_HED = torch.tensor(
     dtype=torch.float32,
 )
 LOG_1E6 = float(np.log(1e-6))
-TILE_SIZE = 224
+IMAGE_SIZE = 224
 
 
 # Patients (not tiles) are the split unit so train/val never share a case.
@@ -87,7 +87,16 @@ class HEDJitter(nn.Module):
 
 
 # Map-style TCGA tile dataset that emits global/local multi-view stacks for train.py.
-class TCGATileDataset(Dataset):
+# This class is the domain adapter: everything train.py would otherwise need to know about
+# whole-slide pathology (barcode parsing, stain jitter, tissue thresholding, the patient-level
+# split) is confined here, and the rest of the harness is a generic image-SSL trainer.
+class ParquetImageDataset(Dataset):
+    # Data-coverage groupings this adapter can report, as {emitted metric name: batch field}.
+    # train.py counts uniques for whatever is listed without knowing what the groups mean; the
+    # first entry must be the image itself, since patch coverage is derived from its count.
+    # A different corpus swaps this for its own levels (e.g. frames -> clips -> videos).
+    coverage_keys = {"unique_tiles_seen": "sample_idx", "unique_slides_seen": "slide_id", "unique_patients_seen": "patient_id"}
+
     # Glob shards, build a (shard_idx, row_in_shard) index over the requested patient
     # split, and configure augmentations. `is_train=True` keeps the (1 - val_fraction)
     # majority of patient ids; `is_train=False` keeps the held-out `val_fraction` slice.
@@ -103,8 +112,8 @@ class TCGATileDataset(Dataset):
                 f"`python prepare.py {cfg['config_path']} download=True` to fetch them from "
                 f"the medarc/nanopath HF dataset before training."
             )
-        if int(train["global_size"]) > TILE_SIZE:
-            raise ValueError(f"global_size must be <= {TILE_SIZE}, got global_size={train['global_size']}")
+        if int(train["global_size"]) > IMAGE_SIZE:
+            raise ValueError(f"global_size must be <= {IMAGE_SIZE}, got global_size={train['global_size']}")
         # Lazy ParquetFile handles, opened on first __getitem__ in each worker
         # so fork-children own their own file positions.
         self._readers = [None] * len(self.shards)
@@ -146,6 +155,7 @@ class TCGATileDataset(Dataset):
         mean, std = data["mean"], data["std"]
         self.global_views = int(train["global_views"])
         self.local_views = int(train["local_views"])
+        self.local_size = int(train["local_size"])
         self.to_tensor = v2.Compose([v2.ToImage(), v2.ToDtype(torch.float32, scale=True)])
         # Global crops carry the high-context view used by the DINO/iBOT objectives.
         self.global_aug = v2.Compose(
@@ -210,7 +220,10 @@ class TCGATileDataset(Dataset):
         patient_key = int.from_bytes(hashlib.blake2b(patient_id.encode(), digest_size=8).digest(), "big") & 0x7FFFFFFFFFFFFFFF
         # Augmentations are stochastic per view; reproducibility comes from worker seeds.
         global_views = torch.stack([self.global_aug(tile) for _ in range(self.global_views)])
-        local_views = torch.stack([self.local_aug(tile) for _ in range(self.local_views)])
+        # local_views: 0 disables multi-crop entirely (torch.stack rejects an empty list, so emit the
+        # zero-length tensor explicitly and let the collate keep a (B, 0, ...) batch dimension).
+        local_views = (torch.stack([self.local_aug(tile) for _ in range(self.local_views)]) if self.local_views
+                       else global_views.new_zeros((0, 3, self.local_size, self.local_size)))
         # FINO per-factor labels for this tile's patient: discrete ids (-1 = missing), one tensor per continuous
         # factor (scalar or vector; nan-filled if missing). train.py masks missing branches out per-factor.
         fino_keys = {}

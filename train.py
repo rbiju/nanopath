@@ -1,4 +1,4 @@
-# Continual DINOv2 pretraining on TCGA tiles (single-GPU). Three loss terms:
+# Continual DINOv2 pretraining on unlabelled images (single-GPU). Three loss terms:
 # DINO CLS self-distillation (Sinkhorn-Knopp centred teacher targets),
 # I-JEPA patch-feature regression, and a KDE uniformity term on the
 # L2-normalised CLS tokens. YAML drives the tunable knobs (backbone variant,
@@ -29,7 +29,7 @@ import yaml
 from torch.utils.data import DataLoader
 from torch.utils.flop_counter import FlopCounterMode
 
-from dataloader import TCGATileDataset, TILE_SIZE
+from dataloader import IMAGE_SIZE, ParquetImageDataset
 from model import DINOHead, GradScale, JEPAPredictor, SpecializedDinoV2ViT, load_dinov2_pretrained
 from probe import (
     completed_probe_summary,
@@ -44,7 +44,7 @@ from probe import (
 def console_prefix(): return f"{time.strftime('%H:%M:%S')} {os.environ.get('SLURM_JOB_ID', str(os.getpid()))}"
 
 
-# Read the YAML recipe and fail before any GPU work if the parquet tile dataset is absent.
+# Read the YAML recipe and fail before any GPU work if the parquet dataset is absent.
 # expandvars is necessary to resolve `$USER` for checked-in configs.
 def load_config():
     if len(sys.argv) < 2:
@@ -61,10 +61,9 @@ def load_config():
     dataset_dir = Path(cfg["data"]["dataset_dir"])
     if not any(dataset_dir.glob("shard-*.parquet")):
         raise FileNotFoundError(
-            f"No parquet shards (shard-*.parquet) under {dataset_dir}. Pull the 4M-tile "
-            f"parquet dataset from medarc/nanopath on HF by running "
-            f"`python prepare.py {cfg['config_path']} download=True`. Follow the data setup in "
-            f"README.md before launching train.py."
+            f"No parquet shards (shard-*.parquet) under {dataset_dir}. Fetch the configured "
+            f"dataset by running `python prepare.py {cfg['config_path']} download=True`. "
+            f"Follow the data setup in README.md before launching train.py."
         )
     return cfg
 
@@ -162,33 +161,41 @@ def kde_loss(x, concentration):
     return torch.logsumexp(sim, dim=1).mean() - math.log(max(1, sim.shape[1] - 1))
 
 
-# I-JEPA target mask: contiguous square blocks so the predictor must infer missing tissue context.
-# Blocks are drawn without replacement from a lattice of side x side cells, so they are disjoint by
-# construction and every sample masks exactly n_blocks * side**2 patches. That fixed K is what lets the
-# encoder gather a rectangular (B, V) visible set and the predictor a rectangular (B, K) query set, and
-# lets the JEPA loss be a plain mean; overlap-allowed placement made both ragged. The lattice is then
-# rolled by a random per-sample offset (toroidal, via two gathers) so block edges are not pinned to
-# multiples of `side`, which would be a learnable artifact.
-# Vectorised end to end: no Python loop over the batch. `side` must divide `grid`.
-def make_block_mask(batch, grid, device, n_blocks=4, side=4):
-    cells = grid // side
-    sel = torch.rand(batch, cells * cells, device=device).argsort(-1)[:, :n_blocks]
-    m = torch.zeros(batch, cells * cells, dtype=torch.bool, device=device).scatter_(1, sel, True)
-    m = m.view(batch, cells, cells).repeat_interleave(side, 1).repeat_interleave(side, 2)
-    r = torch.arange(grid, device=device)
-    dy, dx = torch.randint(grid, (2, batch, 1), device=device)
-    m = m.gather(1, ((r - dy) % grid)[:, :, None].expand(-1, -1, grid))
-    m = m.gather(2, ((r - dx) % grid)[:, None, :].expand(-1, grid, -1))
-    # Stable argsort of the 0/1 mask puts the V visible indices first and the K masked ones after, each
-    # ascending, so one op yields both gather index sets (and avoids nonzero()'s device-host sync).
-    order = m.flatten(1).int().argsort(dim=-1, stable=True)
-    n_vis = grid * grid - n_blocks * side * side
-    return order[:, :n_vis], order[:, n_vis:]  # keep_idx (B, V), mask_idx (B, K)
+# I-JEPA context/target geometry. The two index sets are drawn independently -- the targets are NOT the
+# complement of the context -- which is what lets both be fixed-width and removes all the complement
+# bookkeeping. Everything is toroidal, so a region wraps across the image border rather than being
+# clipped, and every position is equally likely to be covered (no centre bias, no edge-pinned artifacts).
+#
+# Context: one contiguous side x side region of the patch grid at a random per-sample offset. The student
+# encoder sees exactly these V = side**2 patches and nothing else, so V is constant and the encoder can
+# gather a rectangular (B, V) set. Ascending order preserves the grid-order invariant on
+# x_norm_patchtokens.
+def make_context_idx(batch, grid, device, side):
+    off = torch.arange(side, device=device)
+    ty, tx = torch.randint(grid, (2, batch, 1), device=device)
+    rows, cols = (ty + off) % grid, (tx + off) % grid  # (B, side)
+    return (rows[..., None] * grid + cols[:, None, :]).flatten(1).sort(dim=-1).values  # (B, side**2)
+
+
+# Targets: n_blocks independent side x side blocks, each free to overlap the others and the context.
+# Overlap would normally make the covered-patch count vary; keeping every block's slots including
+# duplicates holds K = n_blocks * side**2 constant instead. A patch under two blocks therefore appears
+# twice, takes the same positional embedding both times, and so yields identical queries and identical
+# targets -- sound only because CrossBlock has no query-query attention, so duplicate rows cannot
+# influence each other. The effect is that overlapped patches carry proportionally more weight.
+# Blocks may land inside the context: that is not a copy task, because the target is a full-image
+# teacher's feature at that patch and the student only has the context to work from (data2vec's setup).
+def make_target_idx(batch, grid, device, n_blocks, side):
+    off = torch.arange(side, device=device)
+    ty, tx = torch.randint(grid, (2, batch, n_blocks, 1), device=device)
+    rows, cols = (ty + off) % grid, (tx + off) % grid  # (B, n_blocks, side)
+    return (rows[..., None] * grid + cols[:, :, None, :]).flatten(1)  # (B, n_blocks * side**2)
 
 
 # AdamW parameter groups with layer-wise LR decay on the backbone:
 # block i gets lr * layerwise_decay^(depth - 1 - i); patch_embed gets the deepest decay
-# multiplied by patch_embed_lr_mult; biases and norms get no weight decay; the head's
+# multiplied by patch_embed_lr_mult; biases, norms, and token/positional embeddings (backbone
+# cls/register/pos/mask tokens, predictor query/pos/cond_emb) get no weight decay; the head's
 # DINO final weight-norm last_layer parameters get an LR-freeze for the first dino.freeze_last_layer_fraction.
 def build_param_groups(student_backbone, student_dino_head, student_predictor, layerwise_decay, patch_embed_lr_mult):
     depth = len(student_backbone.blocks)
@@ -196,6 +203,9 @@ def build_param_groups(student_backbone, student_dino_head, student_predictor, l
     # instead of one-per-param), so AdamW's foreach path fuses the step across many tensors rather than
     # launching per-parameter kernels. Per-param lr/wd are unchanged, so the optimization is numerically identical.
     coalesced = {}
+    # ndim >= 2 embedding-like params the bias/norm/ndim rule misses; the predictor's pos table is a
+    # query's only positional identity, so decaying it directly erodes the JEPA queries.
+    no_wd_names = {"pos_embed", "cls_token", "register_tokens", "mask_token", "query", "pos", "cond_emb.weight"}
     modules = ((student_backbone, "backbone"), (student_dino_head, "dino_head"), (student_predictor, "jepa_predictor"))
     for module, kind in modules:
         for name, p in module.named_parameters():
@@ -206,7 +216,7 @@ def build_param_groups(student_backbone, student_dino_head, student_predictor, l
                 lr_mult = layerwise_decay ** (depth - 1 - int(name.split(".")[1]))
             elif kind == "backbone" and name.startswith("patch_embed."):
                 lr_mult = (layerwise_decay ** depth) * patch_embed_lr_mult
-            wd_mult = 0.0 if name.endswith("bias") or "norm" in name or p.ndim < 2 else 1.0
+            wd_mult = 0.0 if name.endswith("bias") or "norm" in name or p.ndim < 2 or name in no_wd_names else 1.0
             key = (lr_mult, wd_mult, "last_layer" in name)
             coalesced.setdefault(key, {"params": [], "lr_mult": lr_mult, "wd_mult": wd_mult, "last_layer": key[2]})["params"].append(p)
     return list(coalesced.values())
@@ -239,7 +249,7 @@ def main():
     # FINO two-phase: freeze the backbone (except patch_embed) for the first this-fraction of the run so the DINO/JEPA
     # heads + metadata prototypes/predictors converge against a fixed target before they steer the encoder. 0 = off.
     freeze_backbone_frac = float(dino_cfg.get("freeze_backbone_fraction", 0.0))
-    # JEPA-T: optionally condition the JEPA predictor on a discrete factor (must be in fino.discrete so its per-tile
+    # JEPA-T: optionally condition the JEPA predictor on a discrete factor (must be in fino.discrete so its per-sample
     # label rides in the batch). cond_col indexes that factor's column in batch["meta_disc"].
     jepa_cond = fino_cfg.get("jepa_cond") if fino_cfg else None
     cond_col = [f for f, _ in fino_disc].index(jepa_cond) if jepa_cond else None
@@ -262,6 +272,11 @@ def main():
     teacher_dino_head = deepcopy(student_dino_head)
     global_grid = train_cfg["global_size"] // student_backbone.patch_size
     global_patches = global_grid ** 2
+    context_side = int(dino_cfg["jepa_context_side"])
+    if not 0 < context_side <= global_grid:
+        raise ValueError(f"dino.jepa_context_side={context_side} must be in 1..{global_grid} (the {global_grid}x{global_grid} patch grid)")
+    # Independent context regions sampled per global view -- multi-crop emulated by index gathering.
+    context_views = int(train_cfg["context_views"])
     # n_pos sizes the predictor's query position table: one row per global-view patch position.
     student_predictor = JEPAPredictor(student_backbone.embed_dim, global_patches, depth=int(dino_cfg["jepa_pred_depth"]), width=int(dino_cfg["jepa_pred_width"]), n_cond=(fino_meta["n"][jepa_cond] if jepa_cond else 0)).to(device)
     for p in teacher_dino_head.parameters():
@@ -387,8 +402,8 @@ def main():
     wandb_meta = {"entity": wandb_run.entity, "project": "nanopath", "id": wandb_run.id, "name": wandb_name, "url": wandb_run.url,
                   "mode": getattr(wandb_run.settings, "mode", ""), "source_artifact": source_id,
                   "source_dir": str(source_snapshot_dir), "git": {"commit": git_commit, "remote": git_remote}}
-    train_ds = TCGATileDataset(cfg, is_train=True)
-    val_ds = TCGATileDataset(cfg, is_train=False)
+    train_ds = ParquetImageDataset(cfg, is_train=True)
+    val_ds = ParquetImageDataset(cfg, is_train=False)
     probe_state = prepare_probe_state(cfg, output_dir) if probe_enabled(cfg) else None
 
     # Train shuffles + drops partials; the loop never starts a batch that would exceed
@@ -401,15 +416,18 @@ def main():
 
     activation_checkpointing = bool(train_cfg["activation_checkpointing"])
     local_patches = (train_cfg["local_size"] // student_backbone.patch_size) ** 2
-    # Patches the student actually encodes per global view: the masked ones are dropped, not substituted.
-    visible_global_patches = global_patches - int(dino_cfg["jepa_blocks"]) * int(dino_cfg["jepa_block_side"]) ** 2
+    # Patches the student actually encodes per global view: only the contiguous context region.
+    visible_global_patches = context_side ** 2
     last_time = time.time()
     last_examples = examples_seen
     last_visible_patch_presentations = visible_patch_presentations
     last_train_flops = train_flops
-    unique_tile_patch_count = (TILE_SIZE // student_backbone.patch_size) ** 2
-    seen_ids = {"sample": set(), "slide": set(), "patient": set()}
-    pending_ids = {key: set() for key in seen_ids}
+    sample_patch_count = (IMAGE_SIZE // student_backbone.patch_size) ** 2
+    # Whatever grouping levels the dataset adapter declares; the first is the image itself.
+    coverage_keys = train_ds.coverage_keys
+    primary_coverage = next(iter(coverage_keys))
+    seen_ids = {name: set() for name in coverage_keys}
+    pending_ids = {name: set() for name in coverage_keys}
 
     # cpu_state(m) materializes an on-CPU copy of a module's state_dict for torch.save.
     def cpu_state(m): return {k: v.detach().cpu().clone() for k, v in m.state_dict().items()}
@@ -436,38 +454,55 @@ def main():
             stale_checkpoint_path.unlink()
         last_saved_step = checkpoint_step
 
-    # Count unique tiles/slides/patients for data-coverage diagnostics.
+    # Data-coverage diagnostics: unique count per grouping level the adapter declares, plus the
+    # patch count implied by the number of distinct images.
     def flush_unique_counts():
-        for key in seen_ids:
-            seen_ids[key].update(pending_ids[key])
-            pending_ids[key].clear()
-        unique_tiles_seen = len(seen_ids["sample"])
-        return {
-            "unique_slides_seen": len(seen_ids["slide"]),
-            "unique_patients_seen": len(seen_ids["patient"]),
-            "unique_tiles_seen": unique_tiles_seen,
-            "unique_patches_seen": unique_tiles_seen * unique_tile_patch_count,
-        }
+        for name in seen_ids:
+            seen_ids[name].update(pending_ids[name])
+            pending_ids[name].clear()
+        counts = {name: len(seen) for name, seen in seen_ids.items()}
+        return {**counts, "unique_patches_seen": counts[primary_coverage] * sample_patch_count}
 
-    # Compute (dino_loss, jepa_loss, kde) for one batch of (gf, lf) crops with the given masks +
-    # schedule values. Used by both the train step and evaluate() (no_grad).
-    def compute_losses(gf, lf, b, keep_idx, mask_idx, t_temp, k_scale, ckpt=False, meta=None, cond=None):
+    # Compute (dino_loss, jepa_loss, kde) for one batch of global crops with the given context/target
+    # indices + schedule values. Used by both the train step and evaluate() (no_grad).
+    #
+    # Teacher: the full global view, every patch -- 2b rows, one forward, shared by everything below.
+    # Student: R independent context regions per global view, so 2b*R rows. Regions are sub-windows of an
+    # already-augmented view rather than fresh crops, which recovers multi-crop's local-to-global
+    # structure (a partial observation predicting the full view's teacher assignment) for the price of
+    # re-running the patch-embed conv, ~1.6% of the student forward. What it does NOT recover is
+    # magnification: a gathered region is the same resolution as the view, not a zoomed resample.
+    #
+    # Layout is region-major -- gf.repeat tiles the crop-major batch, so student row r*2b + v*b + i is
+    # image i, global view v, region r. Everything that pairs with the student either .chunk(R)s or
+    # .repeat(...)s to match, never repeat_interleave.
+    # Local crops are disabled (train.local_views: 0), so DINO is the cross-global term alone: each
+    # region's CLS predicts the *other* view's full-image teacher assignment, averaged over regions.
+    # Reintroducing local views means restoring the 1/(2L+2) multi-crop normalisation.
+    def compute_losses(gf, b, keep_idx, mask_idx, t_temp, k_scale, ckpt=False, meta=None, cond=None):
+        R = context_views
         with torch.no_grad():
             t = teacher_backbone(gf)
             t_cls = teacher_dino_head(t["x_norm_clstoken"]).chunk(train_cfg["global_views"])
             t_prob = sinkhorn(torch.cat((t_cls[1], t_cls[0])), t_temp).view(2, b, -1)
-        sg = student_backbone(gf, keep_idx=keep_idx, checkpoint=ckpt)
-        sl = student_backbone(lf, checkpoint=ckpt)
-        sg_cls, sl_cls = student_dino_head(sg["x_norm_clstoken"]), student_dino_head(sl["x_norm_clstoken"])
-        L = train_cfg["local_views"]
-        local_loss = sum(dino_ce(x, y) for x in sl_cls.chunk(L) for y in t_prob) / (2 * L + 2)
-        global_loss = dino_ce(sg_cls, t_prob.flatten(0, 1)) * 2 / (2 * L + 2)
-        # Equal masked counts make the old per-sample 1/K reweighting a constant, so this is a plain mean.
-        gather = mask_idx[..., None].expand(-1, -1, student_backbone.embed_dim)
-        target = F.layer_norm(t["x_norm_patchtokens"], (student_backbone.embed_dim,)).gather(1, gather)
+        sg = student_backbone(gf.repeat(R, 1, 1, 1), keep_idx=keep_idx, checkpoint=ckpt)
+        sg_cls = student_dino_head(sg["x_norm_clstoken"])
+        # Averaged over region chunks rather than against a repeated target: t_flat is (2b, 131072) fp32,
+        # so .repeat(R, 1) would cost another ~134 MB per extra region for no benefit.
+        t_flat = t_prob.flatten(0, 1)
+        dino_loss = sum(dino_ce(x, t_flat) for x in sg_cls.chunk(R)) / R
+        # Fixed K (duplicates included) makes the old per-sample 1/K reweighting a constant, so this is a
+        # plain mean; duplicated slots simply appear more than once in both pred and target.
+        # Gathering per region chunk keeps the teacher features unduplicated: only the (2b*R, K, D) result
+        # is materialised, not R copies of the (2b, 256, D) source.
+        tp = F.layer_norm(t["x_norm_patchtokens"], (student_backbone.embed_dim,))
+        target = torch.cat([tp.gather(1, mi[..., None].expand(-1, -1, tp.shape[-1])) for mi in mask_idx.chunk(R)])
         pred = student_predictor(sg["x_norm_patchtokens"], mask_idx, cond)
         jepa_loss = F.smooth_l1_loss(pred, target)
-        kde = dino_cfg["kde_loss_weight"] * k_scale * sum(kde_loss(x, dino_cfg["kde_concentration"]) for x in sg["x_norm_clstoken"].chunk(train_cfg["global_views"]))
+        # One KDE term per (region, view) group of b distinct images -- uniformity is only meaningful
+        # across different images, never across regions of the same one. Averaged over regions so
+        # kde_loss_weight keeps its calibrated meaning (a sum over global views) as R varies.
+        kde = dino_cfg["kde_loss_weight"] * k_scale * sum(kde_loss(x, dino_cfg["kde_concentration"]) for x in sg["x_norm_clstoken"].chunk(train_cfg["global_views"] * R)) / R
         # FINO metadata guidance on the CLS token (train-only; meta=None in eval), orthogonal to the JEPA patch
         # objective. lambda_meta=0.03/branch; GradScale gates the encoder gradient by the DANN ramp gamma with the
         # per-factor sign (+ M+ encourage / - M- suppress). fp32 island (1/tau=0.023 too sharp for bf16); missing
@@ -481,12 +516,15 @@ def main():
             terms = []  # (factor, per-branch loss 0.03*L_t); combined below, optionally gradient-equalized
             with torch.autocast(device_type="cuda", enabled=False):
                 for j, (f, sign) in enumerate(fino_disc):
-                    lab = md[:, j].repeat(train_cfg["global_views"]); ok = lab >= 0  # repeat, NOT interleave
+                    # phi_s has 2b*R rows (one per region), phi_t only 2b -- the prototype bank is updated
+                    # from the teacher, so its labels tile by global_views alone.
+                    lab = md[:, j].repeat(train_cfg["global_views"] * R); ok = lab >= 0  # repeat, NOT interleave
+                    lab_t = md[:, j].repeat(train_cfg["global_views"]); ok_t = lab_t >= 0
                     if ok.any():
                         logits = (GradScale.apply(phi_s[ok], sign * gamma) @ protos[f].t()) / 0.023
                         terms.append((f, 0.03 * F.cross_entropy(logits, lab[ok])))
                         with torch.no_grad():
-                            pt, lt = phi_t[ok], lab[ok]
+                            pt, lt = phi_t[ok_t], lab_t[ok_t]
                             upd = torch.zeros_like(protos[f]).index_add_(0, lt, pt)
                             cnt = torch.zeros(protos[f].shape[0], 1, device=device).index_add_(0, lt, torch.ones_like(pt[:, :1]))
                             seen = cnt.squeeze(1) > 0; new = protos[f].clone()
@@ -495,7 +533,7 @@ def main():
                 # for the cosine discrete branch and it strips the radial magnitude). raw_cls=True feeds the raw CLS.
                 cls_cont = sg["x_norm_clstoken"].float() if fino_cfg.get("raw_cls") else phi_s
                 for f, sign in fino_cont:
-                    val = mc[f].repeat(train_cfg["global_views"], 1); ok = ~torch.isnan(val).any(dim=1)
+                    val = mc[f].repeat(train_cfg["global_views"] * R, 1); ok = ~torch.isnan(val).any(dim=1)
                     if ok.any():
                         cpred = predictors[f](GradScale.apply(cls_cont[ok], sign * gamma))
                         terms.append((f, 0.03 * F.mse_loss(cpred, val[ok])))
@@ -509,7 +547,7 @@ def main():
                     meta_loss = sum((nbar / grad_eq_ema[f]).detach() * L for f, L in terms)
                 else:
                     for _, L in terms: meta_loss = meta_loss + L
-        return local_loss + global_loss, jepa_loss, kde, meta_loss
+        return dino_loss, jepa_loss, kde, meta_loss
 
     # Held-out validation pass: same DINO + JEPA + KDE losses on `val_batches` of the val split.
     # Schedule terms (teacher_temp, kde_scale) drift over training, so read val curves as same-step
@@ -525,12 +563,14 @@ def main():
         for vb_idx, vbatch in enumerate(val_loader):
             if vb_idx >= int(train_cfg["val_batches"]):
                 break
-            vg, vl = vbatch["global_views"].to(device, non_blocking=True), vbatch["local_views"].to(device, non_blocking=True)
+            vg = vbatch["global_views"].to(device, non_blocking=True)
             b = vg.shape[0]
             with torch.no_grad(), autocast:
-                gf, lf = vg.transpose(0, 1).flatten(0, 1), vl.transpose(0, 1).flatten(0, 1)
-                keep_idx, mask_idx = make_block_mask(b * train_cfg["global_views"], global_grid, device, n_blocks=int(dino_cfg["jepa_blocks"]), side=int(dino_cfg["jepa_block_side"]))
-                dino_l, jepa_l, kde_v, _ = compute_losses(gf, lf, b, keep_idx, mask_idx, eval_teacher_temp, eval_kde_scale)
+                gf = vg.transpose(0, 1).flatten(0, 1)
+                n = b * train_cfg["global_views"] * context_views
+                keep_idx = make_context_idx(n, global_grid, device, context_side)
+                mask_idx = make_target_idx(n, global_grid, device, int(dino_cfg["jepa_blocks"]), int(dino_cfg["jepa_block_side"]))
+                dino_l, jepa_l, kde_v, _ = compute_losses(gf, b, keep_idx, mask_idx, eval_teacher_temp, eval_kde_scale)
             sums += torch.tensor([float(dino_l), float(jepa_l), float(kde_v), float(dino_l + jepa_l + kde_v)], device=device)
             n_batches += 1
         random.setstate(py_rng)
@@ -564,7 +604,7 @@ def main():
     log_probe_results()
     max_train_flops = int(train_cfg["max_train_flops"])
     warmup_train_samples = math.ceil(max_train_samples * dino_cfg["warmup_fraction"])
-    # Probe targets are sample milestones: one tile counts once even with many global/local crops.
+    # Probe targets are sample milestones: one image counts once even with many global/local crops.
     probe_count = int(cfg["probe"]["count"]) if probe_enabled(cfg) else 0
     probe_targets = [math.ceil(max_train_samples * (i + 1) / probe_count) for i in range(probe_count)]
     if len(set(probe_targets)) != len(probe_targets):
@@ -598,14 +638,14 @@ def main():
             completed_step = step + 1
             should_log = completed_step == 1 or completed_step % train_cfg["log_every"] == 0
             # Data identifiers stay on CPU and feed coverage metrics; image tensors move below.
-            for key, batch_key in (("sample", "sample_idx"), ("slide", "slide_id"), ("patient", "patient_id")):
-                pending_ids[key].update(int(x) for x in batch[batch_key].tolist())
-            global_views, local_views = [batch[key].to(device, non_blocking=True) for key in ("global_views", "local_views")]
-            visible_now = batch_size * (train_cfg["global_views"] * visible_global_patches + train_cfg["local_views"] * local_patches)
-            # LR warmup uses the 1M-tile sample cap; decay/WD/teacher/freeze/KDE default to the public FLOP budget.
+            for name, batch_key in coverage_keys.items():
+                pending_ids[name].update(int(x) for x in batch[batch_key].tolist())
+            global_views = batch["global_views"].to(device, non_blocking=True)
+            visible_now = batch_size * (train_cfg["global_views"] * context_views * visible_global_patches + train_cfg["local_views"] * local_patches)
+            # LR warmup uses the 1M-sample cap; decay/WD/teacher/freeze/KDE default to the public FLOP budget.
             # But this run hits the sample cap at ~19% of the FLOP budget, so a FLOP-keyed cosine only traverses ~0.11
             # of its arc (LR never anneals, KDE peaks at 0.22, WD ~0.05). lr_key/reg_key="sample" re-key the decay/reg
-            # schedules to SAMPLE progress so they complete over the actual 1M-tile run (same fix as the FINO gamma ramp).
+            # schedules to SAMPLE progress so they complete over the actual 1M-sample run (same fix as the FINO gamma ramp).
             frac = min(1.0, train_flops / max_train_flops)
             sfrac = min(1.0, examples_seen / max_train_samples)
             lr_frac = sfrac if dino_cfg.get("lr_key") == "sample" else frac
@@ -622,7 +662,9 @@ def main():
                 base_lr = last_layer_lr if group["last_layer"] else lr
                 group["lr"] = base_lr * group["lr_mult"]
                 group["weight_decay"] = wd * group["wd_mult"]
-            keep_idx, mask_idx = make_block_mask(batch_size * train_cfg["global_views"], global_grid, device, n_blocks=int(dino_cfg["jepa_blocks"]), side=int(dino_cfg["jepa_block_side"]))
+            n_gf = batch_size * train_cfg["global_views"] * context_views
+            keep_idx = make_context_idx(n_gf, global_grid, device, context_side)
+            mask_idx = make_target_idx(n_gf, global_grid, device, int(dino_cfg["jepa_blocks"]), int(dino_cfg["jepa_block_side"]))
             kde_scale = min(1.0, max(0.0, (reg_frac - 0.1) / 0.4))
             # Wrap forward + backward + opt.step in FlopCounterMode on the first step only;
             # subsequent steps reuse measured_flops_per_step (fixed shapes => fixed cost).
@@ -632,7 +674,6 @@ def main():
                     # Crop-major flatten: collate shape is (B, V, 3, H, W) but DINO wants per-crop chunks
                     # so [crop0_img0, crop0_img1, ..., crop1_img0, ...] for clean teacher/student alignment.
                     gf = global_views.transpose(0, 1).flatten(0, 1)
-                    lf = local_views.transpose(0, 1).flatten(0, 1)
                     # FINO DANN ramp keyed to nanopath's SAMPLE budget (NOT FLOPs — sample-capped at ~19% of the FLOP
                     # cap, so a flop-keyed ramp stalls gamma at ~0.75*gamma_max). Counted from the backbone-unfreeze
                     # point: gamma=0 through the frozen Phase 1 (banks warm), then ramps to full gamma_max by the cap.
@@ -640,9 +681,9 @@ def main():
                     meta = ((fino_cfg["gamma_max"] * (2.0 / (1.0 + math.exp(-10.0 * ramp)) - 1.0),
                              batch["meta_disc"].to(device, non_blocking=True),
                              {f: batch["mc_" + f].to(device, non_blocking=True) for f, _ in fino_cont}) if fino_cfg else None)
-                    cond = batch["meta_disc"][:, cond_col].repeat(train_cfg["global_views"]).to(device, non_blocking=True) if jepa_cond else None
+                    cond = batch["meta_disc"][:, cond_col].repeat(train_cfg["global_views"] * context_views).to(device, non_blocking=True) if jepa_cond else None
                     dino_loss_value, jepa_loss, kde, meta_loss = compute_losses(
-                        gf, lf, batch_size, keep_idx, mask_idx, teacher_temp, kde_scale,
+                        gf, batch_size, keep_idx, mask_idx, teacher_temp, kde_scale,
                         ckpt=activation_checkpointing, meta=meta, cond=cond,
                     )
                     total_loss = dino_loss_value + jepa_loss + kde + meta_loss

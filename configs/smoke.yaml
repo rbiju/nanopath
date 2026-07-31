@@ -40,7 +40,8 @@ train:
   eval_every: 50
   val_batches: 4
   global_views: 2
-  local_views: 8
+  local_views: 0 # real multi-crop disabled; emulated by context_views instead
+  context_views: 2 # independent context regions sampled per global view; student batch is global_views * context_views
   global_size: 224
   local_size: 112
   resume: null # optional explicit checkpoint path; null means always start fresh and wipe output_dir
@@ -61,8 +62,9 @@ dino:
   kde_concentration: 10.0
   jepa_pred_depth: 4
   jepa_pred_width: 0
+  jepa_context_side: 13 # student encoder sees one contiguous 13x13 region (169 of 256 patches), placed by a random toroidal offset
   jepa_blocks: 5
-  jepa_block_side: 4 # must divide the 16x16 patch grid; 5 disjoint 4x4 blocks = exactly 80 of 256 patches masked
+  jepa_block_side: 4 # 5 target blocks, free to overlap each other and the context; overlaps kept as duplicate slots so K stays 80
 
 probe:
   enabled: true

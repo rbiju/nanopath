@@ -72,6 +72,7 @@ LARGE_DIFF_SUFFIXES = (
 )
 NUMBER_RE = re.compile(r"^-?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?$")
 GIT_SHA_RE = re.compile(r"^[0-9a-f]{40}$")
+CONFIG_RE = re.compile(r"^configs/[A-Za-z0-9_-][A-Za-z0-9._-]*\.ya?ml$")
 
 
 def main() -> int:
@@ -425,7 +426,7 @@ def collect_source_context(main_ref: dict[str, str], summary: dict[str, Any], so
     review_paths = [*REVIEW_DIFF_PATHS, *([] if config_rel in REVIEW_DIFF_PATHS else [config_rel])]
     main_diff = collect_main_diff(main_ref, commit, source_dir, review_paths)
     review_files = collect_review_files(source, source_dir, review_paths)
-    source_changed_files = changed_source_paths(main_ref["commit"], source_dir)
+    source_changed_files = changed_source_paths(main_ref["commit"], source_dir, config_rel)
     new_source_files = [path for path in source_changed_files if main_file(main_ref["commit"], path) is None and snapshot_file(source_dir, path) is not None]
     policy_errors = [f"helper file outside allowed surface changed: {path}" for path in source_changed_files if new_source_path_blocked(path)]
     policy_errors.extend(locked_probe_config_errors(source_dir, review_paths))
@@ -459,18 +460,20 @@ def collect_review_files(source: str, source_dir: Path, review_paths: list[str])
 
 
 def review_path_allowed(path: str) -> bool:
-    return path in REVIEW_DIFF_PATHS or bool(re.match(r"^configs/[A-Za-z0-9_-][A-Za-z0-9._-]*\.ya?ml$", path))
+    return path in REVIEW_DIFF_PATHS or bool(CONFIG_RE.match(path))
 
 
 def new_source_path_blocked(path: str) -> bool:
     return not path.startswith("labless/") and Path(path).suffix.lower() in {".py", ".pyi", ".yaml", ".yml"} and not review_path_allowed(path)
 
 
-def changed_source_paths(commit: str, source_dir: Path) -> list[str]:
+def changed_source_paths(commit: str, source_dir: Path, config_rel: str) -> list[str]:
     source_files = []
     for p in source_dir.rglob("*"):
         rel_path = p.relative_to(source_dir)
         rel = rel_path.as_posix()
+        if CONFIG_RE.match(rel) and rel != config_rel:
+            continue
         if p.is_file() and p.name != "manifest.json" and rel not in IGNORED_SOURCE_PATHS and not rel.startswith("labless/") and not any(part.startswith(".") for part in rel_path.parts):
             source_files.append(rel)
     main_files = [
@@ -484,7 +487,7 @@ def changed_source_paths(commit: str, source_dir: Path) -> list[str]:
 def locked_probe_config_errors(source_dir: Path, review_paths: list[str]) -> list[str]:
     errors: list[str] = []
     for path in review_paths:
-        if not re.match(r"^configs/[A-Za-z0-9_-][A-Za-z0-9._-]*\.ya?ml$", path):
+        if not CONFIG_RE.match(path):
             continue
         data = snapshot_file(source_dir, path)
         if data is None:

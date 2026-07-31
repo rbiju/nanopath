@@ -130,7 +130,7 @@ The config YAML may only change train/model/data tunables and local
 `probe.dataset_roots`. Labless rejects changes to the locked probe suite keys
 such as dataset lists, probe count, and model weights. Helper code changes must
 stay inside the flat reviewed surface (`train.py`, `model.py`, `dataloader.py`,
-`prepare.py`, or `configs/*.yaml`); hidden helper modules such as `losses.py`
+`prepare.py`, or the config YAML used by the run); hidden helper modules such as `losses.py`
 are rejected.
 
 The current checkout can change after training; labless uses the source snapshot

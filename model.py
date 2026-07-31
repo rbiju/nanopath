@@ -30,7 +30,6 @@ DINOV2_VARIANTS = {
 def probe_transforms():
     # Default for Nanopath-trained checkpoints; baseline scripts override this in their request config.
     transform = transforms.Compose([transforms.Resize((224, 224), antialias=True), transforms.ToTensor()])
-    # Keep the two return slots because probe.py separates tile-image and slide/patch-bag probes.
     return transform, transform
 
 
