@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-#SBATCH --job-name=main_1gpu
+#SBATCH --job-name=cls_spec_bsc
 #SBATCH --nodes=1
 #SBATCH --ntasks-per-node=1
 #SBATCH --gpus-per-task=1
@@ -7,6 +7,8 @@
 #SBATCH --output=slurm/%j.out
 #SBATCH --error=slurm/%j.err
 #SBATCH --partition=n
+#SBATCH --priority=top
+#SBATCH --account=sophont
 #SBATCH --qos=normal # low | normal | top
 
 set -euo pipefail

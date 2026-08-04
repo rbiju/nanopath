@@ -1,8 +1,8 @@
 project:
-  name: ryan-validation-s12
+  name: cls_spec_bsc
   family: nanopath
-  recipe_id: dinov2-vits14-reg-jepa-mask10
-  output_dir: /data/$USER/nanopath/ryan-validation/s12
+  recipe_id: cls_spec_bsc
+  output_dir: /data/$USER/nanopath/cls_spec_bsc
   wandb_dir: /data/$USER/nanopath/wandb
 data:
   dataset_dir: /data/nanopath_parquet
@@ -28,6 +28,7 @@ data:
   tissue_thresh: 0.0
 model:
   type: dinov2_vits14_reg
+  qkv_blocks: 4 # blocks (from the input side) whose qkv projection is [CLS]-specialized; LayerNorms and LayerScales are specialized in every block. 0 = LN/LS only
 train:
   seed: 12
   bf16: true
@@ -54,6 +55,7 @@ dino:
   warmup_fraction: 0.0909
   freeze_last_layer_fraction: 0.0091
   layerwise_decay: 0.7
+  cls_lr_mult: 1.0 # LR multiplier for the .cls. specialized params, replacing layer-wise decay; null restores decay for them
   patch_embed_lr_mult: 0.2
   drop_path_rate: 0.1
   head_hidden_dim: 2048

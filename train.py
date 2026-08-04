@@ -30,7 +30,7 @@ from torch.utils.data import DataLoader
 from torch.utils.flop_counter import FlopCounterMode
 
 from dataloader import TCGATileDataset, TILE_SIZE
-from model import DINOHead, DinoV2ViT, GradScale, JEPAPredictor, load_dinov2_pretrained
+from model import DINOHead, GradScale, JEPAPredictor, SpecializedDinoV2ViT, load_dinov2_pretrained
 from probe import (
     completed_probe_summary,
     collect_probe_results,
@@ -181,12 +181,18 @@ def make_block_mask(batch, grid, device, n_blocks=4, block_scale=0.10):
 # block i gets lr * layerwise_decay^(depth - 1 - i); patch_embed gets the deepest decay
 # multiplied by patch_embed_lr_mult; biases and norms get no weight decay; the head's
 # DINO final weight-norm last_layer parameters get an LR-freeze for the first dino.freeze_last_layer_fraction.
-def build_param_groups(student_backbone, student_dino_head, student_predictor, layerwise_decay, patch_embed_lr_mult):
+def build_param_groups(student_backbone, student_dino_head, student_predictor, layerwise_decay, patch_embed_lr_mult, cls_lr_mult=1.0):
     depth = len(student_backbone.blocks)
     # Coalesce params that share (lr_mult, wd_mult, last_layer) into a single group each (~30 groups
     # instead of one-per-param), so AdamW's foreach path fuses the step across many tensors rather than
     # launching per-parameter kernels. Per-param lr/wd are unchanged, so the optimization is numerically identical.
     coalesced = {}
+    # Floating parameters: learned tokens and positional/conditioning tables that are not the weight
+    # matrix of any layer. The bias/norm/ndim<2 rule misses them because they carry a leading singleton
+    # batch dim (pos_embed is (1, N, D), cls_token (1, 1, D)), so they were silently taking full decay.
+    # Shrinking them has no regularising reading -- they are the entire positional or identity signal
+    # their consumers get, so decay just erodes it toward zero.
+    no_wd_names = {"pos_embed", "cls_token", "register_tokens", "mask_token", "cond_emb.weight"}
     modules = ((student_backbone, "backbone"), (student_dino_head, "dino_head"), (student_predictor, "jepa_predictor"))
     for module, kind in modules:
         for name, p in module.named_parameters():
@@ -194,10 +200,20 @@ def build_param_groups(student_backbone, student_dino_head, student_predictor, l
                 continue
             lr_mult = 1.0
             if kind == "backbone" and name.startswith("blocks."):
+                # Layer-wise decay exists to protect *pretrained* low-level features. The CLS-specialized
+                # copies (".cls." branch of every Specialized layer) are new capacity wearing a pretrained
+                # initialization: they start as exact duplicates of their patch twin and are worth nothing
+                # until they diverge, which is purely LR-driven. Decay also penalises them hardest exactly
+                # where they matter -- qkv specialization sits in the first `qkv_blocks` blocks, which at
+                # decay 0.7 train at 2-6% of base LR -- so they could never diverge within the sample
+                # budget. Exempt them; the ".patch." branch is the untouched pretrained tensor and keeps
+                # its decay. cls_lr_mult=None disables the carve-out for a clean A/B against plain decay.
                 lr_mult = layerwise_decay ** (depth - 1 - int(name.split(".")[1]))
+                if cls_lr_mult is not None and ".cls." in name:
+                    lr_mult = cls_lr_mult
             elif kind == "backbone" and name.startswith("patch_embed."):
                 lr_mult = (layerwise_decay ** depth) * patch_embed_lr_mult
-            wd_mult = 0.0 if name.endswith("bias") or "norm" in name or p.ndim < 2 else 1.0
+            wd_mult = 0.0 if name.endswith("bias") or "norm" in name or p.ndim < 2 or name in no_wd_names else 1.0
             key = (lr_mult, wd_mult, "last_layer" in name)
             coalesced.setdefault(key, {"params": [], "lr_mult": lr_mult, "wd_mult": wd_mult, "last_layer": key[2]})["params"].append(p)
     return list(coalesced.values())
@@ -244,7 +260,9 @@ def main():
     torch.backends.cuda.matmul.allow_tf32 = True
     torch.backends.cudnn.allow_tf32 = True
     variant = cfg["model"]["type"]
-    student_backbone = load_dinov2_pretrained(DinoV2ViT(variant=variant, drop_path_rate=dino_cfg["drop_path_rate"])).to(device)
+    # qkv_blocks=0 leaves the qkv projections shared; LayerNorms and LayerScales are specialized in every
+    # block regardless. Both halves init from the same pretrained tensor, so step 0 matches a plain ViT.
+    student_backbone = load_dinov2_pretrained(SpecializedDinoV2ViT(variant=variant, drop_path_rate=dino_cfg["drop_path_rate"], qkv_blocks=int(cfg["model"]["qkv_blocks"]))).to(device)
     teacher_backbone = deepcopy(student_backbone)
     teacher_backbone.train(False)
     for p in teacher_backbone.parameters():
@@ -258,7 +276,7 @@ def main():
     # FINO continuous-factor predictors (phi -> vector regressors); their params join the optimizer.
     predictors = {f: nn.Sequential(nn.Linear(student_backbone.embed_dim, 512), nn.GELU(), nn.Linear(512, 256), nn.GELU(), nn.Linear(256, fino_meta.get("cont_dim", {}).get(f, 1))).to(device) for f, _ in fino_cont}
     # AdamW param groups carry per-parameter LR/WD multipliers (LWD + patch_embed + biases-no-WD).
-    param_groups = build_param_groups(student_backbone, student_dino_head, student_predictor, dino_cfg["layerwise_decay"], dino_cfg["patch_embed_lr_mult"])
+    param_groups = build_param_groups(student_backbone, student_dino_head, student_predictor, dino_cfg["layerwise_decay"], dino_cfg["patch_embed_lr_mult"], dino_cfg.get("cls_lr_mult", 1.0))
     if predictors:
         param_groups.append({"params": [p for m in predictors.values() for p in m.parameters()], "lr_mult": 1.0, "wd_mult": 1.0, "last_layer": False})
     opt = torch.optim.AdamW(param_groups, lr=1.0, betas=(0.9, dino_cfg["adam_beta2"]))

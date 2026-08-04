@@ -1,5 +1,6 @@
 # DinoV2ViT: clean ViT + 4 register tokens that loads Meta's `dinov2_vit{s,b,g}14_reg`
 # pretrained weights via state_dict (no xformers, no dinov2 codebase imports).
+# SpecializedDinoV2ViT is the same network with the [CLS] pathway given its own weights.
 # Attention runs on `F.scaled_dot_product_attention` so we get FlashAttention-2
 # on H100 bf16 with no third-party kernel dependency. Module names below match
 # Meta's checkpoint key layout exactly, so `load_dinov2_pretrained(model)` does
@@ -8,6 +9,8 @@
 # DINOHead is the small MLP + weight-normed classifier used by train.py for the
 # DINO CLS self-distillation loss. It is intentionally trivial
 # (~15 lines) so we have zero runtime dependency on the dinov2 codebase.
+
+from copy import deepcopy
 
 import torch
 import torch.nn as nn
@@ -203,12 +206,63 @@ class DinoV2ViT(nn.Module):
                 feats.append(self.norm(xt)[:, 0])
         return torch.cat(feats, dim=-1)
 
+    # probe.py builds a plain DinoV2ViT and strict-loads the training checkpoint. A specialized run
+    # writes blocks.{i}.norm1.cls.weight-style keys that a plain model has no slots for, so detect them
+    # and specialize in place before delegating. qkv_blocks is recovered from the checkpoint rather than
+    # the config, so the probe path never needs to know how the run was configured -- which keeps the
+    # specialized and unspecialized arms of an ablation on one identical evaluation path.
+    def load_state_dict(self, state_dict, *args, **kwargs):
+        if any(".cls." in k for k in state_dict) and not any(".cls." in k for k in self.state_dict()):
+            specialize_cls_weights(self, sum(f"blocks.{i}.attn.qkv.cls.weight" in state_dict for i in range(len(self.blocks))))
+        return super().load_state_dict(state_dict, *args, **kwargs)
+
+
+# [CLS] weight specialization. `layer` keeps serving the patch stream; `cls` is an independent copy
+# applied to token 0 alone. Both branches start as exact duplicates of the pretrained tensor, so a fresh
+# model is numerically identical to the unspecialized one at step 0 -- the specialization is worth
+# nothing until the two halves diverge, which is purely a matter of how much LR they get (see
+# build_param_groups' cls_lr_mult carve-out in train.py).
+#
+# Registers ride with the PATCH branch. They were introduced to absorb high-norm artifacts out of the
+# patch stream, so they are patch-like scratch space rather than extra global tokens. Moving them to the
+# cls branch is a one-character change: slice at [:, :1 + registers] instead of [:, :1].
+class Specialized(nn.Module):
+    def __init__(self, layer):
+        super().__init__()
+        self.patch, self.cls = layer, deepcopy(layer)
+
+    def forward(self, x):
+        return torch.cat([self.cls(x[:, :1]), self.patch(x[:, 1:])], dim=1)
+
+
+# Wrap every block's LayerNorms and LayerScales, plus the qkv projection of the first `qkv_blocks`
+# blocks. Idempotent, so re-specializing an already-specialized model is a no-op.
+def specialize_cls_weights(model, qkv_blocks):
+    for i, blk in enumerate(model.blocks):
+        for name in ("norm1", "norm2", "ls1", "ls2"):
+            layer = getattr(blk, name)
+            if not isinstance(layer, Specialized):
+                setattr(blk, name, Specialized(layer))
+        if i < qkv_blocks and not isinstance(blk.attn.qkv, Specialized):
+            blk.attn.qkv = Specialized(blk.attn.qkv)
+    return model
+
+
+class SpecializedDinoV2ViT(DinoV2ViT):
+    def __init__(self, variant="dinov2_vits14_reg", drop_path_rate=0.0, qkv_blocks=0, variant_cfg=None):
+        super().__init__(variant, drop_path_rate, variant_cfg)
+        specialize_cls_weights(self, qkv_blocks)
+
 
 # Strict-load Meta's pretrained weights for the model's declared variant.
 # Strict matches our key layout against Meta's; any drift fails loudly per AGENTS.md.
+# On a specialized model Meta's flat keys are re-pointed so both halves of every Specialized layer
+# read the SAME pretrained tensor, keeping the strict load and making step 0 an exact match.
 def load_dinov2_pretrained(model):
     *_, url = DINOV2_VARIANTS[model.variant]
     state = torch.hub.load_state_dict_from_url(url, progress=False, map_location="cpu")
+    if any(".cls." in k for k in model.state_dict()):
+        state = {k: state[k.replace(".cls.", ".").replace(".patch.", ".")] for k in model.state_dict()}
     model.load_state_dict(state, strict=True)
     return model
 

@@ -22,6 +22,7 @@ data:
 
 model:
   type: dinov2_vits14_reg
+  qkv_blocks: 4 # blocks (from the input side) whose qkv projection is [CLS]-specialized; LayerNorms and LayerScales are specialized in every block. 0 = LN/LS only
 
 train:
   seed: 1337
@@ -51,6 +52,7 @@ dino:
   warmup_fraction: 0.0909
   freeze_last_layer_fraction: 0.0091
   layerwise_decay: 0.7
+  cls_lr_mult: 1.0 # LR multiplier for the .cls. specialized params, replacing layer-wise decay; null restores decay for them
   patch_embed_lr_mult: 0.2
   drop_path_rate: 0.1
   head_hidden_dim: 2048
