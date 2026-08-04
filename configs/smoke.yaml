@@ -40,8 +40,10 @@ train:
   eval_every: 50
   val_batches: 4
   global_views: 2
-  local_views: 0 # real multi-crop disabled; emulated by context_views instead
-  context_views: 2 # independent context regions sampled per global view; student batch is global_views * context_views
+  local_views: 0 # real multi-crop disabled; emulated by context_regions instead
+  context_regions: # [[side, count], ...]: `count` context regions of `side` patches per global view
+  - [12, 1] # near-complete view (56% of the 16x16 grid) -- keeps a global-to-global DINO term
+  - [8, 1] # small view (25%) -- the local-to-global term
   global_size: 224
   local_size: 112
   resume: null # optional explicit checkpoint path; null means always start fresh and wipe output_dir
@@ -53,6 +55,7 @@ dino:
   warmup_fraction: 0.0909
   freeze_last_layer_fraction: 0.0091
   layerwise_decay: 0.7
+  cls_lr_mult: 1.0 # CLS-specialized (.cls.) params bypass layer-wise decay; new capacity, not pretrained features
   patch_embed_lr_mult: 0.2
   drop_path_rate: 0.1
   head_hidden_dim: 2048
@@ -62,7 +65,6 @@ dino:
   kde_concentration: 10.0
   jepa_pred_depth: 4
   jepa_pred_width: 0
-  jepa_context_side: 13 # student encoder sees one contiguous 13x13 region (169 of 256 patches), placed by a random toroidal offset
   jepa_blocks: 5
   jepa_block_side: 4 # 5 target blocks, free to overlap each other and the context; overlaps kept as duplicate slots so K stays 80
 

@@ -269,7 +269,12 @@ def api_json(api_url: str, method: str, path: str, payload: Any = None, headers:
     response = connection.getresponse()
     raw = response.read().decode()
     connection.close()
-    return response.status, json.loads(raw) if raw else {}
+    if not raw:
+        return response.status, {}
+    try:
+        return response.status, json.loads(raw)
+    except json.JSONDecodeError:
+        return response.status, {"detail": f"HTTP {response.status} non-JSON response from {method} {path}: {raw[:800]!r}"}
 
 
 def github_sign_in(api_url: str) -> tuple[str, str]:

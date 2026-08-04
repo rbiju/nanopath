@@ -1,8 +1,8 @@
 project:
-  name: bscsc_xattn_wd
+  name: bscsc_xA_mix128_00
   family: nanopath
-  recipe_id: bscsc_xattn_wd
-  output_dir: /data/$USER/nanopath/20260731-bscsc_xattn_wd
+  recipe_id: bscsc_xA_mix128_00
+  output_dir: /data/$USER/nanopath/20260804-bscsc_xA_mix128_00
   wandb_dir: /data/$USER/nanopath/wandb
 data:
   dataset_dir: /data/nanopath_parquet
@@ -44,8 +44,10 @@ train:
   eval_every: 200
   val_batches: 16
   global_views: 2
-  local_views: 0 # real multi-crop disabled; emulated by context_views instead
-  context_views: 6 # independent context regions sampled per global view; student batch is global_views * context_views
+  local_views: 0 # real multi-crop disabled; emulated by context_regions instead
+  context_regions: # [[side, count], ...]: `count` independent context regions of `side` patches sampled per global view
+    - [12, 2]
+    - [8, 4]
   global_size: 224
   local_size: 112
   resume: null
@@ -56,6 +58,7 @@ dino:
   warmup_fraction: 0.0909
   freeze_last_layer_fraction: 0.0091
   layerwise_decay: 0.7
+  cls_lr_mult: 1.0 # CLS-specialized (.cls.) params bypass layer-wise decay; new capacity, not pretrained features
   patch_embed_lr_mult: 0.2
   drop_path_rate: 0.1
   head_hidden_dim: 2048
@@ -65,9 +68,8 @@ dino:
   kde_concentration: 10.0
   jepa_pred_depth: 4
   jepa_pred_width: 0
-  jepa_context_side: 12 # 56% visible, placed by a random toroidal offset
-  jepa_blocks: 5
-  jepa_block_side: 4 # 5 target blocks, free to overlap each other and the context; overlaps kept as duplicate slots so K stays 80
+  jepa_blocks: 12
+  jepa_block_side: 4
   freeze_backbone_fraction: 0.0
 probe:
   enabled: true
