@@ -213,7 +213,11 @@ class DinoV2ViT(nn.Module):
     # specialized and unspecialized arms of an ablation on one identical evaluation path.
     def load_state_dict(self, state_dict, *args, **kwargs):
         if any(".cls." in k for k in state_dict) and not any(".cls." in k for k in self.state_dict()):
-            specialize_cls_weights(self, sum(f"blocks.{i}.attn.qkv.cls.weight" in state_dict for i in range(len(self.blocks))))
+            n = len(self.blocks)
+            qkv = sum(f"blocks.{i}.attn.qkv.cls.weight" in state_dict for i in range(n))
+            proj = sum(f"blocks.{i}.attn.proj.cls.weight" in state_dict for i in range(n))
+            mlp = sum(any(f"blocks.{i}.mlp.{p}.cls.weight" in state_dict for p in ("fc1", "w12")) for i in range(n))
+            specialize_cls_weights(self, qkv, mlp, proj)
         return super().load_state_dict(state_dict, *args, **kwargs)
 
 
@@ -235,9 +239,22 @@ class Specialized(nn.Module):
         return torch.cat([self.cls(x[:, :1]), self.patch(x[:, 1:])], dim=1)
 
 
-# Wrap every block's LayerNorms and LayerScales, plus the qkv projection of the first `qkv_blocks`
-# blocks. Idempotent, so re-specializing an already-specialized model is a no-op.
-def specialize_cls_weights(model, qkv_blocks):
+# Wrap every block's LayerNorms and LayerScales, plus the qkv and output projections of the FIRST
+# `qkv_blocks` / `proj_blocks` blocks and the FFN of the LAST `mlp_blocks` blocks. Idempotent, so
+# re-specializing an already-specialized model is a no-op.
+#
+# The two ends are deliberate. Attention sits early because that is where the token roles diverge most
+# -- patches are still doing local feature extraction while the CLS is already aggregating. The FFN is
+# specialized late instead, on the argument that the CLS is a readout token and the last blocks shape
+# the readout that feeds the DINO head and the downstream probes; specializing the FFN early would just
+# restate the qkv hypothesis with ~3x the parameters.
+#
+# qkv and proj are separate knobs rather than one "attention" switch because they do different things:
+# specializing qkv changes what the CLS *reads* and also what the patches read *from* the CLS (its key
+# and value are computed with the cls weights), whereas proj only changes how the CLS writes its own
+# attention output back into the residual stream. Setting both completes the attention block as a unit.
+def specialize_cls_weights(model, qkv_blocks, mlp_blocks=0, proj_blocks=0):
+    depth = len(model.blocks)
     for i, blk in enumerate(model.blocks):
         for name in ("norm1", "norm2", "ls1", "ls2"):
             layer = getattr(blk, name)
@@ -245,13 +262,23 @@ def specialize_cls_weights(model, qkv_blocks):
                 setattr(blk, name, Specialized(layer))
         if i < qkv_blocks and not isinstance(blk.attn.qkv, Specialized):
             blk.attn.qkv = Specialized(blk.attn.qkv)
+        if i < proj_blocks and not isinstance(blk.attn.proj, Specialized):
+            blk.attn.proj = Specialized(blk.attn.proj)
+        if i >= depth - mlp_blocks:
+            # Wrap the FFN's two projections rather than the FFN module, so Block._ff's
+            # `isinstance(self.mlp, SwiGLU)` dispatch still sees the original type. Both layouts
+            # concatenate along the token dim, which leaves SwiGLU's chunk(2, dim=-1) intact.
+            for name in ("w12", "w3") if isinstance(blk.mlp, SwiGLU) else ("fc1", "fc2"):
+                layer = getattr(blk.mlp, name)
+                if not isinstance(layer, Specialized):
+                    setattr(blk.mlp, name, Specialized(layer))
     return model
 
 
 class SpecializedDinoV2ViT(DinoV2ViT):
-    def __init__(self, variant="dinov2_vits14_reg", drop_path_rate=0.0, qkv_blocks=0, variant_cfg=None):
+    def __init__(self, variant="dinov2_vits14_reg", drop_path_rate=0.0, qkv_blocks=0, mlp_blocks=0, proj_blocks=0, variant_cfg=None):
         super().__init__(variant, drop_path_rate, variant_cfg)
-        specialize_cls_weights(self, qkv_blocks)
+        specialize_cls_weights(self, qkv_blocks, mlp_blocks, proj_blocks)
 
 
 # Strict-load Meta's pretrained weights for the model's declared variant.

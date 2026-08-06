@@ -260,9 +260,10 @@ def main():
     torch.backends.cuda.matmul.allow_tf32 = True
     torch.backends.cudnn.allow_tf32 = True
     variant = cfg["model"]["type"]
-    # qkv_blocks=0 leaves the qkv projections shared; LayerNorms and LayerScales are specialized in every
-    # block regardless. Both halves init from the same pretrained tensor, so step 0 matches a plain ViT.
-    student_backbone = load_dinov2_pretrained(SpecializedDinoV2ViT(variant=variant, drop_path_rate=dino_cfg["drop_path_rate"], qkv_blocks=int(cfg["model"]["qkv_blocks"]))).to(device)
+    # qkv_blocks/proj_blocks count from the INPUT side, mlp_blocks from the OUTPUT side; 0 leaves it shared.
+    # LayerNorms and LayerScales are specialized in every block regardless. Both halves init from the same
+    # pretrained tensor, so step 0 matches a plain ViT for any setting.
+    student_backbone = load_dinov2_pretrained(SpecializedDinoV2ViT(variant=variant, drop_path_rate=dino_cfg["drop_path_rate"], qkv_blocks=int(cfg["model"]["qkv_blocks"]), mlp_blocks=int(cfg["model"].get("mlp_blocks", 0)), proj_blocks=int(cfg["model"].get("proj_blocks", 0)))).to(device)
     teacher_backbone = deepcopy(student_backbone)
     teacher_backbone.train(False)
     for p in teacher_backbone.parameters():

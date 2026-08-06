@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-#SBATCH --job-name=cls_spec_bsc
+#SBATCH --job-name=cls_spec_bsc_e7
 #SBATCH --nodes=1
 #SBATCH --ntasks-per-node=1
 #SBATCH --gpus-per-task=1

@@ -29,6 +29,7 @@ data:
 model:
   type: dinov2_vits14_reg
   qkv_blocks: 4 # blocks (from the input side) whose qkv projection is [CLS]-specialized; LayerNorms and LayerScales are specialized in every block. 0 = LN/LS only
+  mlp_blocks: 0 # blocks (from the OUTPUT side) whose FFN is [CLS]-specialized; 0 = shared FFN everywhere
 train:
   seed: 12
   bf16: true
