@@ -76,6 +76,11 @@ prototype_head:
   reg_type: kde  # anti-collapse shape regularizer: "swd" (score_swd) or "kde" (dino.kde_* knobs)
   score_reg_weight: 0.1
   score_reg_weight: 0.1
+  # Warmup ramp on the reg_type term: reg_scale goes 0 -> 1 linearly between these two fractions of
+  # the FLOP budget (the historical KDE schedule was 0.1 -> 0.5). Equal values make it a step at that
+  # fraction; 0.0 / 0.0 means full strength from step 0, which is what these ablation runs used.
+  reg_warmup_start_frac: 0.0
+  reg_warmup_end_frac: 0.0
   # Assignment-shaping term (anti-collapse + per-sample code shaping) = per-sample axis - h_batch.
   # sample_reg_type picks the per-sample axis: "swd" pulls each score row toward a graded Gaussian
   # (distributed, multi-prototype code) via sample_swd_weight; "entropy" minimizes h_per to sharpen

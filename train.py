@@ -311,6 +311,15 @@ def main():
     sample_reg_type = head_cfg["sample_reg_type"]
     if sample_reg_type not in ("swd", "entropy"):
         raise ValueError(f"prototype_head.sample_reg_type must be 'swd' or 'entropy', got {sample_reg_type!r}")
+    # Warmup window for the anti-collapse regularizer, as fractions of the FLOP budget. Equal values
+    # give a step (full strength from that point on); 0.0/0.0 disables the ramp entirely.
+    reg_warmup_start = float(head_cfg["reg_warmup_start_frac"])
+    reg_warmup_end = float(head_cfg["reg_warmup_end_frac"])
+    if not 0.0 <= reg_warmup_start <= reg_warmup_end:
+        raise ValueError(
+            "prototype_head requires 0 <= reg_warmup_start_frac <= reg_warmup_end_frac, got "
+            f"{reg_warmup_start} and {reg_warmup_end}"
+        )
     def make_prototype_head():
         return PrototypeHead(student_backbone.embed_dim, head_cfg['n_prototypes'], head_cfg["hidden_dim"], head_cfg["prototype_dim"], head_cfg["n_layers"], head_cfg['ns_steps'], head_cfg["orthogonal"]).to(device)
     student_dino_head = make_prototype_head()
@@ -639,10 +648,12 @@ def main():
                 group["lr"] = base_lr * group["lr_mult"]
                 group["weight_decay"] = wd * group["wd_mult"]
             masks, mask_idx, mask_w = make_masks(batch_size * train_cfg["global_views"], global_patches, device)
-            # score_swd is active at full strength from step 0: collapse to a single prototype
-            # happens in the earliest steps (sharp teacher temp, no Sinkhorn centering), so the
-            # regularizer has to guard that window rather than ramp in after collapse has set in.
-            reg_scale = 1.0
+            # Warmup ramp on the anti-collapse regularizer (the reg_type term): 0 before
+            # reg_warmup_start_frac, linear to full strength at reg_warmup_end_frac. A zero-width
+            # window (both fracs equal, e.g. 0.0/0.0) makes it a step, i.e. full strength from step 0
+            # -- collapse to a single prototype happens in the earliest steps (sharp teacher temp, no
+            # Sinkhorn centering), so a late ramp only guards the window after collapse has set in.
+            reg_scale = 1.0 if frac >= reg_warmup_end else max(0.0, (frac - reg_warmup_start) / max(1e-9, reg_warmup_end - reg_warmup_start))
             # Wrap forward + backward + opt.step in FlopCounterMode on the first step only;
             # subsequent steps reuse measured_flops_per_step (fixed shapes => fixed cost).
             flop_ctx = FlopCounterMode(display=False) if measured_flops_per_step is None else contextlib.nullcontext()
@@ -824,6 +835,8 @@ def main():
         "lr": dino_cfg["lr"],
         "adam_beta2": dino_cfg["adam_beta2"],
         "score_reg_weight": head_cfg["score_reg_weight"],
+        "reg_warmup_start_frac": reg_warmup_start,
+        "reg_warmup_end_frac": reg_warmup_end,
         "ibot_mode": ibot_mode,
         "orthogonal": head_cfg["orthogonal"],
         "drop_path_rate": dino_cfg["drop_path_rate"],
