@@ -61,6 +61,8 @@ dino:
   clip_grad: 3.0
   kde_loss_weight: 0.005
   kde_concentration: 10.0
+  assign_coding_rate_weight: 1.0
+  assign_coding_rate_eps: 0.5
   jepa_pred_depth: 4
   jepa_pred_width: 0
   jepa_blocks: 4

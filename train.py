@@ -1,5 +1,5 @@
 # Continual DINOv2 pretraining on TCGA tiles (single-GPU). Three loss terms:
-# DINO CLS self-distillation (Sinkhorn-Knopp centred teacher targets),
+# DINO CLS self-distillation (sharpened teacher targets, assignment coding rate in place of Sinkhorn-Knopp),
 # I-JEPA patch-feature regression, and a KDE uniformity term on the
 # L2-normalised CLS tokens. YAML drives the tunable knobs (backbone variant,
 # LR + LR scheduler, drop path, layerwise decay, KDE weight + concentration,
@@ -137,7 +137,22 @@ def cosine_schedule(start, end, frac):
     return end + 0.5 * (start - end) * (1 + math.cos(math.pi * min(1.0, max(0.0, frac))))
 
 
-# Sinkhorn-Knopp centring across this batch, used for DINO teacher targets.
+# Coding rate of a batch of prototype assignments P (n, K): the log-volume the n assignment vectors
+# span, MAXIMISED in place of Sinkhorn-Knopp. Collapse -- every image landing on the same prototypes --
+# makes P rank 1 and drives this to its floor, so it sees the failure SK used to prevent by
+# construction. Sharp AND mutually near-orthogonal rows maximise it: different images on different
+# prototypes, confidently, which is what SK's equipartition bought. Because it also rewards sharpness
+# it covers what a separate per-sample entropy term would do.
+# Measured range: ~0.006 fully collapsed, 3.1-4.0 healthy, 4.16 distinct one-hot.
+def coding_rate(p, eps):
+    n, k = p.shape
+    gram = (p @ p.t()).float() * (k / (n * eps ** 2))
+    with torch.autocast(device_type="cuda", enabled=False):
+        return 0.5 * torch.linalg.slogdet(torch.eye(n, device=p.device) + gram)[1] / n
+
+
+# Sinkhorn-Knopp centring across this batch. No longer used for the teacher targets (coding_rate
+# above replaces it); kept so the SK arm of this ablation is one line away.
 def sinkhorn(x, temp):
     q = torch.exp(x.float() / temp).t()
     b = q.shape[1]
@@ -350,6 +365,7 @@ def main():
         f"probe_count: {cfg['probe']['count']}  warmup_fraction: {dino_cfg['warmup_fraction']}  "
         f"lr: {dino_cfg['lr']}  adam_beta2: {dino_cfg['adam_beta2']}  kde_loss_weight: {dino_cfg['kde_loss_weight']}  "
         f"kde_concentration: {dino_cfg['kde_concentration']}  drop_path: {dino_cfg['drop_path_rate']}  "
+        f"assign_coding_rate_weight: {dino_cfg['assign_coding_rate_weight']}  assign_coding_rate_eps: {dino_cfg['assign_coding_rate_eps']}  "
         f"layerwise_decay: {dino_cfg['layerwise_decay']}",
         flush=True,
     )
@@ -456,13 +472,23 @@ def main():
             "unique_patches_seen": unique_tiles_seen * unique_tile_patch_count,
         }
 
-    # Compute (dino_loss, jepa_loss, kde) for one batch of (gf, lf) crops with the given masks +
-    # schedule values. Used by both the train step and evaluate() (no_grad).
+    dino_stats = {"h_marginal": 0.0, "h_sample": 0.0}  # teacher-distribution collapse diagnostics, written below, logged in the train loop
+
+    # Compute (dino_loss, jepa_loss, kde, meta_loss, crate) for one batch of (gf, lf) crops with the
+    # given masks + schedule values. Used by both the train step and evaluate() (no_grad).
     def compute_losses(gf, lf, b, masks, mask_idx, mask_w, t_temp, k_scale, ckpt=False, meta=None, cond=None):
         with torch.no_grad():
             t = teacher_backbone(gf)
             t_cls = teacher_dino_head(t["x_norm_clstoken"]).chunk(train_cfg["global_views"])
-            t_prob = sinkhorn(torch.cat((t_cls[1], t_cls[0])), t_temp).view(2, b, -1)
+            # Plain sharpened teacher: no Sinkhorn, no centring. Anti-collapse moved to the assignment
+            # coding rate on the STUDENT side (crate, below) -- this block is no_grad, so a regulariser
+            # here would produce no gradient at all. h_marginal/h_sample are the two properties SK used
+            # to guarantee: h_marginal near log(K)=11.78 nats means the codebook is broadly used, and a
+            # sustained fall is head collapse rather than a temperature effect.
+            t_prob = F.softmax(torch.cat((t_cls[1], t_cls[0])) / t_temp, dim=-1).view(2, b, -1)
+            pbar = t_prob.flatten(0, 1).mean(0)
+            dino_stats["h_marginal"] = float(-(pbar * pbar.clamp_min(1e-12).log()).sum())
+            dino_stats["h_sample"] = float(-(t_prob * t_prob.clamp_min(1e-12).log()).sum(-1).mean())
         sg = student_backbone(gf, masks=masks, checkpoint=ckpt)
         sl = student_backbone(lf, checkpoint=ckpt)
         sg_cls, sl_cls = student_dino_head(sg["x_norm_clstoken"]), student_dino_head(sl["x_norm_clstoken"])
@@ -473,6 +499,14 @@ def main():
         pred = student_predictor(sg["x_norm_patchtokens"], cond).flatten(0, 1)[mask_idx]
         jepa_loss = F.smooth_l1_loss(pred, target, reduction="none").mean(-1).mul(mask_w).sum() / max(1, b * 2)
         kde = dino_cfg["kde_loss_weight"] * k_scale * sum(kde_loss(x, dino_cfg["kde_concentration"]) for x in sg["x_norm_clstoken"].chunk(train_cfg["global_views"]))
+        # Assignment coding rate, negated because it is maximised. Chunked like KDE: one term per global
+        # view, each a group of b DISTINCT images, since spreading assignments is only meaningful across
+        # different images -- the views of one image are what the cross-view CE pulls together. Globals
+        # only, matching KDE; the local crops are partial observations and would only add noise here.
+        # Softmax at the same 0.1 student temperature dino_ce uses, so this scores the same distribution.
+        crate = -dino_cfg["assign_coding_rate_weight"] * sum(
+            coding_rate(F.softmax(x / 0.1, dim=-1), dino_cfg["assign_coding_rate_eps"]) for x in sg_cls.chunk(train_cfg["global_views"])
+        ) / train_cfg["global_views"]
         # FINO metadata guidance on the CLS token (train-only; meta=None in eval), orthogonal to the JEPA patch
         # objective. lambda_meta=0.03/branch; GradScale gates the encoder gradient by the DANN ramp gamma with the
         # per-factor sign (+ M+ encourage / - M- suppress). fp32 island (1/tau=0.023 too sharp for bf16); missing
@@ -514,7 +548,7 @@ def main():
                     meta_loss = sum((nbar / grad_eq_ema[f]).detach() * L for f, L in terms)
                 else:
                     for _, L in terms: meta_loss = meta_loss + L
-        return local_loss + global_loss, jepa_loss, kde, meta_loss
+        return local_loss + global_loss, jepa_loss, kde, meta_loss, crate
 
     # Held-out validation pass: same DINO + JEPA + KDE losses on `val_batches` of the val split.
     # Schedule terms (teacher_temp, kde_scale) drift over training, so read val curves as same-step
@@ -525,7 +559,7 @@ def main():
         py_rng, cpu_rng, cuda_rng = random.getstate(), torch.random.get_rng_state(), torch.cuda.get_rng_state(device)
         random.seed(train_cfg["seed"] + eval_step)
         torch.manual_seed(train_cfg["seed"] + eval_step)
-        sums = torch.zeros(4, device=device)
+        sums = torch.zeros(5, device=device)
         n_batches = 0
         for vb_idx, vbatch in enumerate(val_loader):
             if vb_idx >= int(train_cfg["val_batches"]):
@@ -535,13 +569,13 @@ def main():
             with torch.no_grad(), autocast:
                 gf, lf = vg.transpose(0, 1).flatten(0, 1), vl.transpose(0, 1).flatten(0, 1)
                 masks, mask_idx, mask_w = make_block_mask(b * train_cfg["global_views"], global_grid, device, n_blocks=int(dino_cfg["jepa_blocks"]), block_scale=float(dino_cfg["jepa_block_scale"]))
-                dino_l, jepa_l, kde_v, _ = compute_losses(gf, lf, b, masks, mask_idx, mask_w, eval_teacher_temp, eval_kde_scale)
-            sums += torch.tensor([float(dino_l), float(jepa_l), float(kde_v), float(dino_l + jepa_l + kde_v)], device=device)
+                dino_l, jepa_l, kde_v, _, crate_v = compute_losses(gf, lf, b, masks, mask_idx, mask_w, eval_teacher_temp, eval_kde_scale)
+            sums += torch.tensor([float(dino_l), float(jepa_l), float(kde_v), float(crate_v), float(dino_l + jepa_l + kde_v + crate_v)], device=device)
             n_batches += 1
         random.setstate(py_rng)
         torch.random.set_rng_state(cpu_rng)
         torch.cuda.set_rng_state(cuda_rng, device)
-        return dict(zip(("dino", "jepa", "kde", "total"), (sums / max(1, n_batches)).tolist()))
+        return dict(zip(("dino", "jepa", "kde", "crate", "total"), (sums / max(1, n_batches)).tolist()))
 
     # Ingest completed probe result JSONs into metrics.jsonl and wandb.
     def log_probe_results():
@@ -646,11 +680,11 @@ def main():
                              batch["meta_disc"].to(device, non_blocking=True),
                              {f: batch["mc_" + f].to(device, non_blocking=True) for f, _ in fino_cont}) if fino_cfg else None)
                     cond = batch["meta_disc"][:, cond_col].repeat(train_cfg["global_views"]).to(device, non_blocking=True) if jepa_cond else None
-                    dino_loss_value, jepa_loss, kde, meta_loss = compute_losses(
+                    dino_loss_value, jepa_loss, kde, meta_loss, crate = compute_losses(
                         gf, lf, batch_size, masks, mask_idx, mask_w, teacher_temp, kde_scale,
                         ckpt=activation_checkpointing, meta=meta, cond=cond,
                     )
-                    total_loss = dino_loss_value + jepa_loss + kde + meta_loss
+                    total_loss = dino_loss_value + jepa_loss + kde + meta_loss + crate
                 opt.zero_grad(set_to_none=True)
                 total_loss.backward()
                 if examples_seen / max_train_samples < freeze_backbone_frac:  # Phase 1: backbone frozen (patch_embed + heads + metadata still train)
@@ -678,6 +712,7 @@ def main():
                     "dino": float(dino_loss_value.detach()),
                     "jepa": float(jepa_loss.detach()),
                     "kde": float(kde.detach()),
+                    "crate": float(crate.detach()),
                     "total": float(total_loss.detach()),
                 }
                 unique_counts = flush_unique_counts()
@@ -721,6 +756,10 @@ def main():
                     "teacher_temp": teacher_temp,
                     "teacher_momentum": m,
                     "kde_scale": kde_scale,
+                    # Teacher-distribution health, the two properties SK used to guarantee by construction.
+                    # h_marginal near log(K)=11.78 means the codebook is broadly used; a sustained fall is
+                    # head collapse. h_sample reads the sharpening, which crate also pushes on.
+                    **dino_stats,
                     "batch_size": batch_size,
                     "examples_seen": examples_seen,
                     "visible_patch_presentations": visible_patch_presentations,
@@ -735,6 +774,7 @@ def main():
                     f"[{completed_step}/{total_steps_estimate}]  eta: {eta_string}  gap: {console_gap_ms:.2f} ms  "
                     f"lr: {current_lr:.6f}  total: {reduced['total']:.4f}  "
                     f"dino: {reduced['dino']:.4f}  jepa: {reduced['jepa']:.4f}  kde: {reduced['kde']:.4f}  "
+                    f"crate: {reduced['crate']:.4f}  h_marg: {dino_stats['h_marginal']:.3f}  "
                     f"grad_norm: {train_log['grad_norm']:.4f}  flops/s: {flops_per_sec:.3e}  "
                     f"time: {step_seconds:.6f}  data: {data_seconds:.6f}  "
                     f"max mem: {int(gpu_peak_mem_gb * 1024)}",
@@ -763,7 +803,7 @@ def main():
                 with metrics_path.open("a") as handle:
                     handle.write(json.dumps(val_log) + "\n")
                 wandb_run.log({f"val/{k}": v for k, v in val.items()}, step=completed_step)
-                print(f"{console_prefix()} Validation  [{completed_step}]  total: {val['total']:.4f}  dino: {val['dino']:.4f}  jepa: {val['jepa']:.4f}  kde: {val['kde']:.4f}", flush=True)
+                print(f"{console_prefix()} Validation  [{completed_step}]  total: {val['total']:.4f}  dino: {val['dino']:.4f}  jepa: {val['jepa']:.4f}  kde: {val['kde']:.4f}  crate: {val['crate']:.4f}", flush=True)
                 # Reset rate clocks after validation so the next train log is train-rate only.
                 last_console_step, last_console_monotonic = completed_step, time.monotonic()
                 last_time, last_examples, last_visible_patch_presentations, last_train_flops = time.time(), examples_seen, visible_patch_presentations, train_flops
@@ -816,6 +856,8 @@ def main():
         "adam_beta2": dino_cfg["adam_beta2"],
         "kde_loss_weight": dino_cfg["kde_loss_weight"],
         "kde_concentration": dino_cfg["kde_concentration"],
+        "assign_coding_rate_weight": dino_cfg["assign_coding_rate_weight"],
+        "assign_coding_rate_eps": dino_cfg["assign_coding_rate_eps"],
         "drop_path_rate": dino_cfg["drop_path_rate"],
         "layerwise_decay": dino_cfg["layerwise_decay"],
         "probe_target_samples": probe_targets,

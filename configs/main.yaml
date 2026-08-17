@@ -1,8 +1,8 @@
 project:
-  name: cls_spec_bsc
+  name: crp_e1
   family: nanopath
-  recipe_id: cls_spec_bsc
-  output_dir: /data/$USER/nanopath/cls_spec_bsc
+  recipe_id: crp_e1
+  output_dir: /data/$USER/nanopath/20260817-crp_e1
   wandb_dir: /data/$USER/nanopath/wandb
 data:
   dataset_dir: /data/nanopath_parquet
@@ -64,6 +64,12 @@ dino:
   clip_grad: 3.0
   kde_loss_weight: 0.005
   kde_concentration: 10.0
+  # Coding rate of the batch's prototype assignments, maximised (replaces Sinkhorn-Knopp as the
+  # anti-collapse term). Per-sample normalised: ~0.006 fully collapsed, 3.1-4.0 healthy, 4.16 at
+  # distinct one-hot, so weight 1.0 puts its swing at ~4 nats against a DINO CE of ~log(K)=11.8.
+  # It rewards sharpness as well as diversity, covering what a per-sample entropy term would do.
+  assign_coding_rate_weight: 1.0
+  assign_coding_rate_eps: 0.5
   jepa_pred_depth: 4
   jepa_pred_width: 0
   jepa_blocks: 4
