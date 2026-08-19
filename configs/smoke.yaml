@@ -61,8 +61,11 @@ dino:
   clip_grad: 3.0
   kde_loss_weight: 0.005
   kde_concentration: 10.0
+  collapse_prevention: coding_rate # sinkhorn | coding_rate | barlow
   assign_coding_rate_weight: 1.0
   assign_coding_rate_eps: 0.5
+  barlow_weight: 1.0
+  barlow_lambda: 1.0 # per-entry means, so not BT's 0.005; both terms are in [0, 1]
   jepa_pred_depth: 4
   jepa_pred_width: 0
   jepa_blocks: 4

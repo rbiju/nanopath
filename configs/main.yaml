@@ -64,12 +64,11 @@ dino:
   clip_grad: 3.0
   kde_loss_weight: 0.005
   kde_concentration: 10.0
-  # Coding rate of the batch's prototype assignments, maximised (replaces Sinkhorn-Knopp as the
-  # anti-collapse term). Per-sample normalised: ~0.006 fully collapsed, 3.1-4.0 healthy, 4.16 at
-  # distinct one-hot, so weight 1.0 puts its swing at ~4 nats against a DINO CE of ~log(K)=11.8.
-  # It rewards sharpness as well as diversity, covering what a per-sample entropy term would do.
+  # Collapse reg ablation
   assign_coding_rate_weight: 1.0
   assign_coding_rate_eps: 0.5
+  barlow_weight: 1.0
+  barlow_lambda: 1.0 # per-entry means, so not BT's 0.005; both terms are in [0, 1]
   jepa_pred_depth: 4
   jepa_pred_width: 0
   jepa_blocks: 4
