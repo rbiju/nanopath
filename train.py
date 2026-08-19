@@ -137,28 +137,28 @@ def cosine_schedule(start, end, frac):
     return end + 0.5 * (start - end) * (1 + math.cos(math.pi * min(1.0, max(0.0, frac))))
 
 
-# Coding rate of a batch of prototype assignments P (n, K): the log-volume the n assignment vectors
-# span, MAXIMISED in place of Sinkhorn-Knopp. Collapse -- every image landing on the same prototypes --
-# makes P rank 1 and drives this to its floor, which is the failure SK used to prevent by construction.
-def coding_rate(p, eps):
-    n, k = p.shape
-    p = F.normalize(p, dim=-1)
-    gram = (p @ p.t()).float() * (k / (n * eps ** 2))
+# Log-volume the n normalised logit rows span; collapse makes them parallel and floors it. 4.06 healthy,
+# 0.051 collapsed at K=131072/n=128.
+def coding_rate(z, eps):
+    n, k = z.shape
+    z = F.normalize(z, dim=-1)
+    gram = (z @ z.t()).float() * (k / (n * eps ** 2))
     with torch.autocast(device_type="cuda", enabled=False):
-        return 0.5 * torch.linalg.slogdet(torch.eye(n, device=p.device) + gram)[1] / n
+        return 0.5 * torch.linalg.slogdet(torch.eye(n, device=z.device) + gram)[1] / n
 
 
-def barlow(p1, p2, lambd):
-    b, k = p1.shape
-    z1 = (p1 - p1.mean(1, keepdim=True)) / p1.std(1, keepdim=True).clamp_min(1e-9)
-    z2 = (p2 - p2.mean(1, keepdim=True)) / p2.std(1, keepdim=True).clamp_min(1e-9)
+# Sample-wise cross-correlation -> identity: diagonal aligns an image's two views, off-diagonal
+# decorrelates different images. One-prototype collapse trips off_diag, uniform collapse trips on_diag.
+def barlow(z1, z2, lambd):
+    b, k = z1.shape
+    z1 = (z1 - z1.mean(1, keepdim=True)) / z1.std(1, keepdim=True).clamp_min(1e-9)
+    z2 = (z2 - z2.mean(1, keepdim=True)) / z2.std(1, keepdim=True).clamp_min(1e-9)
     c = z1 @ z2.t() / k
     diag = torch.diagonal(c)
     return diag.add(-1).pow(2).mean() + lambd * (c.pow(2).sum() - diag.pow(2).sum()) / (b * (b - 1))
 
 
-# Sinkhorn-Knopp centring across this batch. No longer used for the teacher targets (coding_rate
-# above replaces it); kept so the SK arm of this ablation is one line away.
+# Sinkhorn-Knopp centring across this batch; the teacher_target: sinkhorn arm.
 def sinkhorn(x, temp):
     q = torch.exp(x.float() / temp).t()
     b = q.shape[1]
@@ -204,15 +204,7 @@ def make_block_mask(batch, grid, device, n_blocks=4, block_scale=0.10):
 # DINO final weight-norm last_layer parameters get an LR-freeze for the first dino.freeze_last_layer_fraction.
 def build_param_groups(student_backbone, student_dino_head, student_predictor, layerwise_decay, patch_embed_lr_mult, cls_lr_mult=1.0):
     depth = len(student_backbone.blocks)
-    # Coalesce params that share (lr_mult, wd_mult, last_layer) into a single group each (~30 groups
-    # instead of one-per-param), so AdamW's foreach path fuses the step across many tensors rather than
-    # launching per-parameter kernels. Per-param lr/wd are unchanged, so the optimization is numerically identical.
     coalesced = {}
-    # Floating parameters: learned tokens and positional/conditioning tables that are not the weight
-    # matrix of any layer. The bias/norm/ndim<2 rule misses them because they carry a leading singleton
-    # batch dim (pos_embed is (1, N, D), cls_token (1, 1, D)), so they were silently taking full decay.
-    # Shrinking them has no regularising reading -- they are the entire positional or identity signal
-    # their consumers get, so decay just erodes it toward zero.
     no_wd_names = {"pos_embed", "cls_token", "register_tokens", "mask_token", "cond_emb.weight"}
     modules = ((student_backbone, "backbone"), (student_dino_head, "dino_head"), (student_predictor, "jepa_predictor"))
     for module, kind in modules:
@@ -221,14 +213,6 @@ def build_param_groups(student_backbone, student_dino_head, student_predictor, l
                 continue
             lr_mult = 1.0
             if kind == "backbone" and name.startswith("blocks."):
-                # Layer-wise decay exists to protect *pretrained* low-level features. The CLS-specialized
-                # copies (".cls." branch of every Specialized layer) are new capacity wearing a pretrained
-                # initialization: they start as exact duplicates of their patch twin and are worth nothing
-                # until they diverge, which is purely LR-driven. Decay also penalises them hardest exactly
-                # where they matter -- qkv specialization sits in the first `qkv_blocks` blocks, which at
-                # decay 0.7 train at 2-6% of base LR -- so they could never diverge within the sample
-                # budget. Exempt them; the ".patch." branch is the untouched pretrained tensor and keeps
-                # its decay. cls_lr_mult=None disables the carve-out for a clean A/B against plain decay.
                 lr_mult = layerwise_decay ** (depth - 1 - int(name.split(".")[1]))
                 if cls_lr_mult is not None and ".cls." in name:
                     lr_mult = cls_lr_mult
@@ -291,6 +275,7 @@ def main():
         p.requires_grad = False
     student_dino_head = DINOHead(student_backbone.embed_dim, 131072, dino_cfg["head_hidden_dim"], dino_cfg["head_bottleneck_dim"], 3).to(device)
     teacher_dino_head = deepcopy(student_dino_head)
+    center = torch.zeros(student_dino_head.last_layer.weight.shape[0], device=device)  # DINO teacher-logit EMA; stays 0 when teacher_target != "centering"
     student_predictor = JEPAPredictor(student_backbone.embed_dim, depth=int(dino_cfg["jepa_pred_depth"]), width=int(dino_cfg["jepa_pred_width"]), n_cond=(fino_meta["n"][jepa_cond] if jepa_cond else 0)).to(device)
     for p in teacher_dino_head.parameters():
         p.requires_grad = False
@@ -337,6 +322,7 @@ def main():
         teacher_backbone.load_state_dict(checkpoint["model_ema"])
         student_dino_head.load_state_dict(checkpoint["dino_head"])
         teacher_dino_head.load_state_dict(checkpoint["dino_head_ema"])
+        center.copy_(checkpoint["center"].to(device))
         student_predictor.load_state_dict(checkpoint["predictor"])
         opt.load_state_dict(checkpoint["opt"])
         if fino_cfg:
@@ -371,7 +357,7 @@ def main():
         f"probe_count: {cfg['probe']['count']}  warmup_fraction: {dino_cfg['warmup_fraction']}  "
         f"lr: {dino_cfg['lr']}  adam_beta2: {dino_cfg['adam_beta2']}  kde_loss_weight: {dino_cfg['kde_loss_weight']}  "
         f"kde_concentration: {dino_cfg['kde_concentration']}  drop_path: {dino_cfg['drop_path_rate']}  "
-        f"collapse_prevention: {dino_cfg['collapse_prevention']}  "
+        f"teacher_target: {dino_cfg['teacher_target']}  assign_regularizer: {dino_cfg['assign_regularizer']}  "
         f"assign_coding_rate_weight: {dino_cfg['assign_coding_rate_weight']}  assign_coding_rate_eps: {dino_cfg['assign_coding_rate_eps']}  "
         f"layerwise_decay: {dino_cfg['layerwise_decay']}",
         flush=True,
@@ -451,6 +437,7 @@ def main():
         if not full:
             return payload
         return {**payload, "dino_head": cpu_state(student_dino_head), "dino_head_ema": cpu_state(teacher_dino_head),
+                "center": center.detach().cpu(),
                 "predictor": cpu_state(student_predictor), "opt": opt.state_dict(),
                 "examples_seen": examples_seen, "visible_patch_presentations": visible_patch_presentations,
                 "train_flops": train_flops, "wandb": wandb_meta,
@@ -483,14 +470,19 @@ def main():
 
     # Compute (dino_loss, jepa_loss, kde, meta_loss, creg) for one batch of (gf, lf) crops with the
     # given masks + schedule values. Used by both the train step and evaluate() (no_grad).
-    def compute_losses(gf, lf, b, masks, mask_idx, mask_w, t_temp, k_scale, ckpt=False, meta=None, cond=None):
-        mode = dino_cfg["collapse_prevention"]
+    def compute_losses(gf, lf, b, masks, mask_idx, mask_w, t_temp, k_scale, ckpt=False, meta=None, cond=None, is_train=False):
         with torch.no_grad():
             t = teacher_backbone(gf)
             t_cls = teacher_dino_head(t["x_norm_clstoken"]).chunk(train_cfg["global_views"])
-            # SK centres the target itself; the other modes leave it sharpened and regularise the student instead.
+            # SK reprojects the target; centering subtracts an EMA of the teacher logits ('none' leaves center at 0).
             swapped = torch.cat((t_cls[1], t_cls[0]))
-            t_prob = (sinkhorn(swapped, t_temp) if mode == "sinkhorn" else F.softmax(swapped / t_temp, dim=-1)).view(2, b, -1)
+            if dino_cfg["teacher_target"] == "sinkhorn":
+                t_prob = sinkhorn(swapped, t_temp).view(2, b, -1)
+            else:
+                t_prob = F.softmax((swapped - center) / t_temp, dim=-1).view(2, b, -1)
+                # is_train is False in evaluate(), so val batches cannot drag the EMA.
+                if is_train and dino_cfg["teacher_target"] == "centering":
+                    center.mul_(dino_cfg["center_momentum"]).add_(swapped.float().mean(0), alpha=1 - dino_cfg["center_momentum"])
             pbar = t_prob.flatten(0, 1).mean(0)
             dino_stats["h_marginal"] = float(-(pbar * pbar.clamp_min(1e-12).log()).sum())
             dino_stats["h_sample"] = float(-(t_prob * t_prob.clamp_min(1e-12).log()).sum(-1).mean())
@@ -505,15 +497,16 @@ def main():
         jepa_loss = F.smooth_l1_loss(pred, target, reduction="none").mean(-1).mul(mask_w).sum() / max(1, b * 2)
         kde = dino_cfg["kde_loss_weight"] * k_scale * sum(kde_loss(x, dino_cfg["kde_concentration"]) for x in sg["x_norm_clstoken"].chunk(train_cfg["global_views"]))
         # Collapse regulariser on the student assignments; sinkhorn needs none, having centred the target.
-        if mode == "coding_rate":
+        reg = dino_cfg["assign_regularizer"]
+        if reg == "coding_rate":
             # Chunked like KDE into groups of b distinct images: spreading is only meaningful across images.
             creg = -dino_cfg["assign_coding_rate_weight"] * sum(
-                coding_rate(F.softmax(x / 0.1, dim=-1), dino_cfg["assign_coding_rate_eps"]) for x in sg_cls.chunk(train_cfg["global_views"])
+                coding_rate(x, dino_cfg["assign_coding_rate_eps"]) for x in sg_cls.chunk(train_cfg["global_views"])
             ) / train_cfg["global_views"]
-        elif mode == "barlow":
-            p1, p2 = (F.softmax(x / 0.1, dim=-1) for x in sg_cls.chunk(train_cfg["global_views"]))
-            creg = dino_cfg["barlow_weight"] * barlow(p1, p2, dino_cfg["barlow_lambda"])
-        elif mode == "sinkhorn":
+        elif reg == "barlow":
+            z1, z2 = sg_cls.chunk(train_cfg["global_views"])
+            creg = dino_cfg["barlow_weight"] * barlow(z1, z2, dino_cfg["barlow_lambda"])
+        elif reg == "none":
             creg = sg_cls.new_zeros(())
         # FINO metadata guidance on the CLS token (train-only; meta=None in eval), orthogonal to the JEPA patch
         # objective. lambda_meta=0.03/branch; GradScale gates the encoder gradient by the DANN ramp gamma with the
@@ -690,7 +683,7 @@ def main():
                     cond = batch["meta_disc"][:, cond_col].repeat(train_cfg["global_views"]).to(device, non_blocking=True) if jepa_cond else None
                     dino_loss_value, jepa_loss, kde, meta_loss, creg = compute_losses(
                         gf, lf, batch_size, masks, mask_idx, mask_w, teacher_temp, kde_scale,
-                        ckpt=activation_checkpointing, meta=meta, cond=cond,
+                        ckpt=activation_checkpointing, meta=meta, cond=cond, is_train=True,
                     )
                     total_loss = dino_loss_value + jepa_loss + kde + meta_loss + creg
                 opt.zero_grad(set_to_none=True)
@@ -764,8 +757,7 @@ def main():
                     "teacher_temp": teacher_temp,
                     "teacher_momentum": m,
                     "kde_scale": kde_scale,
-                    # Teacher-distribution health, the two properties SK used to guarantee by construction.
-                    # h_marginal near log(K)=11.78 means the codebook is broadly used; a sustained fall is
+                    # Healthy h_marginal is log(2b)=5.55, NOT log(K): 2b sharp rows cap it there. 11.78 means uniform.
                     **dino_stats,
                     "batch_size": batch_size,
                     "examples_seen": examples_seen,
@@ -863,7 +855,9 @@ def main():
         "adam_beta2": dino_cfg["adam_beta2"],
         "kde_loss_weight": dino_cfg["kde_loss_weight"],
         "kde_concentration": dino_cfg["kde_concentration"],
-        "collapse_prevention": dino_cfg["collapse_prevention"],
+        "teacher_target": dino_cfg["teacher_target"],
+        "assign_regularizer": dino_cfg["assign_regularizer"],
+        "center_momentum": dino_cfg["center_momentum"],
         "assign_coding_rate_weight": dino_cfg["assign_coding_rate_weight"],
         "assign_coding_rate_eps": dino_cfg["assign_coding_rate_eps"],
         "barlow_weight": dino_cfg["barlow_weight"],

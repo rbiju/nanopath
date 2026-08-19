@@ -61,7 +61,9 @@ dino:
   clip_grad: 3.0
   kde_loss_weight: 0.005
   kde_concentration: 10.0
-  collapse_prevention: coding_rate # sinkhorn | coding_rate | barlow
+  teacher_target: none # sinkhorn | centering | none -- target-side, immune to softmax saturation
+  center_momentum: 0.9 # EMA over teacher logits; only read when teacher_target is centering
+  assign_regularizer: coding_rate # coding_rate | barlow | none -- student-side loss term
   assign_coding_rate_weight: 1.0
   assign_coding_rate_eps: 0.5
   barlow_weight: 1.0

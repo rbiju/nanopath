@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-#SBATCH --job-name=crp_e1
+#SBATCH --job-name=skr_cent_cRate
 #SBATCH --nodes=1
 #SBATCH --ntasks-per-node=1
 #SBATCH --gpus-per-task=1
@@ -7,8 +7,8 @@
 #SBATCH --output=slurm/%j.out
 #SBATCH --error=slurm/%j.err
 #SBATCH --partition=n
-#SBATCH --account=plus
-#SBATCH --qos=high
+#SBATCH --account=training
+#SBATCH --qos=normal
 
 set -euo pipefail
 

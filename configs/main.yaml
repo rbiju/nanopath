@@ -1,8 +1,8 @@
 project:
-  name: crp_e1
+  name: skr_cent_none
   family: nanopath
-  recipe_id: crp_e1
-  output_dir: /data/$USER/nanopath/20260817-crp_e1
+  recipe_id: skr_cent_none
+  output_dir: /data/$USER/nanopath/20260819-skr_cent_none
   wandb_dir: /data/$USER/nanopath/wandb
 data:
   dataset_dir: /data/nanopath_parquet
@@ -65,6 +65,9 @@ dino:
   kde_loss_weight: 0.005
   kde_concentration: 10.0
   # Collapse reg ablation
+  teacher_target: centering # sinkhorn | centering | none -- target-side, immune to softmax saturation
+  center_momentum: 0.9 # EMA over teacher logits; only read when teacher_target is centering
+  assign_regularizer: none # coding_rate | barlow | none -- student-side loss term
   assign_coding_rate_weight: 1.0
   assign_coding_rate_eps: 0.5
   barlow_weight: 1.0
