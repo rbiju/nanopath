@@ -65,8 +65,9 @@ dino:
   kde_concentration: 10.0
   jepa_pred_depth: 4
   jepa_pred_width: 0
-  jepa_blocks: 5
-  jepa_block_side: 4 # 5 target blocks, free to overlap each other and the context; overlaps kept as duplicate slots so K stays 80
+  jepa_targets: 80 # patches sampled without replacement from outside the context; cap is 112 (256 - 12^2)
+  jepa_target_decay: 0.0 # e-folds of preference across the available depth: 0 uniform, >0 hugs the context, <0 goes deep
+  jepa_target_decay_end: 0.0 # cosine target over reg_frac; equal to the start = no curriculum. e.g. 2.0 -> -1.0 anneals near to deep
 
 probe:
   enabled: true

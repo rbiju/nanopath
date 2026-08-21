@@ -1,8 +1,8 @@
 project:
-  name: bscsc_xA_mix128_00
+  name: xattnjepa_lmbd0
   family: nanopath
-  recipe_id: bscsc_xA_mix128_00
-  output_dir: /data/$USER/nanopath/20260804-bscsc_xA_mix128_00
+  recipe_id: xattnjepa_lmbd0
+  output_dir: /data/$USER/nanopath/20260821-xattnjepa_lmbd0
   wandb_dir: /data/$USER/nanopath/wandb
 data:
   dataset_dir: /data/nanopath_parquet
@@ -47,7 +47,7 @@ train:
   local_views: 0 # real multi-crop disabled; emulated by context_regions instead
   context_regions: # [[side, count], ...]: `count` independent context regions of `side` patches sampled per global view
     - [12, 2]
-    - [8, 4]
+    - [8, 2]
   global_size: 224
   local_size: 112
   resume: null
@@ -68,8 +68,9 @@ dino:
   kde_concentration: 10.0
   jepa_pred_depth: 4
   jepa_pred_width: 0
-  jepa_blocks: 12
-  jepa_block_side: 4
+  jepa_targets: 48 # patches sampled without replacement from outside the context; cap is 112 (256 - 12^2)
+  jepa_target_decay: 0.0 # e-folds of preference across the available depth: 0 uniform, >0 hugs the context, <0 goes deep
+  jepa_target_decay_end: 0.0
   freeze_backbone_fraction: 0.0
 probe:
   enabled: true

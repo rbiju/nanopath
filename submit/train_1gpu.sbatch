@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-#SBATCH --job-name=bscsc_xA_mix128_00
+#SBATCH --job-name=xattnjepa_lmbd0
 #SBATCH --nodes=1
 #SBATCH --ntasks-per-node=1
 #SBATCH --gpus-per-task=1
@@ -7,8 +7,8 @@
 #SBATCH --output=slurm/%j.out
 #SBATCH --error=slurm/%j.err
 #SBATCH --partition=n
-#SBATCH --account=sophont
-#SBATCH --qos=top # low | normal | top
+#SBATCH --account=plus
+#SBATCH --qos=high
 
 set -euo pipefail
 
