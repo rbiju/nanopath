@@ -494,9 +494,9 @@ def main():
     # context/target indices + schedule values. Used by both the train step and evaluate() (no_grad).
     #
     # Teacher: the full global view, every patch -- 2b rows, one forward, shared by every scale below.
-    # Student: context regions at several SCALES, `count` of each per global view.
-    def compute_losses(gf, b, keep_idx, mask_idx, t_temp, k_scale, ckpt=False, meta=None, cond=None):
-        gv, total_r = train_cfg["global_views"], total_regions
+    # Student: context regions at several SCALES, `count` of each per global view, plus `lf` local crops.
+    def compute_losses(gf, lf, b, keep_idx, mask_idx, t_temp, k_scale, ckpt=False, meta=None, cond=None):
+        gv, total_r, n_local = train_cfg["global_views"], total_regions, train_cfg["local_views"]
         with torch.no_grad():
             t = teacher_backbone(gf)
             # Sinkhorn centres over all gv*b teacher rows at once. With 131072 prototypes that centring is
@@ -527,6 +527,16 @@ def main():
             return sum(-(t_prob[w] * ls[v]).sum(-1).mean() for v, w in pairs) / len(pairs)
 
         dino_loss = sum(dino_cross(x) for x in sg_cls.chunk(total_r)) / total_r
+        # Local crops: every (local, teacher view) pair, no exclusion since a local never IS a teacher view.
+        # The two branches are recombined by pair count, so the result stays a flat mean over all student-
+        # teacher pairs -- at total_r=1 that is exactly the 1/(2L+2) multi-crop normalisation.
+        # Locals feed DINO only: KDE and FINO stay on the region CLS rows they are calibrated for.
+        if n_local:
+            sl_cls = student_dino_head(student_backbone(lf, checkpoint=ckpt)["x_norm_clstoken"])
+            ls = F.log_softmax(sl_cls.view(n_local, b, -1) / 0.1, dim=-1)
+            local_loss = sum(-(t_prob[w] * ls[v]).sum(-1).mean() for v in range(n_local) for w in range(gv)) / (n_local * gv)
+            n_gpairs, n_lpairs = total_r * gv * (gv - 1), n_local * gv
+            dino_loss = (n_gpairs * dino_loss + n_lpairs * local_loss) / (n_gpairs + n_lpairs)
         # Region-count weighted so the result is a plain mean over all regions regardless of how the
         # scales are split; identical to a flat mean when every scale has the same count.
         jepa_loss = sum(jepa_terms) / total_r
@@ -595,11 +605,12 @@ def main():
             if vb_idx >= int(train_cfg["val_batches"]):
                 break
             vg = vbatch["global_views"].to(device, non_blocking=True)
+            vl = vbatch["local_views"].to(device, non_blocking=True)
             b = vg.shape[0]
             with torch.no_grad(), autocast:
-                gf = vg.transpose(0, 1).flatten(0, 1)
+                gf, lf = vg.transpose(0, 1).flatten(0, 1), vl.transpose(0, 1).flatten(0, 1)
                 keep_idx, mask_idx = make_region_indices(b * train_cfg["global_views"], eval_decay)
-                dino_l, jepa_l, kde_v, _ = compute_losses(gf, b, keep_idx, mask_idx, eval_teacher_temp, eval_kde_scale)
+                dino_l, jepa_l, kde_v, _ = compute_losses(gf, lf, b, keep_idx, mask_idx, eval_teacher_temp, eval_kde_scale)
             sums += torch.tensor([float(dino_l), float(jepa_l), float(kde_v), float(dino_l + jepa_l + kde_v)], device=device)
             n_batches += 1
         random.setstate(py_rng)
@@ -670,6 +681,7 @@ def main():
             for name, batch_key in coverage_keys.items():
                 pending_ids[name].update(int(x) for x in batch[batch_key].tolist())
             global_views = batch["global_views"].to(device, non_blocking=True)
+            local_views = batch["local_views"].to(device, non_blocking=True)
             visible_now = batch_size * (train_cfg["global_views"] * visible_global_patches + train_cfg["local_views"] * local_patches)
             # LR warmup uses the 1M-sample cap; decay/WD/teacher/freeze/KDE default to the public FLOP budget.
             # But this run hits the sample cap at ~19% of the FLOP budget, so a FLOP-keyed cosine only traverses ~0.11
@@ -701,7 +713,7 @@ def main():
                 with autocast:
                     # Crop-major flatten: collate shape is (B, V, 3, H, W) but DINO wants per-crop chunks
                     # so [crop0_img0, crop0_img1, ..., crop1_img0, ...] for clean teacher/student alignment.
-                    gf = global_views.transpose(0, 1).flatten(0, 1)
+                    gf, lf = global_views.transpose(0, 1).flatten(0, 1), local_views.transpose(0, 1).flatten(0, 1)
                     # FINO DANN ramp keyed to nanopath's SAMPLE budget (NOT FLOPs — sample-capped at ~19% of the FLOP
                     # cap, so a flop-keyed ramp stalls gamma at ~0.75*gamma_max). Counted from the backbone-unfreeze
                     # point: gamma=0 through the frozen Phase 1 (banks warm), then ramps to full gamma_max by the cap.
@@ -711,7 +723,7 @@ def main():
                              {f: batch["mc_" + f].to(device, non_blocking=True) for f, _ in fino_cont}) if fino_cfg else None)
                     cond = batch["meta_disc"][:, cond_col].to(device, non_blocking=True) if jepa_cond else None
                     dino_loss_value, jepa_loss, kde, meta_loss = compute_losses(
-                        gf, batch_size, keep_idx, mask_idx, teacher_temp, kde_scale,
+                        gf, lf, batch_size, keep_idx, mask_idx, teacher_temp, kde_scale,
                         ckpt=activation_checkpointing, meta=meta, cond=cond,
                     )
                     total_loss = dino_loss_value + jepa_loss + kde + meta_loss

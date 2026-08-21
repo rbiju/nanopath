@@ -1,8 +1,8 @@
 project:
-  name: xattnjepa_lmbd_crclm
+  name: xattnjepa_lmbd_0_lcl
   family: nanopath
-  recipe_id: xattnjepa_lmbd_crclm
-  output_dir: /data/$USER/nanopath/20260821-xattnjepa_lmbd_crclm
+  recipe_id: xattnjepa_lmbd_0_lcl
+  output_dir: /data/$USER/nanopath/20260821-xattnjepa_lmbd_0_lcl
   wandb_dir: /data/$USER/nanopath/wandb
 data:
   dataset_dir: /data/nanopath_parquet
@@ -44,10 +44,9 @@ train:
   eval_every: 200
   val_batches: 16
   global_views: 2
-  local_views: 0 # real multi-crop disabled; emulated by context_regions instead
+  local_views: 8 # real multi-crop: 112px resampled crops, the magnification that context_regions cannot give
   context_regions: # [[side, count], ...]: `count` independent context regions of `side` patches sampled per global view
     - [12, 2]
-    - [8, 2]
   global_size: 224
   local_size: 112
   resume: null
@@ -69,8 +68,8 @@ dino:
   jepa_pred_depth: 4
   jepa_pred_width: 0
   jepa_targets: 48 # patches sampled without replacement from outside the context; cap is 112 (256 - 12^2)
-  jepa_target_decay: 0.8 # e-folds of preference across the available depth: 0 uniform, >0 hugs the context, <0 goes deep
-  jepa_target_decay_end: -0.8
+  jepa_target_decay: 0.0 # e-folds of preference across the available depth: 0 uniform, >0 hugs the context, <0 goes deep
+  jepa_target_decay_end: 0.0
   freeze_backbone_fraction: 0.0
 probe:
   enabled: true

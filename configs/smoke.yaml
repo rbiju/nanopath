@@ -40,7 +40,7 @@ train:
   eval_every: 50
   val_batches: 4
   global_views: 2
-  local_views: 0 # real multi-crop disabled; emulated by context_regions instead
+  local_views: 4 # real multi-crop: 112px resampled crops, the magnification that context_regions cannot give
   context_regions: # [[side, count], ...]: `count` context regions of `side` patches per global view
   - [12, 1] # near-complete view (56% of the 16x16 grid) -- keeps a global-to-global DINO term
   - [8, 1] # small view (25%) -- the local-to-global term
