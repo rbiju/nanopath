@@ -1,8 +1,8 @@
 project:
-  name: xattnjepa_lmbd0
+  name: xattnjepa_lmbd_crclm
   family: nanopath
-  recipe_id: xattnjepa_lmbd0
-  output_dir: /data/$USER/nanopath/20260821-xattnjepa_lmbd0
+  recipe_id: xattnjepa_lmbd_crclm
+  output_dir: /data/$USER/nanopath/20260821-xattnjepa_lmbd_crclm
   wandb_dir: /data/$USER/nanopath/wandb
 data:
   dataset_dir: /data/nanopath_parquet
@@ -69,8 +69,8 @@ dino:
   jepa_pred_depth: 4
   jepa_pred_width: 0
   jepa_targets: 48 # patches sampled without replacement from outside the context; cap is 112 (256 - 12^2)
-  jepa_target_decay: 0.0 # e-folds of preference across the available depth: 0 uniform, >0 hugs the context, <0 goes deep
-  jepa_target_decay_end: 0.0
+  jepa_target_decay: 0.8 # e-folds of preference across the available depth: 0 uniform, >0 hugs the context, <0 goes deep
+  jepa_target_decay_end: -0.8
   freeze_backbone_fraction: 0.0
 probe:
   enabled: true
