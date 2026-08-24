@@ -1,8 +1,8 @@
 project:
-  name: xaj_lmbd_0_sInv_bs256
+  name: xaj_lmbd0_ctx12_8_4
   family: nanopath
-  recipe_id: xaj_lmbd_0_sInv_bs256
-  output_dir: /data/$USER/nanopath/20260821-xaj_lmbd_0_sInv_bs256
+  recipe_id: xaj_lmbd0_ctx12_8_4
+  output_dir: /data/$USER/nanopath/20260824-xaj_lmbd0_ctx12_8_4
   wandb_dir: /data/$USER/nanopath/wandb
 data:
   dataset_dir: /data/nanopath_parquet
@@ -24,7 +24,7 @@ data:
   - 0.35
   color_jitter: 0.3
   color_jitter_saturation: 0.30
-  hed_jitter: 0.07
+  hed_jitter: 0.01
   tissue_thresh: 0.0
 model:
   type: dinov2_vits14_reg
@@ -46,8 +46,9 @@ train:
   global_views: 2
   local_views: 0 # real multi-crop: 112px resampled crops, the magnification that context_regions cannot give
   context_regions: # [[side, count], ...]: `count` independent context regions of `side` patches sampled per global view
-    - [12, 2]
+    - [12, 1]
     - [8, 2]
+    - [4, 2]
   global_size: 224
   local_size: 112
   resume: null
@@ -108,14 +109,3 @@ probe:
     pathorob: /data/pathorob
     surgen: /data/surgen
     ucla_lung: /data/ucla-lung
-fino:
-  enabled: true
-  gamma_max: 0.7
-  discrete:
-  - - subtype
-    - 1
-  continuous:
-  - - expr512
-    - 1
-  - - fga
-    - 1
