@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-#SBATCH --job-name=xattnjepa_lmbd_0_lcl
+#SBATCH --job-name=xaj_lmbd_0_sInv_bs256
 #SBATCH --nodes=1
 #SBATCH --ntasks-per-node=1
 #SBATCH --gpus-per-task=1

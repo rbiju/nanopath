@@ -86,6 +86,17 @@ class HEDJitter(nn.Module):
         return torch.exp(log_rgb).clamp_(0.0, 1.0).permute(2, 0, 1)
 
 
+# Batched GPU counterpart of HEDJitter, for re-jittering a collated batch on device: same stain math,
+# but one independent shift/scale per image instead of one per call. Expects [0, 1] RGB, (B, 3, H, W).
+def hed_jitter_batch(x, sigma):
+    rgb = x.permute(0, 2, 3, 1).clamp_min(1e-6)
+    hed = ((torch.log(rgb) / LOG_1E6) @ HED_FROM_RGB.to(x.device, x.dtype)).clamp_min(0.0)
+    shift = torch.randn(x.shape[0], 1, 1, 3, device=x.device, dtype=x.dtype) * sigma
+    scale = 1.0 + torch.randn_like(shift) * sigma
+    log_rgb = -((hed * scale + shift) * (-LOG_1E6)) @ RGB_FROM_HED.to(x.device, x.dtype)
+    return torch.exp(log_rgb).clamp_(0.0, 1.0).permute(0, 3, 1, 2)
+
+
 # Map-style TCGA tile dataset that emits global/local multi-view stacks for train.py.
 # This class is the domain adapter: everything train.py would otherwise need to know about
 # whole-slide pathology (barcode parsing, stain jitter, tissue thresholding, the patient-level

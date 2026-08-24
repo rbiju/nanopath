@@ -67,7 +67,8 @@ dino:
   jepa_pred_width: 0
   jepa_targets: 80 # patches sampled without replacement from outside the context; cap is 112 (256 - 12^2)
   jepa_target_decay: 0.0 # e-folds of preference across the available depth: 0 uniform, >0 hugs the context, <0 goes deep
-  jepa_target_decay_end: 0.0 # cosine target over reg_frac; equal to the start = no curriculum. e.g. 2.0 -> -1.0 anneals near to deep
+  jepa_target_decay_end: 0.0
+  student_view_jitter: 0.0 # HED sigma re-applied to the student region view only; 0 disables. Teacher stays as collated # cosine target over reg_frac; equal to the start = no curriculum. e.g. 2.0 -> -1.0 anneals near to deep
 
 probe:
   enabled: true

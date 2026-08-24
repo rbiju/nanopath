@@ -29,7 +29,7 @@ import yaml
 from torch.utils.data import DataLoader
 from torch.utils.flop_counter import FlopCounterMode
 
-from dataloader import IMAGE_SIZE, ParquetImageDataset
+from dataloader import IMAGE_SIZE, ParquetImageDataset, hed_jitter_batch
 from model import DINOHead, GradScale, JEPAPredictor, SpecializedDinoV2ViT, load_dinov2_pretrained
 from probe import (
     completed_probe_summary,
@@ -298,6 +298,15 @@ def main():
     jepa_decay_start = float(dino_cfg["jepa_target_decay"])
     jepa_decay_end = float(dino_cfg.get("jepa_target_decay_end", jepa_decay_start))
 
+    view_jitter = float(dino_cfg.get("student_view_jitter", 0.0))
+    norm_mean = torch.tensor(cfg["data"]["mean"], device=device).view(1, 3, 1, 1)
+    norm_std = torch.tensor(cfg["data"]["std"], device=device).view(1, 3, 1, 1)
+
+    def jitter_view(x):
+        with torch.autocast(device_type="cuda", enabled=False):
+            rgb = hed_jitter_batch((x.float() * norm_std + norm_mean).clamp_(0.0, 1.0), view_jitter)
+            return ((rgb - norm_mean) / norm_std).to(x.dtype)
+
     # One (keep_idx, mask_idx) pair per scale; each is (b * global_views * count, ...). Separate forwards,
     # since scales have different sequence lengths.
     def make_region_indices(n_crops, decay):
@@ -505,7 +514,8 @@ def main():
         tp = F.layer_norm(t["x_norm_patchtokens"], (student_backbone.embed_dim,))
         cls_tokens, jepa_terms = [], []
         for (_, r), ki, mi in zip(context_regions, keep_idx, mask_idx):
-            sg = student_backbone(gf.repeat(r, 1, 1, 1), keep_idx=ki, checkpoint=ckpt)
+            sv = gf.repeat(r, 1, 1, 1)
+            sg = student_backbone(jitter_view(sv) if view_jitter else sv, keep_idx=ki, checkpoint=ckpt)
             cls_tokens.append(sg["x_norm_clstoken"])
             # K is fixed and every slot is a distinct unseen patch, so this is a plain mean.
             # Gathering per region chunk keeps the teacher features unduplicated: only the (2b*r, K, D)

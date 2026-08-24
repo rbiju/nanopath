@@ -1,8 +1,8 @@
 project:
-  name: xattnjepa_lmbd_0_lcl
+  name: xaj_lmbd_0_sInv_bs256
   family: nanopath
-  recipe_id: xattnjepa_lmbd_0_lcl
-  output_dir: /data/$USER/nanopath/20260821-xattnjepa_lmbd_0_lcl
+  recipe_id: xaj_lmbd_0_sInv_bs256
+  output_dir: /data/$USER/nanopath/20260821-xaj_lmbd_0_sInv_bs256
   wandb_dir: /data/$USER/nanopath/wandb
 data:
   dataset_dir: /data/nanopath_parquet
@@ -33,7 +33,7 @@ train:
   seed: 12
   bf16: true
   activation_checkpointing: false
-  batch_size: 128
+  batch_size: 256
   num_workers: 16
   prefetch_factor: 2
   persistent_workers: true
@@ -44,9 +44,10 @@ train:
   eval_every: 200
   val_batches: 16
   global_views: 2
-  local_views: 8 # real multi-crop: 112px resampled crops, the magnification that context_regions cannot give
+  local_views: 0 # real multi-crop: 112px resampled crops, the magnification that context_regions cannot give
   context_regions: # [[side, count], ...]: `count` independent context regions of `side` patches sampled per global view
     - [12, 2]
+    - [8, 2]
   global_size: 224
   local_size: 112
   resume: null
@@ -70,6 +71,7 @@ dino:
   jepa_targets: 48 # patches sampled without replacement from outside the context; cap is 112 (256 - 12^2)
   jepa_target_decay: 0.0 # e-folds of preference across the available depth: 0 uniform, >0 hugs the context, <0 goes deep
   jepa_target_decay_end: 0.0
+  student_view_jitter: 0.02
   freeze_backbone_fraction: 0.0
 probe:
   enabled: true
