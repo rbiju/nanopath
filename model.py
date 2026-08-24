@@ -278,24 +278,37 @@ def load_dinov2_pretrained(model):
 # weight-normed Linear(bottleneck -> n_prototypes) with weight_g frozen at 1, matching the
 # behaviour of dinov2.layers.DINOHead. Standalone reimplementation (no xformers, no fvcore).
 class DINOHead(nn.Module):
-    def __init__(self, in_dim, n_prototypes, hidden_dim=2048, bottleneck_dim=384, nlayers=3):
+    def __init__(self, in_dim, n_prototypes, hidden_dim=2048, bottleneck_dim=384, nlayers=3, n_factors=1):
         super().__init__()
+        if bottleneck_dim % n_factors:
+            raise ValueError(f"head_bottleneck_dim={bottleneck_dim} must be divisible by head_factors={n_factors}")
         layers = [nn.Linear(in_dim, hidden_dim), nn.GELU()]
         for _ in range(nlayers - 2):
             layers += [nn.Linear(hidden_dim, hidden_dim), nn.GELU()]
         layers.append(nn.Linear(hidden_dim, bottleneck_dim))
         self.mlp = nn.Sequential(*layers)
-        self.last_layer = nn.utils.parametrizations.weight_norm(nn.Linear(bottleneck_dim, n_prototypes, bias=False))
+        self.n_factors, self.slice_dim = n_factors, bottleneck_dim // n_factors
+        # ModuleList stays named `last_layer` so build_param_groups' `"last_layer" in name` test still
+        # matches and freeze_last_layer_fraction keeps working unchanged.
+        self.last_layer = nn.ModuleList(
+            nn.utils.parametrizations.weight_norm(nn.Linear(self.slice_dim, n_prototypes, bias=False))
+            for _ in range(n_factors)
+        )
         # weight-norm under torch.nn.utils.parametrizations exposes `parametrizations.weight.original0/1`;
         # original0 is the magnitude vector (size n_prototypes). Freeze it at 1 to match dinov2's recipe.
         with torch.no_grad():
-            self.last_layer.parametrizations.weight.original0.fill_(1.0)
-        self.last_layer.parametrizations.weight.original0.requires_grad_(False)
+            for head in self.last_layer:
+                head.parametrizations.weight.original0.fill_(1.0)
+        for head in self.last_layer:
+            head.parametrizations.weight.original0.requires_grad_(False)
 
+    # Cut the bottleneck into n_factors disjoint chunks, one per codebook, so no two codebooks can see the
+    # same numbers and learn the same partition. Normalising AFTER the cut keeps every chunk unit-length,
+    # so all factors score true cosines and share one temperature; normalising before would leave each
+    # chunk ~1/sqrt(F) long, a per-sample temperature change in disguise.
     def forward(self, x):
-        x = self.mlp(x)
-        x = F.normalize(x, dim=-1, p=2)
-        return self.last_layer(x)
+        x = F.normalize(self.mlp(x).view(-1, self.n_factors, self.slice_dim), dim=-1, p=2)
+        return torch.stack([head(x[:, f]) for f, head in enumerate(self.last_layer)], dim=1)  # (N, F, K)
 
 
 # CrossMAE decoder block: queries attend into `ctx` and never to each other, so a masked position's only

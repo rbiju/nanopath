@@ -136,16 +136,17 @@ def cosine_schedule(start, end, frac):
     return end + 0.5 * (start - end) * (1 + math.cos(math.pi * min(1.0, max(0.0, frac))))
 
 
-# Sinkhorn-Knopp centring across this batch, used for DINO teacher targets.
+# Sinkhorn-Knopp centring across this batch, used for DINO teacher targets. Input is (N, F, K): each of
+# the F codebooks is an independent balancing problem over its own K prototypes, solved in parallel here.
+# At F=1 this is numerically identical to the unfactorised version it replaces.
 def sinkhorn(x, temp):
-    q = torch.exp(x.float() / temp).t()
-    b = q.shape[1]
-    k = q.shape[0]
-    q /= q.sum()
+    q = torch.exp(x.float() / temp).permute(1, 2, 0)  # (F, K, N)
+    k, b = q.shape[1], q.shape[2]
+    q /= q.sum((1, 2), keepdim=True)
     for _ in range(3):
-        q /= q.sum(1, keepdim=True) * k
-        q /= q.sum(0, keepdim=True) * b
-    return (q * b).t()
+        q /= q.sum(2, keepdim=True) * k  # prototype marginals, per factor
+        q /= q.sum(1, keepdim=True) * b  # sample marginals, per factor
+    return (q * b).permute(2, 0, 1)  # (N, F, K)
 
 
 # KDE uniformity loss on L2-normalised CLS tokens.
@@ -276,7 +277,11 @@ def main():
     teacher_backbone.train(False)
     for p in teacher_backbone.parameters():
         p.requires_grad = False
-    student_dino_head = DINOHead(student_backbone.embed_dim, 131072, dino_cfg["head_hidden_dim"], dino_cfg["head_bottleneck_dim"], 3).to(device)
+    # Product-factorised prototypes: the bottleneck splits into head_factors chunks, each with its own
+    # head_prototypes codebook, giving head_prototypes**head_factors joint codes while Sinkhorn only ever
+    # balances head_prototypes bins at a time. Defaults reproduce the single 131072-way head exactly.
+    n_factors, n_prototypes = int(dino_cfg.get("head_factors", 1)), int(dino_cfg.get("head_prototypes", 131072))
+    student_dino_head = DINOHead(student_backbone.embed_dim, n_prototypes, dino_cfg["head_hidden_dim"], dino_cfg["head_bottleneck_dim"], 3, n_factors).to(device)
     teacher_dino_head = deepcopy(student_dino_head)
     global_grid = train_cfg["global_size"] // student_backbone.patch_size
     global_patches = global_grid ** 2
@@ -508,9 +513,10 @@ def main():
         gv, total_r, n_local = train_cfg["global_views"], total_regions, train_cfg["local_views"]
         with torch.no_grad():
             t = teacher_backbone(gf)
-            # Sinkhorn centres over all gv*b teacher rows at once. With 131072 prototypes that centring is
-            # the thinnest statistic in the objective, so more global views widen it as a side effect.
-            t_prob = sinkhorn(teacher_dino_head(t["x_norm_clstoken"]), t_temp).view(gv, b, -1)
+            # Sinkhorn centres over all gv*b teacher rows at once, per factor. Prototype count per factor
+            # sets how thin that statistic is: gv*b rows spread over n_prototypes bins, not over the joint
+            # n_prototypes**n_factors code space, which is the point of factorising.
+            t_prob = sinkhorn(teacher_dino_head(t["x_norm_clstoken"]), t_temp).view(gv, b, n_factors, -1)
         tp = F.layer_norm(t["x_norm_patchtokens"], (student_backbone.embed_dim,))
         cls_tokens, jepa_terms = [], []
         for (_, r), ki, mi in zip(context_regions, keep_idx, mask_idx):
@@ -529,12 +535,14 @@ def main():
         # Every ordered cross-view pair: student view v scored against teacher view w != v, averaged over
         # the gv*(gv-1) pairs and then over regions. At gv=2 this is exactly the old swap pair.
         # log_softmax is taken once per student view and reused across the gv-1 teachers it is scored
-        # against; a per-pair cross-entropy would instead save gv*(gv-1) copies of a (b, 131072) tensor
-        # for backward, which at gv=4 is ~800 MB per region for no numerical difference.
+        # against; a per-pair cross-entropy would instead save gv*(gv-1) copies of a (b, F, K) tensor
+        # for backward, which at gv=4 is ~800 MB per region unfactorised, for no numerical difference.
+        # log_softmax is over K alone, so each codebook is its own distribution; summing the per-factor
+        # cross-entropies over F is exactly the joint CE, since the code factorises across chunks.
         def dino_cross(x):
-            ls = F.log_softmax(x.view(gv, b, -1) / 0.1, dim=-1)
+            ls = F.log_softmax(x.view(gv, b, n_factors, -1) / 0.1, dim=-1)
             pairs = [(v, w) for v in range(gv) for w in range(gv) if v != w]
-            return sum(-(t_prob[w] * ls[v]).sum(-1).mean() for v, w in pairs) / len(pairs)
+            return sum(-(t_prob[w] * ls[v]).sum((-2, -1)).mean() for v, w in pairs) / len(pairs)
 
         dino_loss = sum(dino_cross(x) for x in sg_cls.chunk(total_r)) / total_r
         # Local crops: every (local, teacher view) pair, no exclusion since a local never IS a teacher view.
@@ -543,8 +551,8 @@ def main():
         # Locals feed DINO only: KDE and FINO stay on the region CLS rows they are calibrated for.
         if n_local:
             sl_cls = student_dino_head(student_backbone(lf, checkpoint=ckpt)["x_norm_clstoken"])
-            ls = F.log_softmax(sl_cls.view(n_local, b, -1) / 0.1, dim=-1)
-            local_loss = sum(-(t_prob[w] * ls[v]).sum(-1).mean() for v in range(n_local) for w in range(gv)) / (n_local * gv)
+            ls = F.log_softmax(sl_cls.view(n_local, b, n_factors, -1) / 0.1, dim=-1)
+            local_loss = sum(-(t_prob[w] * ls[v]).sum((-2, -1)).mean() for v in range(n_local) for w in range(gv)) / (n_local * gv)
             n_gpairs, n_lpairs = total_r * gv * (gv - 1), n_local * gv
             dino_loss = (n_gpairs * dino_loss + n_lpairs * local_loss) / (n_gpairs + n_lpairs)
         # Region-count weighted so the result is a plain mean over all regions regardless of how the
@@ -903,6 +911,8 @@ def main():
         "adam_beta2": dino_cfg["adam_beta2"],
         "kde_loss_weight": dino_cfg["kde_loss_weight"],
         "kde_concentration": dino_cfg["kde_concentration"],
+        "head_factors": n_factors,
+        "head_prototypes": n_prototypes,
         "jepa_targets": jepa_targets,
         "jepa_target_decay": jepa_decay_start,
         "jepa_target_decay_end": jepa_decay_end,

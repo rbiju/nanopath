@@ -63,7 +63,9 @@ dino:
   patch_embed_lr_mult: 0.2
   drop_path_rate: 0.1
   head_hidden_dim: 2048
-  head_bottleneck_dim: 384
+  head_bottleneck_dim: 384 # split evenly across head_factors, so it must divide by it
+  head_factors: 3 
+  head_prototypes: 64
   clip_grad: 3.0
   kde_loss_weight: 0.005
   kde_concentration: 10.0
