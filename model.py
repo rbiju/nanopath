@@ -215,8 +215,42 @@ def load_dinov2_pretrained(model):
     return model
 
 
+class PrototypeRegularizer(nn.Module):
+    # protos: the L2-normalised bank, (n_prototypes, D), spanning every factor's codebook at once.
+    def forward(self, protos):
+        raise NotImplementedError
+
+
+class NoPrototypeReg(PrototypeRegularizer):
+    def forward(self, protos):
+        return protos.new_zeros(())
+
+class CodingRateReg(PrototypeRegularizer):
+    def __init__(self, weight, eps=0.5):
+        super().__init__()
+        self.weight, self.eps = float(weight), float(eps)
+
+    def forward(self, protos):
+        with torch.autocast(device_type=protos.device.type, enabled=False):
+            p = protos.float()
+            k, d = p.shape
+            gram = p @ p.T if k < d else p.T @ p
+            eye = torch.eye(gram.shape[-1], device=p.device, dtype=p.dtype)
+            return -self.weight * 0.5 * torch.logdet(eye + (d / (k * self.eps ** 2)) * gram)
+
+
+PROTOTYPE_REGULARIZERS = {"none": NoPrototypeReg, "coding_rate": CodingRateReg}
+
+
+# Build a regularizer by name; "none" ignores weight/eps so the baseline needs no extra config.
+def make_prototype_regularizer(kind, weight=0.0, eps=0.5):
+    if kind not in PROTOTYPE_REGULARIZERS:
+        raise ValueError(f"unknown dino.prototype_reg={kind!r}; expected one of {sorted(PROTOTYPE_REGULARIZERS)}")
+    return NoPrototypeReg() if kind == "none" else PROTOTYPE_REGULARIZERS[kind](weight, eps)
+
+
 class FactoredDINOHead(nn.Module):
-    def __init__(self, in_dim, n_prototypes, hidden_dim=2048, bottleneck_dim=384, nlayers=3, n_factors=1):
+    def __init__(self, in_dim, n_prototypes, hidden_dim=2048, bottleneck_dim=384, nlayers=3, n_factors=1, regularizer=None):
         super().__init__()
         if bottleneck_dim % n_factors:
             raise ValueError("Bottleneck dim must be divisible by n_factors")
@@ -234,12 +268,21 @@ class FactoredDINOHead(nn.Module):
 
         self.prototypes = nn.Parameter(torch.randn(n_prototypes, bottleneck_dim // n_factors))
         self.n_factors = n_factors
+        self.regularizer = regularizer or NoPrototypeReg()
+
+    # L2-normalised bank, split into one codebook per factor.
+    def _chunked_prototypes(self):
+        return torch.tensor_split(F.normalize(self.prototypes, dim=-1, p=2), self.n_factors, dim=0)
+
+    # Prototype-bank penalty over the WHOLE bank
+    def prototype_reg(self):
+        return self.regularizer(F.normalize(self.prototypes, dim=-1, p=2))
 
     def forward(self, x):
         # x: [B E]
         x = self.mlp(x)
         chunks = einops.rearrange(F.normalize(x, dim=-1, p=2), 'b (n k) -> b n k', n=self.n_factors)
-        chunked_prototypes = torch.tensor_split(F.normalize(self.prototypes, dim=-1, p=2), self.n_factors, dim=0)
+        chunked_prototypes = self._chunked_prototypes()
         out = torch.stack([chunks[:, i, :] @ chunked_prototypes[i].T for i in range(self.n_factors)], dim=1)
 
         return out  # B N K_P

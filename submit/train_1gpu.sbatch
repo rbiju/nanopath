@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-#SBATCH --job-name=main_1gpu
+#SBATCH --job-name=pf_f3_p768_bsN_cr
 #SBATCH --nodes=1
 #SBATCH --ntasks-per-node=1
 #SBATCH --gpus-per-task=1
@@ -7,7 +7,8 @@
 #SBATCH --output=slurm/%j.out
 #SBATCH --error=slurm/%j.err
 #SBATCH --partition=n
-#SBATCH --qos=normal # low | normal | top
+#SBATCH --account=training
+#SBATCH --qos=normal
 
 set -euo pipefail
 

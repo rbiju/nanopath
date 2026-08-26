@@ -1,8 +1,8 @@
 project:
-  name: ryan-validation-s12
+  name: pf_f3_p768_bsN_cr
   family: nanopath
-  recipe_id: dinov2-vits14-reg-jepa-mask10
-  output_dir: /data/$USER/nanopath/ryan-validation/s12
+  recipe_id: pf_f3_p768_bsN_cr
+  output_dir: /data/$USER/nanopath/pf_f3_p768_bsN_cr
   wandb_dir: /data/$USER/nanopath/wandb
 data:
   dataset_dir: /data/nanopath_parquet
@@ -32,7 +32,7 @@ train:
   seed: 12
   bf16: true
   activation_checkpointing: false
-  batch_size: 128
+  batch_size: 384
   num_workers: 16
   prefetch_factor: 2
   persistent_workers: true
@@ -57,9 +57,12 @@ dino:
   patch_embed_lr_mult: 0.2
   drop_path_rate: 0.1
   head_hidden_dim: 2048
-  head_bottleneck_dim: 384 # split evenly across head_factors, so it must divide by it
-  head_factors: 1 # codebooks the bottleneck is cut into; 1 = the original single-head behaviour
-  head_prototypes: 131072 # TOTAL across factors; each factor gets this // head_factors, and the joint code space is that quotient ** head_factors
+  head_bottleneck_dim: 384 # must be divisible by head_factors
+  head_factors: 3
+  head_prototypes: 768
+  prototype_reg: coding_rate # none | coding_rate
+  prototype_reg_weight: 0.01 # ignored when prototype_reg is none
+  prototype_reg_eps: 0.5 # coding-rate distortion; smaller = stricter spreading
   clip_grad: 3.0
   kde_loss_weight: 0.005
   kde_concentration: 10.0
@@ -103,14 +106,3 @@ probe:
     pathorob: /data/pathorob
     surgen: /data/surgen
     ucla_lung: /data/ucla-lung
-fino:
-  enabled: true
-  gamma_max: 0.7
-  discrete:
-  - - subtype
-    - 1
-  continuous:
-  - - expr512
-    - 1
-  - - fga
-    - 1
