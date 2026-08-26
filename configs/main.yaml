@@ -64,14 +64,17 @@ dino:
   drop_path_rate: 0.1
   head_hidden_dim: 2048
   head_bottleneck_dim: 384 # split evenly across head_factors, so it must divide by it
-  head_factors: 3 
-  head_prototypes: 64
+  head_factors: 3 # codebooks the bottleneck is cut into; 1 = single-head behaviour
+  head_prototypes: 768 
+  prototype_reg: none # none | coding_rate -- penalty spreading the whole prototype bank
+  prototype_reg_weight: 0.0 # ignored when prototype_reg is none
+  prototype_reg_eps: 0.5 # coding-rate distortion; smaller = stricter spreading
   clip_grad: 3.0
   kde_loss_weight: 0.005
   kde_concentration: 10.0
   jepa_pred_depth: 4
   jepa_pred_width: 0
-  jepa_targets: 48 # patches sampled without replacement from outside the context; cap is 112 (256 - 12^2)
+  jepa_targets: 48 # patches sampled without replacement from outside the context
   jepa_target_decay: 0.0 # e-folds of preference across the available depth: 0 uniform, >0 hugs the context, <0 goes deep
   jepa_target_decay_end: 0.0
   student_view_jitter: 0.02

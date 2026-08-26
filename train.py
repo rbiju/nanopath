@@ -30,7 +30,7 @@ from torch.utils.data import DataLoader
 from torch.utils.flop_counter import FlopCounterMode
 
 from dataloader import IMAGE_SIZE, ParquetImageDataset, hed_jitter_batch
-from model import DINOHead, GradScale, JEPAPredictor, SpecializedDinoV2ViT, load_dinov2_pretrained
+from model import FactoredDINOHead, GradScale, JEPAPredictor, SpecializedDinoV2ViT, load_dinov2_pretrained, make_prototype_regularizer
 from probe import (
     completed_probe_summary,
     collect_probe_results,
@@ -226,7 +226,9 @@ def build_param_groups(student_backbone, student_dino_head, student_predictor, l
             elif kind == "backbone" and name.startswith("patch_embed."):
                 lr_mult = (layerwise_decay ** depth) * patch_embed_lr_mult
             wd_mult = 0.0 if name.endswith("bias") or "norm" in name or p.ndim < 2 or name in no_wd_names else 1.0
-            key = (lr_mult, wd_mult, "last_layer" in name)
+            # FactoredDINOHead holds its whole pool in one `prototypes` Parameter, so the freeze that used
+            # to key on the weight-norm `last_layer` name has to look for that instead.
+            key = (lr_mult, wd_mult, kind == "dino_head" and "prototypes" in name)
             coalesced.setdefault(key, {"params": [], "lr_mult": lr_mult, "wd_mult": wd_mult, "last_layer": key[2]})["params"].append(p)
     return list(coalesced.values())
 
@@ -281,7 +283,10 @@ def main():
     # head_prototypes codebook, giving head_prototypes**head_factors joint codes while Sinkhorn only ever
     # balances head_prototypes bins at a time. Defaults reproduce the single 131072-way head exactly.
     n_factors, n_prototypes = int(dino_cfg.get("head_factors", 1)), int(dino_cfg.get("head_prototypes", 131072))
-    student_dino_head = DINOHead(student_backbone.embed_dim, n_prototypes, dino_cfg["head_hidden_dim"], dino_cfg["head_bottleneck_dim"], 3, n_factors).to(device)
+    # Prototype-bank penalty, weighted inside the regularizer so compute_losses just adds the scalar.
+    prototype_reg = str(dino_cfg.get("prototype_reg", "none"))
+    regularizer = make_prototype_regularizer(prototype_reg, float(dino_cfg.get("prototype_reg_weight", 0.0)), float(dino_cfg.get("prototype_reg_eps", 0.5)))
+    student_dino_head = FactoredDINOHead(student_backbone.embed_dim, n_prototypes, dino_cfg["head_hidden_dim"], dino_cfg["head_bottleneck_dim"], 3, n_factors, regularizer).to(device)
     teacher_dino_head = deepcopy(student_dino_head)
     global_grid = train_cfg["global_size"] // student_backbone.patch_size
     global_patches = global_grid ** 2
@@ -606,7 +611,9 @@ def main():
                     meta_loss = sum((nbar / grad_eq_ema[f]).detach() * L for f, L in terms)
                 else:
                     for _, L in terms: meta_loss = meta_loss + L
-        return dino_loss, jepa_loss, kde, meta_loss
+        # Penalises the prototype parameter, not the data, so it is returned separately and evaluate()
+        # leaves it out of the val totals.
+        return dino_loss, jepa_loss, kde, meta_loss, student_dino_head.prototype_reg()
 
     # Held-out validation pass: same DINO + JEPA + KDE losses on `val_batches` of the val split.
     # Schedule terms (teacher_temp, kde_scale, jepa decay) drift over training, so read val curves as
@@ -628,7 +635,7 @@ def main():
             with torch.no_grad(), autocast:
                 gf, lf = vg.transpose(0, 1).flatten(0, 1), vl.transpose(0, 1).flatten(0, 1)
                 keep_idx, mask_idx = make_region_indices(b * train_cfg["global_views"], eval_decay)
-                dino_l, jepa_l, kde_v, _ = compute_losses(gf, lf, b, keep_idx, mask_idx, eval_teacher_temp, eval_kde_scale)
+                dino_l, jepa_l, kde_v, _, _ = compute_losses(gf, lf, b, keep_idx, mask_idx, eval_teacher_temp, eval_kde_scale)
             sums += torch.tensor([float(dino_l), float(jepa_l), float(kde_v), float(dino_l + jepa_l + kde_v)], device=device)
             n_batches += 1
         random.setstate(py_rng)
@@ -740,11 +747,11 @@ def main():
                              batch["meta_disc"].to(device, non_blocking=True),
                              {f: batch["mc_" + f].to(device, non_blocking=True) for f, _ in fino_cont}) if fino_cfg else None)
                     cond = batch["meta_disc"][:, cond_col].to(device, non_blocking=True) if jepa_cond else None
-                    dino_loss_value, jepa_loss, kde, meta_loss = compute_losses(
+                    dino_loss_value, jepa_loss, kde, meta_loss, proto_reg = compute_losses(
                         gf, lf, batch_size, keep_idx, mask_idx, teacher_temp, kde_scale,
                         ckpt=activation_checkpointing, meta=meta, cond=cond,
                     )
-                    total_loss = dino_loss_value + jepa_loss + kde + meta_loss
+                    total_loss = dino_loss_value + jepa_loss + kde + meta_loss + proto_reg
                 opt.zero_grad(set_to_none=True)
                 total_loss.backward()
                 if examples_seen / max_train_samples < freeze_backbone_frac:  # Phase 1: backbone frozen (patch_embed + heads + metadata still train)
@@ -815,6 +822,7 @@ def main():
                     "teacher_temp": teacher_temp,
                     "teacher_momentum": m,
                     "kde_scale": kde_scale,
+                    "prototype_reg_loss": float(proto_reg),
                     "jepa_target_decay": jepa_decay,
                     "batch_size": batch_size,
                     "examples_seen": examples_seen,
@@ -913,6 +921,8 @@ def main():
         "kde_concentration": dino_cfg["kde_concentration"],
         "head_factors": n_factors,
         "head_prototypes": n_prototypes,
+        "prototype_reg": prototype_reg,
+        "prototype_reg_weight": float(dino_cfg.get("prototype_reg_weight", 0.0)),
         "jepa_targets": jepa_targets,
         "jepa_target_decay": jepa_decay_start,
         "jepa_target_decay_end": jepa_decay_end,

@@ -13,6 +13,7 @@
 
 from copy import deepcopy
 
+import einops
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -277,38 +278,91 @@ def load_dinov2_pretrained(model):
 # DINO projection head: 3-layer MLP (in -> hidden -> hidden -> bottleneck) + L2 norm +
 # weight-normed Linear(bottleneck -> n_prototypes) with weight_g frozen at 1, matching the
 # behaviour of dinov2.layers.DINOHead. Standalone reimplementation (no xformers, no fvcore).
-class DINOHead(nn.Module):
-    def __init__(self, in_dim, n_prototypes, hidden_dim=2048, bottleneck_dim=384, nlayers=3, n_factors=1):
+# Optional penalty on the prototype bank itself, run once per step from compute_losses and added to the
+# total. Any weighting belongs inside the regularizer so the train script just adds the returned scalar.
+class PrototypeRegularizer(nn.Module):
+    # protos: the L2-normalised bank, (n_prototypes, D), spanning every factor's codebook at once.
+    def forward(self, protos):
+        raise NotImplementedError
+
+
+# Baseline: exactly zero, graph-disconnected, so adding it to the total loss changes nothing.
+class NoPrototypeReg(PrototypeRegularizer):
+    def forward(self, protos):
+        return protos.new_zeros(())
+
+
+# Coding rate (MCR^2): R = 1/2 logdet(I + D/(K eps^2) * P^T P), maximal when the K unit prototypes fill
+# their D-dim subspace rather than clustering on a few directions. Returned negated, so minimising the
+# total loss spreads the bank. Applied across the whole bank, so prototypes from different factors are
+# pushed apart too and the chunks are pressed toward mutually exclusive concepts.
+# det(I + AB) = det(I + BA) lets the smaller Gram form be used, which matters when K and D are far apart.
+# fp32 island: logdet is not safe under bf16 autocast.
+class CodingRateReg(PrototypeRegularizer):
+    def __init__(self, weight, eps=0.5):
+        super().__init__()
+        self.weight, self.eps = float(weight), float(eps)
+
+    def forward(self, protos):
+        with torch.autocast(device_type=protos.device.type, enabled=False):
+            p = protos.float()
+            k, d = p.shape
+            gram = p @ p.T if k < d else p.T @ p
+            eye = torch.eye(gram.shape[-1], device=p.device, dtype=p.dtype)
+            return -self.weight * 0.5 * torch.logdet(eye + (d / (k * self.eps ** 2)) * gram)
+
+
+PROTOTYPE_REGULARIZERS = {"none": NoPrototypeReg, "coding_rate": CodingRateReg}
+
+
+# Build a regularizer by name; "none" ignores weight/eps so the baseline needs no extra config.
+def make_prototype_regularizer(kind, weight=0.0, eps=0.5):
+    if kind not in PROTOTYPE_REGULARIZERS:
+        raise ValueError(f"unknown dino.prototype_reg={kind!r}; expected one of {sorted(PROTOTYPE_REGULARIZERS)}")
+    return NoPrototypeReg() if kind == "none" else PROTOTYPE_REGULARIZERS[kind](weight, eps)
+
+
+class FactoredDINOHead(nn.Module):
+    def __init__(self, in_dim, n_prototypes, hidden_dim=2048, bottleneck_dim=384, nlayers=3, n_factors=1, regularizer=None):
         super().__init__()
         if bottleneck_dim % n_factors:
-            raise ValueError(f"head_bottleneck_dim={bottleneck_dim} must be divisible by head_factors={n_factors}")
+            raise ValueError("Bottleneck dim must be divisible by n_factors")
+
+        if n_prototypes % n_factors:
+            raise ValueError("Number of prototypes must be divisible by n_factors")
+
         layers = [nn.Linear(in_dim, hidden_dim), nn.GELU()]
+        # nlayers includes the first and bottleneck layers
         for _ in range(nlayers - 2):
-            layers += [nn.Linear(hidden_dim, hidden_dim), nn.GELU()]
+            layers.append(nn.Linear(hidden_dim, hidden_dim))
+            layers.append(nn.GELU())
         layers.append(nn.Linear(hidden_dim, bottleneck_dim))
         self.mlp = nn.Sequential(*layers)
-        self.n_factors, self.slice_dim = n_factors, bottleneck_dim // n_factors
-        # ModuleList stays named `last_layer` so build_param_groups' `"last_layer" in name` test still
-        # matches and freeze_last_layer_fraction keeps working unchanged.
-        self.last_layer = nn.ModuleList(
-            nn.utils.parametrizations.weight_norm(nn.Linear(self.slice_dim, n_prototypes, bias=False))
-            for _ in range(n_factors)
-        )
-        # weight-norm under torch.nn.utils.parametrizations exposes `parametrizations.weight.original0/1`;
-        # original0 is the magnitude vector (size n_prototypes). Freeze it at 1 to match dinov2's recipe.
-        with torch.no_grad():
-            for head in self.last_layer:
-                head.parametrizations.weight.original0.fill_(1.0)
-        for head in self.last_layer:
-            head.parametrizations.weight.original0.requires_grad_(False)
 
-    # Cut the bottleneck into n_factors disjoint chunks, one per codebook, so no two codebooks can see the
-    # same numbers and learn the same partition. Normalising AFTER the cut keeps every chunk unit-length,
-    # so all factors score true cosines and share one temperature; normalising before would leave each
-    # chunk ~1/sqrt(F) long, a per-sample temperature change in disguise.
+        self.prototypes = nn.Parameter(torch.randn(n_prototypes, bottleneck_dim // n_factors))
+        self.n_factors = n_factors
+        self.regularizer = regularizer or NoPrototypeReg()
+
+    # L2-normalised bank, split into one codebook per factor.
+    def _chunked_prototypes(self):
+        return torch.tensor_split(F.normalize(self.prototypes, dim=-1, p=2), self.n_factors, dim=0)
+
+    # Prototype-bank penalty over the WHOLE bank, (n_prototypes, D), not per factor: spreading every
+    # prototype against every other is what pushes the factors' codebooks apart, so the chunks are pressed
+    # toward encoding mutually exclusive concepts rather than re-deriving each other's.
+    # Depends only on the parameter, never on x, so the train script calls it once per step instead of
+    # picking it up as a side effect of whichever forward happened to run last.
+    def prototype_reg(self):
+        return self.regularizer(F.normalize(self.prototypes, dim=-1, p=2))
+
     def forward(self, x):
-        x = F.normalize(self.mlp(x).view(-1, self.n_factors, self.slice_dim), dim=-1, p=2)
-        return torch.stack([head(x[:, f]) for f, head in enumerate(self.last_layer)], dim=1)  # (N, F, K)
+        # x: [B E]
+        x = self.mlp(x)
+        chunks = einops.rearrange(F.normalize(x, dim=-1, p=2), 'b (n k) -> b n k', n=self.n_factors)
+        chunked_prototypes = self._chunked_prototypes()
+        out = torch.stack([chunks[:, i, :] @ chunked_prototypes[i].T for i in range(self.n_factors)], dim=1)
+
+        return out  # B N K_P
 
 
 # CrossMAE decoder block: queries attend into `ctx` and never to each other, so a masked position's only
