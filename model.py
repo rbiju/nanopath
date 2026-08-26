@@ -14,6 +14,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torchvision import transforms
 
+import einops
+
 
 # (dim, depth, heads, pretrain_grid, ffn, pos_has_cls, weight URL[, registers]) for each supported variant.
 DINOV2_VARIANTS = {
@@ -213,29 +215,34 @@ def load_dinov2_pretrained(model):
     return model
 
 
-# DINO projection head: 3-layer MLP (in -> hidden -> hidden -> bottleneck) + L2 norm +
-# weight-normed Linear(bottleneck -> n_prototypes) with weight_g frozen at 1, matching the
-# behaviour of dinov2.layers.DINOHead. Standalone reimplementation (no xformers, no fvcore).
-class DINOHead(nn.Module):
-    def __init__(self, in_dim, n_prototypes, hidden_dim=2048, bottleneck_dim=384, nlayers=3):
+class FactoredDINOHead(nn.Module):
+    def __init__(self, in_dim, n_prototypes, hidden_dim=2048, bottleneck_dim=384, nlayers=3, n_factors=1):
         super().__init__()
+        if bottleneck_dim % n_factors:
+            raise ValueError("Bottleneck dim must be divisible by n_factors")
+        
+        if n_prototypes % n_factors:
+            raise ValueError("Number of prototypes must be divisible by n_factors")
+        
         layers = [nn.Linear(in_dim, hidden_dim), nn.GELU()]
+        # nlayers includes the first and bottleneck layers
         for _ in range(nlayers - 2):
-            layers += [nn.Linear(hidden_dim, hidden_dim), nn.GELU()]
+            layers.append(nn.Linear(hidden_dim, hidden_dim))
+            layers.append(nn.GELU())
         layers.append(nn.Linear(hidden_dim, bottleneck_dim))
         self.mlp = nn.Sequential(*layers)
-        self.last_layer = nn.utils.parametrizations.weight_norm(nn.Linear(bottleneck_dim, n_prototypes, bias=False))
-        # weight-norm under torch.nn.utils.parametrizations exposes `parametrizations.weight.original0/1`;
-        # original0 is the magnitude vector (size n_prototypes). Freeze it at 1 to match dinov2's recipe.
-        with torch.no_grad():
-            self.last_layer.parametrizations.weight.original0.fill_(1.0)
-        self.last_layer.parametrizations.weight.original0.requires_grad_(False)
+
+        self.prototypes = nn.Parameter(torch.randn(n_prototypes, bottleneck_dim // n_factors))
+        self.n_factors = n_factors
 
     def forward(self, x):
+        # x: [B E]
         x = self.mlp(x)
-        x = F.normalize(x, dim=-1, p=2)
-        return self.last_layer(x)
+        chunks = einops.rearrange(F.normalize(x, dim=-1, p=2), 'b (n k) -> b n k', n=self.n_factors)
+        chunked_prototypes = torch.tensor_split(F.normalize(self.prototypes, dim=-1, p=2), self.n_factors, dim=0)
+        out = torch.stack([chunks[:, i, :] @ chunked_prototypes[i].T for i in range(self.n_factors)], dim=1)
 
+        return out  # B N K_P
 
 # I-JEPA predictor head: regresses EMA-teacher patch representations at masked target blocks from the student's
 # block-masked patch tokens. FINO/JEPA-T option: n_cond>0 adds a learned per-class embedding (idx 0 = missing/-1)
@@ -258,3 +265,12 @@ class JEPAPredictor(nn.Module):
         for blk in self.blocks:
             x = blk(x)
         return self.proj(self.norm(x))
+
+
+if __name__ == '__main__':
+    x = torch.rand(4, 128)
+    head = FactoredDINOHead(in_dim=128, n_prototypes=32, hidden_dim=256, bottleneck_dim=128, nlayers=3, n_factors=1)
+
+    out = head(x)
+
+    print(out.shape)

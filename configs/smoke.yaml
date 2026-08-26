@@ -54,7 +54,9 @@ dino:
   patch_embed_lr_mult: 0.2
   drop_path_rate: 0.1
   head_hidden_dim: 2048
-  head_bottleneck_dim: 384
+  head_bottleneck_dim: 384 # split evenly across head_factors, so it must divide by it
+  head_factors: 1 # codebooks the bottleneck is cut into; 1 = the original single-head behaviour
+  head_prototypes: 131072 # TOTAL across factors; each factor gets this // head_factors, and the joint code space is that quotient ** head_factors
   clip_grad: 3.0
   kde_loss_weight: 0.005
   kde_concentration: 10.0

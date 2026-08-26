@@ -30,7 +30,7 @@ from torch.utils.data import DataLoader
 from torch.utils.flop_counter import FlopCounterMode
 
 from dataloader import TCGATileDataset, TILE_SIZE
-from model import DINOHead, DinoV2ViT, GradScale, JEPAPredictor, load_dinov2_pretrained
+from model import DinoV2ViT, FactoredDINOHead, GradScale, JEPAPredictor, load_dinov2_pretrained
 from probe import (
     completed_probe_summary,
     collect_probe_results,
@@ -139,19 +139,22 @@ def cosine_schedule(start, end, frac):
 
 # Sinkhorn-Knopp centring across this batch, used for DINO teacher targets.
 def sinkhorn(x, temp):
-    q = torch.exp(x.float() / temp).t()
-    b = q.shape[1]
-    k = q.shape[0]
-    q /= q.sum()
+    # Input is (B, N, K): each of the N codebooks is an independent balancing problem over its own K
+    # prototypes, solved in parallel here. At N=1 this is numerically identical to the 2-D version.
+    q = torch.exp(x.float() / temp).permute(1, 2, 0)  # (F, K, N)
+    k, b = q.shape[1], q.shape[2]
+    q /= q.sum((1, 2), keepdim=True)
     for _ in range(3):
-        q /= q.sum(1, keepdim=True) * k
-        q /= q.sum(0, keepdim=True) * b
-    return (q * b).t()
+        q /= q.sum(2, keepdim=True) * k  # prototype marginals, per factor
+        q /= q.sum(1, keepdim=True) * b  # sample marginals, per factor
+    return (q * b).permute(2, 0, 1)  # (B, N, K)
 
 
 # Cross-entropy between teacher distribution and softmax(student / 0.1).
 def dino_ce(student, teacher):
-    return -(teacher * F.log_softmax(student / 0.1, dim=-1)).sum(-1).mean()
+    # Both are (B, N, K). log_softmax is over K alone so each codebook is its own distribution; summing the
+    # per-factor cross-entropies over F is exactly the joint CE, since the code factorises across chunks.
+    return -(teacher * F.log_softmax(student / 0.1, dim=-1)).sum((-2, -1)).mean()
 
 
 # KDE uniformity loss on L2-normalised CLS tokens.
@@ -179,8 +182,8 @@ def make_block_mask(batch, grid, device, n_blocks=4, block_scale=0.10):
 
 # AdamW parameter groups with layer-wise LR decay on the backbone:
 # block i gets lr * layerwise_decay^(depth - 1 - i); patch_embed gets the deepest decay
-# multiplied by patch_embed_lr_mult; biases and norms get no weight decay; the head's
-# DINO final weight-norm last_layer parameters get an LR-freeze for the first dino.freeze_last_layer_fraction.
+# multiplied by patch_embed_lr_mult; biases and norms get no weight decay; the head's DINO prototype
+# parameters get an LR-freeze for the first dino.freeze_last_layer_fraction.
 def build_param_groups(student_backbone, student_dino_head, student_predictor, layerwise_decay, patch_embed_lr_mult):
     depth = len(student_backbone.blocks)
     # Coalesce params that share (lr_mult, wd_mult, last_layer) into a single group each (~30 groups
@@ -198,7 +201,9 @@ def build_param_groups(student_backbone, student_dino_head, student_predictor, l
             elif kind == "backbone" and name.startswith("patch_embed."):
                 lr_mult = (layerwise_decay ** depth) * patch_embed_lr_mult
             wd_mult = 0.0 if name.endswith("bias") or "norm" in name or p.ndim < 2 else 1.0
-            key = (lr_mult, wd_mult, "last_layer" in name)
+            # FactoredDINOHead holds its whole pool in one `prototypes` Parameter, so the freeze that used
+            # to key on the weight-norm `last_layer` name has to look for that instead.
+            key = (lr_mult, wd_mult, kind == "dino_head" and "prototypes" in name)
             coalesced.setdefault(key, {"params": [], "lr_mult": lr_mult, "wd_mult": wd_mult, "last_layer": key[2]})["params"].append(p)
     return list(coalesced.values())
 
@@ -249,7 +254,11 @@ def main():
     teacher_backbone.train(False)
     for p in teacher_backbone.parameters():
         p.requires_grad = False
-    student_dino_head = DINOHead(student_backbone.embed_dim, 131072, dino_cfg["head_hidden_dim"], dino_cfg["head_bottleneck_dim"], 3).to(device)
+    # Product-factorised prototypes: the bottleneck splits into head_factors chunks, and the single
+    # prototype pool splits with it. head_prototypes is the TOTAL, so each factor balances
+    # head_prototypes // head_factors bins while the joint code space is that quotient ** head_factors.
+    n_factors, n_prototypes = int(dino_cfg.get("head_factors", 1)), int(dino_cfg.get("head_prototypes", 131072))
+    student_dino_head = FactoredDINOHead(student_backbone.embed_dim, n_prototypes, dino_cfg["head_hidden_dim"], dino_cfg["head_bottleneck_dim"], 3, n_factors).to(device)
     teacher_dino_head = deepcopy(student_dino_head)
     student_predictor = JEPAPredictor(student_backbone.embed_dim, depth=int(dino_cfg["jepa_pred_depth"]), width=int(dino_cfg["jepa_pred_width"]), n_cond=(fino_meta["n"][jepa_cond] if jepa_cond else 0)).to(device)
     for p in teacher_dino_head.parameters():
@@ -443,7 +452,7 @@ def main():
         with torch.no_grad():
             t = teacher_backbone(gf)
             t_cls = teacher_dino_head(t["x_norm_clstoken"]).chunk(train_cfg["global_views"])
-            t_prob = sinkhorn(torch.cat((t_cls[1], t_cls[0])), t_temp).view(2, b, -1)
+            t_prob = sinkhorn(torch.cat((t_cls[1], t_cls[0])), t_temp).view(2, b, n_factors, -1)
         sg = student_backbone(gf, masks=masks, checkpoint=ckpt)
         sl = student_backbone(lf, checkpoint=ckpt)
         sg_cls, sl_cls = student_dino_head(sg["x_norm_clstoken"]), student_dino_head(sl["x_norm_clstoken"])
@@ -797,6 +806,8 @@ def main():
         "adam_beta2": dino_cfg["adam_beta2"],
         "kde_loss_weight": dino_cfg["kde_loss_weight"],
         "kde_concentration": dino_cfg["kde_concentration"],
+        "head_factors": n_factors,
+        "head_prototypes": n_prototypes,
         "drop_path_rate": dino_cfg["drop_path_rate"],
         "layerwise_decay": dino_cfg["layerwise_decay"],
         "probe_target_samples": probe_targets,
