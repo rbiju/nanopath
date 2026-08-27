@@ -259,8 +259,9 @@ def main():
     # head_prototypes // head_factors bins while the joint code space is that quotient ** head_factors.
     n_factors, n_prototypes = int(dino_cfg.get("head_factors", 1)), int(dino_cfg.get("head_prototypes", 131072))
     # Prototype-bank penalty, weighted inside the regularizer so compute_losses just adds the scalar.
-    prototype_reg = str(dino_cfg.get("prototype_reg", "none"))
-    regularizer = make_prototype_regularizer(prototype_reg, float(dino_cfg.get("prototype_reg_weight", 0.0)), float(dino_cfg.get("prototype_reg_eps", 0.5)))
+    reg_cfg = dict(dino_cfg.get("prototype_reg") or {})
+    reg_kind = str(reg_cfg.pop("kind", "none"))
+    regularizer = make_prototype_regularizer(reg_kind, **reg_cfg)
     student_dino_head = FactoredDINOHead(student_backbone.embed_dim, n_prototypes, dino_cfg["head_hidden_dim"], dino_cfg["head_bottleneck_dim"], 3, n_factors, regularizer).to(device)
     teacher_dino_head = deepcopy(student_dino_head)
     student_predictor = JEPAPredictor(student_backbone.embed_dim, depth=int(dino_cfg["jepa_pred_depth"]), width=int(dino_cfg["jepa_pred_width"]), n_cond=(fino_meta["n"][jepa_cond] if jepa_cond else 0)).to(device)
@@ -814,8 +815,7 @@ def main():
         "kde_concentration": dino_cfg["kde_concentration"],
         "head_factors": n_factors,
         "head_prototypes": n_prototypes,
-        "prototype_reg": prototype_reg,
-        "prototype_reg_weight": float(dino_cfg.get("prototype_reg_weight", 0.0)),
+        "prototype_reg": {"kind": reg_kind, **reg_cfg},
         "drop_path_rate": dino_cfg["drop_path_rate"],
         "layerwise_decay": dino_cfg["layerwise_decay"],
         "probe_target_samples": probe_targets,

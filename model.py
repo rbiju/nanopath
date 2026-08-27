@@ -9,6 +9,8 @@
 # DINO CLS self-distillation loss. It is intentionally trivial
 # (~15 lines) so we have zero runtime dependency on the dinov2 codebase.
 
+import math
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -216,7 +218,7 @@ def load_dinov2_pretrained(model):
 
 
 class PrototypeRegularizer(nn.Module):
-    # protos: the L2-normalised bank, (n_prototypes, D), spanning every factor's codebook at once.
+    # protos: the raw bank, (n_prototypes, D). Terms that only need direction normalise it themselves.
     def forward(self, protos):
         raise NotImplementedError
 
@@ -225,6 +227,8 @@ class NoPrototypeReg(PrototypeRegularizer):
     def forward(self, protos):
         return protos.new_zeros(())
 
+
+# MCR^2 coding rate, negated so minimising spreads the bank across its subspace.
 class CodingRateReg(PrototypeRegularizer):
     def __init__(self, weight, eps=0.5):
         super().__init__()
@@ -232,21 +236,71 @@ class CodingRateReg(PrototypeRegularizer):
 
     def forward(self, protos):
         with torch.autocast(device_type=protos.device.type, enabled=False):
-            p = protos.float()
+            p = F.normalize(protos.float(), dim=-1, p=2)
             k, d = p.shape
-            gram = p @ p.T if k < d else p.T @ p
+            gram = p @ p.T if k < d else p.T @ p  # det(I + AB) = det(I + BA), so take the smaller side
             eye = torch.eye(gram.shape[-1], device=p.device, dtype=p.dtype)
             return -self.weight * 0.5 * torch.logdet(eye + (d / (k * self.eps ** 2)) * gram)
 
 
-PROTOTYPE_REGULARIZERS = {"none": NoPrototypeReg, "coding_rate": CodingRateReg}
+# Sliced-Wasserstein normality test on (G, B, D): standardise, project onto K random directions, and match
+# each projection's order statistics to the standard-normal quantiles.
+class VISReg(nn.Module):
+    def __init__(self, num_projections: int = 256, scale_weight: float = 1.0, shape_weight: float = 1.0, center_weight: float = 1.0):
+        super().__init__()
+        self.K = num_projections
+        self._cached_B = -1
+        self._cached_target = None
+        self.scale_weight = scale_weight
+        self.shape_weight = shape_weight
+        self.center_weight = center_weight
+
+    def _get_target(self, B: int, device) -> torch.Tensor:
+        if self._cached_B != B:
+            q = torch.linspace(1, B, B, device=device, dtype=torch.float32) / (B + 1)
+            self._cached_target = torch.erfinv(2 * q - 1).mul_(math.sqrt(2))
+            self._cached_B = B
+        return self._cached_target.to(device=device)
+
+    def forward(self, z: torch.Tensor) -> torch.Tensor:
+        _, B, D = z.shape
+
+        mu = z.mean(dim=1, keepdim=True)
+        center_loss = mu.pow(2).mean()
+
+        z_centered = z - mu
+        std = z_centered.norm(dim=1).div(math.sqrt(B)).clamp_min(1e-6)
+        scale_loss = (std - 1.0).pow(2).mean()
+
+        z_norm = z_centered / std.detach().unsqueeze(1)
+        W = F.normalize(torch.randn(D, self.K, device=z.device, dtype=z.dtype), dim=0)
+        p_sorted = (z_norm @ W).sort(dim=1).values
+        target = self._get_target(B, z.device).view(1, B, 1)
+        shape_loss = (p_sorted - target).pow(2).mean()
+
+        return self.scale_weight * scale_loss + self.shape_weight * shape_loss + self.center_weight * center_loss
 
 
-# Build a regularizer by name; "none" ignores weight/eps so the baseline needs no extra config.
-def make_prototype_regularizer(kind, weight=0.0, eps=0.5):
+# Drives the raw bank toward N(0, I), whose directions are uniform on the sphere once the head normalises.
+class SlicedWassersteinReg(PrototypeRegularizer):
+    def __init__(self, weight, projections=256, scale_weight=1.0, shape_weight=1.0, center_weight=1.0):
+        super().__init__()
+        self.weight = float(weight)
+        self.vis = VISReg(int(projections), float(scale_weight), float(shape_weight), float(center_weight))
+
+    def forward(self, protos):
+        with torch.autocast(device_type=protos.device.type, enabled=False):
+            return self.weight * self.vis(protos.float().unsqueeze(0))
+
+
+PROTOTYPE_REGULARIZERS = {"none": NoPrototypeReg, "coding_rate": CodingRateReg, "swd": SlicedWassersteinReg}
+
+
+# Keys under dino.prototype_reg map straight to constructor kwargs; "none" ignores whatever is left set.
+def make_prototype_regularizer(kind, **kwargs):
     if kind not in PROTOTYPE_REGULARIZERS:
-        raise ValueError(f"unknown dino.prototype_reg={kind!r}; expected one of {sorted(PROTOTYPE_REGULARIZERS)}")
-    return NoPrototypeReg() if kind == "none" else PROTOTYPE_REGULARIZERS[kind](weight, eps)
+        raise ValueError(f"unknown dino.prototype_reg.kind={kind!r}; expected one of {sorted(PROTOTYPE_REGULARIZERS)}")
+    return NoPrototypeReg() if kind == "none" else PROTOTYPE_REGULARIZERS[kind](**kwargs)
 
 
 class FactoredDINOHead(nn.Module):
@@ -276,7 +330,7 @@ class FactoredDINOHead(nn.Module):
 
     # Prototype-bank penalty over the WHOLE bank
     def prototype_reg(self):
-        return self.regularizer(F.normalize(self.prototypes, dim=-1, p=2))
+        return self.regularizer(self.prototypes)
 
     def forward(self, x):
         # x: [B E]

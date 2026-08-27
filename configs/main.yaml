@@ -1,8 +1,8 @@
 project:
-  name: pf_f3_p768_bsN_cr
+  name: pf_f3_p768_bsN
   family: nanopath
-  recipe_id: pf_f3_p768_bsN_cr
-  output_dir: /data/$USER/nanopath/pf_f3_p768_bsN_cr
+  recipe_id: pf_f3_p768_bsN
+  output_dir: /data/$USER/nanopath/20260827-pf_f3_p768_bsN
   wandb_dir: /data/$USER/nanopath/wandb
 data:
   dataset_dir: /data/nanopath_parquet
@@ -32,7 +32,7 @@ train:
   seed: 12
   bf16: true
   activation_checkpointing: false
-  batch_size: 384
+  batch_size: 128
   num_workers: 16
   prefetch_factor: 2
   persistent_workers: true
@@ -60,9 +60,11 @@ dino:
   head_bottleneck_dim: 384 # must be divisible by head_factors
   head_factors: 3
   head_prototypes: 768
-  prototype_reg: coding_rate # none | coding_rate
-  prototype_reg_weight: 0.01 # ignored when prototype_reg is none
-  prototype_reg_eps: 0.5 # coding-rate distortion; smaller = stricter spreading
+  prototype_reg: # keys other than `kind` are the regularizer's constructor arguments
+    kind: none # none | coding_rate | swd
+    weight: 0.0
+    # coding_rate: eps
+    # swd: projections, scale_weight, shape_weight, center_weight
   clip_grad: 3.0
   kde_loss_weight: 0.005
   kde_concentration: 10.0
