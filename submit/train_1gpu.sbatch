@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-#SBATCH --job-name=xaj_lmbd0_ctx12_8_4
+#SBATCH --job-name=xajpf_f2_bs384_opt_visreg_mse
 #SBATCH --nodes=1
 #SBATCH --ntasks-per-node=1
 #SBATCH --gpus-per-task=1

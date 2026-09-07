@@ -12,8 +12,8 @@
 # lightweight DINO/iBOT/KDE validation pass), so the held-out patient slice
 # stays cleanly out-of-distribution from optimization.
 #
-# Augmentation per view: RandomResizedCrop -> optional HEDJitter -> horizontal/
-# vertical flips -> ColorJitter -> occasional grayscale/blur -> Normalize.
+# Augmentation per view: RandomResizedCrop -> optional HEDJitter -> rot90 +
+# horizontal/vertical flips -> ColorJitter -> occasional grayscale/blur -> Normalize.
 #
 # This file is the *pretraining* input pipeline only. The downstream probes
 # (probe.py) do not import anything from here.
@@ -84,6 +84,13 @@ class HEDJitter(nn.Module):
         hed = hed * scale + shift
         log_rgb = -(hed * (-LOG_1E6)) @ self.rgb_from_hed.to(dtype=x.dtype)
         return torch.exp(log_rgb).clamp_(0.0, 1.0).permute(2, 0, 1)
+
+
+# Random multiple of 90 degrees. With the two flips this completes the dihedral group of the square, which
+# tiles have no canonical orientation within. Exact on the square crop: pure reindexing, no interpolation.
+class RandomRot90(nn.Module):
+    def forward(self, x):
+        return torch.rot90(x, int(torch.randint(4, (1,))), (-2, -1))
 
 
 # Batched GPU counterpart of HEDJitter, for re-jittering a collated batch on device: same stain math,
@@ -173,6 +180,7 @@ class ParquetImageDataset(Dataset):
             [
                 v2.RandomResizedCrop(train["global_size"], scale=tuple(data["global_crop_scale"]), antialias=True),
                 *([HEDJitter(data["hed_jitter"])] if data["hed_jitter"] > 0 else []),
+                RandomRot90(),
                 v2.RandomHorizontalFlip(),
                 v2.RandomVerticalFlip(),
                 v2.ColorJitter(data["color_jitter"], data["color_jitter"], data["color_jitter_saturation"], 0.0),
@@ -186,6 +194,7 @@ class ParquetImageDataset(Dataset):
             [
                 v2.RandomResizedCrop(train["local_size"], scale=tuple(data["local_crop_scale"]), antialias=True),
                 *([HEDJitter(data["hed_jitter"])] if data["hed_jitter"] > 0 else []),
+                RandomRot90(),
                 v2.RandomHorizontalFlip(),
                 v2.RandomVerticalFlip(),
                 v2.ColorJitter(data["color_jitter"], data["color_jitter"], data["color_jitter_saturation"], 0.0),

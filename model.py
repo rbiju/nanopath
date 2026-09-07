@@ -11,6 +11,7 @@
 # DINO CLS self-distillation loss. It is intentionally trivial
 # (~15 lines) so we have zero runtime dependency on the dinov2 codebase.
 
+import math
 from copy import deepcopy
 
 import einops
@@ -135,6 +136,11 @@ class DinoV2ViT(nn.Module):
         rates = [drop_path_rate * i / max(1, depth - 1) for i in range(depth)]
         self.blocks = nn.ModuleList(Block(dim, heads, mlp_ratio, p, ffn=ffn) for p in rates)
         self.norm = nn.LayerNorm(dim, eps=1e-6)
+        # Which blocks probe_features concatenates. A persistent buffer, so the choice travels in the
+        # checkpoint and probe.py picks it up through its existing strict load without knowing about it.
+        mask = torch.zeros(depth, dtype=torch.bool)
+        mask[[i for i in (4, 6, 8, 11) if i < depth]] = True
+        self.register_buffer("probe_layer_mask", mask)
 
     # Bicubic resample of the checkpoint patch-pos grid to the current (h, w) grid.
     def _interpolate_pos_embed(self, h, w):
@@ -168,19 +174,27 @@ class DinoV2ViT(nn.Module):
     # With `keep_idx` set, `x_norm_patchtokens` holds only the V kept patches, in grid order.
     # `checkpoint=True` re-runs each block under torch.utils.checkpoint to trade compute for memory;
     # useful when the 1-GPU batch of 128 (2 globals + 8 locals) does not fit in 80 GB.
-    def forward(self, x, keep_idx=None, checkpoint=False):
+    # align_from: also return the normed CLS of every block from that index on, as (N, L, D), for the
+    # cross-view feature-alignment term. LayerNorm is per token, so norming CLS alone matches norm(x)[:, 0].
+    def forward(self, x, keep_idx=None, checkpoint=False, align_from=None):
         x = self._prepare_tokens(x, keep_idx)
-        for blk in self.blocks:
+        cls_layers = []
+        for i, blk in enumerate(self.blocks):
             if checkpoint and self.training:
                 x = torch.utils.checkpoint.checkpoint(blk, x, use_reentrant=False)
             else:
                 x = blk(x)
+            if align_from is not None and i >= align_from:
+                cls_layers.append(self.norm(x[:, :1])[:, 0])
         x = self.norm(x)
-        return {
+        out = {
             "x_norm_clstoken": x[:, 0],
             "x_norm_regtokens": x[:, 1 : 1 + self.registers],
             "x_norm_patchtokens": x[:, 1 + self.registers :],
         }
+        if align_from is not None:
+            out["cls_layers"] = torch.stack(cls_layers, dim=1)  # (N, L, D)
+        return out
 
     # Probe readouts fuse intermediate normalized tokens: denser patch detail for seg,
     # and strided-depth CLS features that are less tied to the final DINO head.
@@ -204,13 +218,23 @@ class DinoV2ViT(nn.Module):
         dense = (up + (1 - w_range) * (up - blur)).flatten(2).transpose(1, 2).to(fused.dtype)
         return torch.cat([regs, dense], dim=1)
 
+    # Selects blocks via probe_layer_mask; set_probe_layers configures it before the checkpoint is written.
     def probe_features(self, x):
         xt, feats = self._prepare_tokens(x), []
         for i, blk in enumerate(self.blocks):
             xt = blk(xt)
-            if i in (4, 6, 8, 11):
-                feats.append(self.norm(xt)[:, 0])
+            if bool(self.probe_layer_mask[i]):
+                feats.append(self.norm(xt[:, :1])[:, 0])
         return torch.cat(feats, dim=-1)
+
+    def set_probe_layers(self, layers):
+        depth = len(self.blocks)
+        bad = [i for i in layers if not 0 <= int(i) < depth]
+        if bad or not len(layers):
+            raise ValueError(f"model.probe_layers={list(layers)} invalid: need a non-empty subset of 0..{depth - 1}")
+        self.probe_layer_mask.zero_()
+        self.probe_layer_mask[[int(i) for i in layers]] = True
+        return self
 
     # probe.py is a locked path: it builds a plain DinoV2ViT and strict-loads the run's checkpoint.
     # CLS/patch specialization is purely structural -- no forward override -- so a plain ViT rewrapped to
@@ -270,7 +294,9 @@ class SpecializedDinoV2ViT(DinoV2ViT):
 def load_dinov2_pretrained(model):
     *_, url = DINOV2_VARIANTS[model.variant]
     state = torch.hub.load_state_dict_from_url(url, progress=False, map_location="cpu")
-    state = {k: state[k.replace(".cls.", ".").replace(".patch.", ".")] for k in model.state_dict()}
+    own = model.state_dict()
+    # probe_layer_mask is ours; carry it through so the load can stay strict on everything Meta ships.
+    state = {k: own[k] if k == "probe_layer_mask" else state[k.replace(".cls.", ".").replace(".patch.", ".")] for k in own}
     model.load_state_dict(state, strict=True)
     return model
 
@@ -281,23 +307,17 @@ def load_dinov2_pretrained(model):
 # Optional penalty on the prototype bank itself, run once per step from compute_losses and added to the
 # total. Any weighting belongs inside the regularizer so the train script just adds the returned scalar.
 class PrototypeRegularizer(nn.Module):
-    # protos: the L2-normalised bank, (n_prototypes, D), spanning every factor's codebook at once.
+    # protos: the raw bank, (n_prototypes, D). Terms that only need direction normalise it themselves.
     def forward(self, protos):
         raise NotImplementedError
 
 
-# Baseline: exactly zero, graph-disconnected, so adding it to the total loss changes nothing.
 class NoPrototypeReg(PrototypeRegularizer):
     def forward(self, protos):
         return protos.new_zeros(())
 
 
-# Coding rate (MCR^2): R = 1/2 logdet(I + D/(K eps^2) * P^T P), maximal when the K unit prototypes fill
-# their D-dim subspace rather than clustering on a few directions. Returned negated, so minimising the
-# total loss spreads the bank. Applied across the whole bank, so prototypes from different factors are
-# pushed apart too and the chunks are pressed toward mutually exclusive concepts.
-# det(I + AB) = det(I + BA) lets the smaller Gram form be used, which matters when K and D are far apart.
-# fp32 island: logdet is not safe under bf16 autocast.
+# MCR^2 coding rate, negated so minimising spreads the bank across its subspace.
 class CodingRateReg(PrototypeRegularizer):
     def __init__(self, weight, eps=0.5):
         super().__init__()
@@ -305,21 +325,99 @@ class CodingRateReg(PrototypeRegularizer):
 
     def forward(self, protos):
         with torch.autocast(device_type=protos.device.type, enabled=False):
-            p = protos.float()
+            p = F.normalize(protos.float(), dim=-1, p=2)
             k, d = p.shape
-            gram = p @ p.T if k < d else p.T @ p
+            gram = p @ p.T if k < d else p.T @ p  # det(I + AB) = det(I + BA), so take the smaller side
             eye = torch.eye(gram.shape[-1], device=p.device, dtype=p.dtype)
             return -self.weight * 0.5 * torch.logdet(eye + (d / (k * self.eps ** 2)) * gram)
 
 
-PROTOTYPE_REGULARIZERS = {"none": NoPrototypeReg, "coding_rate": CodingRateReg}
+# Sliced-Wasserstein normality test on (G, B, D): standardise, project onto K random directions, and match
+# each projection's order statistics to the standard-normal quantiles.
+class VISReg(nn.Module):
+    def __init__(self, num_projections: int = 256, scale_weight: float = 1.0, shape_weight: float = 1.0, center_weight: float = 1.0):
+        super().__init__()
+        self.K = num_projections
+        self._cached_B = -1
+        self._cached_target = None
+        self.scale_weight = scale_weight
+        self.shape_weight = shape_weight
+        self.center_weight = center_weight
+
+    def _get_target(self, B: int, device) -> torch.Tensor:
+        if self._cached_B != B:
+            q = torch.linspace(1, B, B, device=device, dtype=torch.float32) / (B + 1)
+            self._cached_target = torch.erfinv(2 * q - 1).mul_(math.sqrt(2))
+            self._cached_B = B
+        return self._cached_target.to(device=device)
+
+    def forward(self, z: torch.Tensor) -> torch.Tensor:
+        _, B, D = z.shape
+
+        mu = z.mean(dim=1, keepdim=True)
+        center_loss = mu.pow(2).mean()
+
+        z_centered = z - mu
+        std = z_centered.norm(dim=1).div(math.sqrt(B)).clamp_min(1e-6)
+        scale_loss = (std - 1.0).pow(2).mean()
+
+        z_norm = z_centered / std.detach().unsqueeze(1)
+        W = F.normalize(torch.randn(D, self.K, device=z.device, dtype=z.dtype), dim=0)
+        p_sorted = (z_norm @ W).sort(dim=1).values
+        target = self._get_target(B, z.device).view(1, B, 1)
+        shape_loss = (p_sorted - target).pow(2).mean()
+
+        return self.scale_weight * scale_loss + self.shape_weight * shape_loss + self.center_weight * center_loss
 
 
-# Build a regularizer by name; "none" ignores weight/eps so the baseline needs no extra config.
-def make_prototype_regularizer(kind, weight=0.0, eps=0.5):
+# Drives the raw bank toward N(0, I), whose directions are uniform on the sphere once the head normalises.
+class SlicedWassersteinReg(PrototypeRegularizer):
+    def __init__(self, weight, projections=256, scale_weight=1.0, shape_weight=1.0, center_weight=1.0):
+        super().__init__()
+        self.weight = float(weight)
+        self.vis = VISReg(int(projections), float(scale_weight), float(shape_weight), float(center_weight))
+
+    def forward(self, protos):
+        with torch.autocast(device_type=protos.device.type, enabled=False):
+            return self.weight * self.vis(protos.float().unsqueeze(0))
+
+
+# VISReg over a FIFO queue of past CLS embeddings, so the normality statistic sees far more samples than
+# one batch holds. Only the current rows carry gradient; queued rows are detached and stale.
+class QueuedVISReg(nn.Module):
+    def __init__(self, dim, weight, queue_size=4096, num_projections=256, scale_weight=1.0, shape_weight=1.0, center_weight=1.0):
+        super().__init__()
+        self.weight = float(weight)
+        self.vis = VISReg(int(num_projections), float(scale_weight), float(shape_weight), float(center_weight))
+        self.register_buffer("queue", torch.zeros(int(queue_size), dim), persistent=False)
+        self.register_buffer("fill", torch.zeros((), dtype=torch.long), persistent=False)
+        self.ptr = 0
+
+    def _push(self, z):
+        k = self.queue.shape[0]
+        idx = (torch.arange(z.shape[0], device=z.device) + self.ptr) % k
+        self.queue.index_copy_(0, idx, z.to(self.queue.dtype))
+        self.ptr = (self.ptr + z.shape[0]) % k
+        self.fill.fill_(min(k, int(self.fill) + z.shape[0]))
+
+    def forward(self, z, enqueue=True):
+        with torch.autocast(device_type=z.device.type, enabled=False):
+            n = int(self.fill)
+            pool = torch.cat([z.float(), self.queue[:n]]) if n else z.float()
+            loss = self.weight * self.vis(pool.unsqueeze(0))
+        if enqueue:
+            self._push(z.detach())
+        return loss
+
+
+PROTOTYPE_REGULARIZERS = {"none": NoPrototypeReg, "coding_rate": CodingRateReg, "swd": SlicedWassersteinReg}
+
+
+# Keys under dino.prototype_reg map straight to constructor kwargs; "none" ignores whatever is left set.
+def make_prototype_regularizer(kind, **kwargs):
     if kind not in PROTOTYPE_REGULARIZERS:
-        raise ValueError(f"unknown dino.prototype_reg={kind!r}; expected one of {sorted(PROTOTYPE_REGULARIZERS)}")
-    return NoPrototypeReg() if kind == "none" else PROTOTYPE_REGULARIZERS[kind](weight, eps)
+        raise ValueError(f"unknown dino.prototype_reg.kind={kind!r}; expected one of {sorted(PROTOTYPE_REGULARIZERS)}")
+    return NoPrototypeReg() if kind == "none" else PROTOTYPE_REGULARIZERS[kind](**kwargs)
 
 
 class FactoredDINOHead(nn.Module):
@@ -353,7 +451,7 @@ class FactoredDINOHead(nn.Module):
     # Depends only on the parameter, never on x, so the train script calls it once per step instead of
     # picking it up as a side effect of whichever forward happened to run last.
     def prototype_reg(self):
-        return self.regularizer(F.normalize(self.prototypes, dim=-1, p=2))
+        return self.regularizer(self.prototypes)
 
     def forward(self, x):
         # x: [B E]

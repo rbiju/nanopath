@@ -1,8 +1,8 @@
 project:
-  name: xaj_lmbd0_ctx12_8_4
+  name: xajpf_f2_bs384_opt_visreg_mse
   family: nanopath
-  recipe_id: xaj_lmbd0_ctx12_8_4
-  output_dir: /data/$USER/nanopath/20260824-xaj_lmbd0_ctx12_8_4
+  recipe_id: xajpf_f2_bs384_opt_visreg_mse
+  output_dir: /data/$USER/nanopath/20260828-xajpf_f2_bs384_opt_visreg_mse
   wandb_dir: /data/$USER/nanopath/wandb
 data:
   dataset_dir: /data/nanopath_parquet
@@ -29,11 +29,12 @@ data:
 model:
   type: dinov2_vits14_reg
   qkv_blocks: 4 # blocks (from the input side) that get a [CLS]-specialized qkv projection; LayerNorms and LayerScales are specialized in all blocks. Registers stay on the patch weights
+  probe_layers: [11] # blocks whose CLS probe_features concatenates (0-based); rides in the checkpoint
 train:
   seed: 12
   bf16: true
   activation_checkpointing: false
-  batch_size: 256
+  batch_size: 384
   num_workers: 16
   prefetch_factor: 2
   persistent_workers: true
@@ -53,8 +54,10 @@ train:
   local_size: 112
   resume: null
 dino:
+  reg_key: sample
   lr: 0.000125
   lr_min: 1.0e-06
+  lr_ref_batch_size: 128 # lr and lr_min scale linearly by batch_size / this; null disables
   adam_beta2: 0.999
   warmup_fraction: 0.0909
   freeze_last_layer_fraction: 0.0091
@@ -64,13 +67,24 @@ dino:
   drop_path_rate: 0.1
   head_hidden_dim: 2048
   head_bottleneck_dim: 384 # split evenly across head_factors, so it must divide by it
-  head_factors: 3 # codebooks the bottleneck is cut into; 1 = single-head behaviour
+  head_factors: 2 # codebooks the bottleneck is cut into; 1 = single-head behaviour
   head_prototypes: 768 
-  prototype_reg: none # none | coding_rate -- penalty spreading the whole prototype bank
-  prototype_reg_weight: 0.0 # ignored when prototype_reg is none
-  prototype_reg_eps: 0.5 # coding-rate distortion; smaller = stricter spreading
+  prototype_reg: # keys other than `kind` are the regularizer's constructor arguments
+    kind: none # none | coding_rate | swd
+    weight: 0.0
+    # coding_rate: eps
+    # swd: projections, scale_weight, shape_weight, center_weight
+  cls_vis_reg: # VISReg on a FIFO queue of CLS embeddings; keys are QueuedVISReg's constructor arguments
+    weight: 0.3 # 0 disables, and the queue is not even allocated
+    queue_size: 4096 # total samples the statistic sees = queue_size + batch_size
+    num_projections: 128
+    scale_weight: 1.0
+    shape_weight: 1.0
+    center_weight: 1.0
+  align_from_layer: 6 # null disables; N aligns student/teacher CLS from block N to the last (0-based)
+  align_weight: 0.1 # cross-view 2-2cos alignment on those CLS tokens; raw term is ~2 at zero agreement
   clip_grad: 3.0
-  kde_loss_weight: 0.005
+  kde_loss_weight: 0.005  # disabled when cls_vis_reg is enabled
   kde_concentration: 10.0
   jepa_pred_depth: 4
   jepa_pred_width: 0

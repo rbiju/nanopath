@@ -23,6 +23,7 @@ data:
 model:
   type: dinov2_vits14_reg
   qkv_blocks: 4 # blocks (from the input side) that get a [CLS]-specialized qkv projection; LayerNorms and LayerScales are specialized in all blocks. Registers stay on the patch weights
+  probe_layers: [4, 6, 8, 11] # blocks whose CLS probe_features concatenates (0-based); rides in the checkpoint
 
 train:
   seed: 1337
@@ -51,6 +52,7 @@ train:
 dino:
   lr: 1.0e-4
   lr_min: 1.0e-6
+  lr_ref_batch_size: 128 # lr and lr_min scale linearly by batch_size / this; null disables
   adam_beta2: 0.999
   warmup_fraction: 0.0909
   freeze_last_layer_fraction: 0.0091
@@ -62,9 +64,20 @@ dino:
   head_bottleneck_dim: 384 # split evenly across head_factors, so it must divide by it
   head_factors: 1 # codebooks the bottleneck is cut into; 1 = the original single-head behaviour
   head_prototypes: 131072 # TOTAL across factors; each factor gets this // head_factors, and the joint code space is that quotient ** head_factors
-  prototype_reg: none # none | coding_rate -- penalty spreading the whole prototype bank
-  prototype_reg_weight: 0.0 # ignored when prototype_reg is none
-  prototype_reg_eps: 0.5 # coding-rate distortion; smaller = stricter spreading
+  prototype_reg: # keys other than `kind` are the regularizer's constructor arguments
+    kind: none # none | coding_rate | swd
+    weight: 0.0
+    # coding_rate: eps
+    # swd: projections, scale_weight, shape_weight, center_weight
+  cls_vis_reg: # VISReg on a FIFO queue of CLS embeddings; keys are QueuedVISReg's constructor arguments
+    weight: 0.0 # 0 disables, and the queue is not even allocated
+    queue_size: 4096 # total samples the statistic sees = queue_size + batch_size
+    num_projections: 256
+    scale_weight: 1.0
+    shape_weight: 1.0
+    center_weight: 1.0
+  align_from_layer: null # null disables; N aligns student/teacher CLS from block N to the last (0-based)
+  align_weight: 0.0 # cross-view 2-2cos alignment on those CLS tokens; raw term is ~2 at zero agreement
   clip_grad: 3.0
   kde_loss_weight: 0.005
   kde_concentration: 10.0
