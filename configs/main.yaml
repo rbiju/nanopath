@@ -96,35 +96,51 @@ dino:
 probe:
   enabled: true
   model_weights: ema
-  count: 1
+  count: 1 # 4 means probing at 25%, 50%, 75%, and 100% of the sample cap. 1 means probing just at the end.
   datasets:
-  - bracs
-  - break_his
-  - mhist
-  - pcam
+    - bach
+    - bracs
+    - break_his
+    - crc
+    - esca
+    - mhist
+    - pcam
+    - spider_breast
+    - spider_colorectal
+    - spider_skin
+    - spider_thorax
+    - wilds
   segmentation_datasets:
-  - pannuke
-  - monusac
-  - consep
+    - pannuke
+    - segpath_epithelial
+    - segpath_lymphocytes
   slide_datasets:
-  - ucla_lung
+    - ucla_lung
   auc_datasets:
-  - surgen
+    - surgen
   survival_datasets:
-  - leopard_bcr
-  - cptac_pda_os
+    - leopard_bcr
+    - cptac_pda_os
   robustness_datasets:
-  - pathorob
+    - pathorob
   dataset_roots:
-    bracs: /data/eva-data/bracs
-    break_his: /data/eva-data/breakhis
-    consep: /data/eva-data/consep
+    bach: /data/thunder-data/bach
+    bracs: /data/thunder-data/bracs
+    break_his: /data/thunder-data/break_his
+    crc: /data/thunder-data/crc
+    esca: /data/thunder-data/esca
+    mhist: /data/thunder-data/mhist
+    pcam: /data/thunder-data/patch_camelyon
+    spider_breast: /data/thunder-data/spider_breast
+    spider_colorectal: /data/thunder-data/spider_colorectal
+    spider_skin: /data/thunder-data/spider_skin
+    spider_thorax: /data/thunder-data/spider_thorax
+    wilds: /data/thunder-data/wilds
+    pannuke: /data/thunder-data/pannuke
+    segpath_epithelial: /data/thunder-data/segpath_epithelial
+    segpath_lymphocytes: /data/thunder-data/segpath_lymphocytes
     cptac_pda_os: /data/CPTAC-PDA
     leopard_bcr: /data/leopard_bcr
-    mhist: /data/eva-data/mhist
-    monusac: /data/eva-data/monusac
-    pcam: /data/eva-data/patch_camelyon
-    pannuke: /data/thunder-data/pannuke
     pathorob: /data/pathorob
     surgen: /data/surgen
     ucla_lung: /data/ucla-lung

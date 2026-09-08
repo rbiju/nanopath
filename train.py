@@ -30,7 +30,7 @@ from torch.utils.data import DataLoader
 from torch.utils.flop_counter import FlopCounterMode
 
 from dataloader import IMAGE_SIZE, ParquetImageDataset, hed_jitter_batch
-from model import FactoredDINOHead, GradScale, JEPAPredictor, QueuedVISReg, SpecializedDinoV2ViT, load_dinov2_pretrained, make_prototype_regularizer
+from model import FactoredDINOHead, GradScale, JEPAPredictor, QueuedVISReg, SpecializedViT, load_pretrained, make_prototype_regularizer
 from probe import (
     completed_probe_summary,
     collect_probe_results,
@@ -48,16 +48,18 @@ def console_prefix(): return f"{time.strftime('%H:%M:%S')} {os.environ.get('SLUR
 # expandvars is necessary to resolve `$USER` for checked-in configs.
 def load_config():
     if len(sys.argv) < 2:
-        raise ValueError("usage: python train.py <config.yaml> [output_dir=<path>]")
+        raise ValueError("usage: python train.py <config.yaml> [output_dir=<path>] [seed=<int>]")
     cfg = yaml.safe_load(os.path.expandvars(Path(sys.argv[1]).read_text()))
     cfg["config_path"] = str(Path(sys.argv[1]).resolve())
-    # Optional `key=value` overrides after the config; only output_dir is supported,
-    # since it's the run identifier and routinely set per-submission from the CLI.
+    # Run identity and confirmation seed are the only CLI overrides; recipes stay in YAML.
     for arg in sys.argv[2:]:
         key, _, value = arg.partition("=")
-        if key != "output_dir":
-            raise ValueError(f"unsupported override {arg!r}; only output_dir=<path> is supported")
-        cfg["project"]["output_dir"] = os.path.expandvars(value)
+        if key == "output_dir":
+            cfg["project"]["output_dir"] = os.path.expandvars(value)
+        elif key == "seed":
+            cfg["train"]["seed"] = int(value)
+        else:
+            raise ValueError(f"unsupported override {arg!r}; use output_dir=<path> or seed=<int>")
     dataset_dir = Path(cfg["data"]["dataset_dir"])
     if not any(dataset_dir.glob("shard-*.parquet")):
         raise FileNotFoundError(
@@ -169,7 +171,7 @@ def _axis_dist(pos, t, grid, side):
 #
 # Context: one contiguous side x side window at a random per-sample offset. The student encoder sees
 # exactly these V = side**2 patches, so V is constant and the gather stays rectangular. Ascending order
-# preserves the grid-order invariant on x_norm_patchtokens.
+# preserves the grid-order invariant on `patches`.
 #
 # Targets: k patches drawn without replacement from outside the window, so every target is unseen and
 # none is solvable by copying a visible token. Weights are exp(-decay * d) with d the Chebyshev distance
@@ -274,7 +276,7 @@ def main():
     torch.backends.cuda.matmul.allow_tf32 = True
     torch.backends.cudnn.allow_tf32 = True
     variant = cfg["model"]["type"]
-    student_backbone = load_dinov2_pretrained(SpecializedDinoV2ViT(variant=variant, drop_path_rate=dino_cfg["drop_path_rate"], qkv_blocks=cfg["model"]["qkv_blocks"])).to(device)
+    student_backbone = load_pretrained(SpecializedViT(variant=variant, drop_path_rate=dino_cfg["drop_path_rate"], qkv_blocks=cfg["model"]["qkv_blocks"])).to(device)
     # Set before the teacher is copied and before any checkpoint is written: probe.py reads this off the
     # state dict, so the choice must be baked in by save time.
     student_backbone.set_probe_layers(cfg["model"].get("probe_layers") or [4, 6, 8, 11])
@@ -339,12 +341,12 @@ def main():
     # Reported against the between-image cosine, because a collapsed representation is trivially "invariant"
     # -- the margin is the fraction of the available spread that the augmentation does NOT destroy.
     def augmentation_sensitivity(x):
-        z = F.normalize(teacher_backbone(x)["x_norm_clstoken"].float(), dim=-1)
+        z = F.normalize(teacher_backbone(x)["cls"].float(), dim=-1)
         g = z @ z.T
         inter = float((g.sum() - g.diagonal().sum()) / (g.shape[0] * (g.shape[0] - 1)))
         out = {"inter_cos": inter}
         for name, xp in (("stain", jitter_view(x, float(cfg["data"]["hed_jitter"]))), ("rot90", torch.rot90(x, 1, (-2, -1)))):
-            zp = F.normalize(teacher_backbone(xp)["x_norm_clstoken"].float(), dim=-1)
+            zp = F.normalize(teacher_backbone(xp)["cls"].float(), dim=-1)
             cos = float((z * zp).sum(-1).mean())
             out[f"aug_cos_{name}"] = cos
             out[f"aug_margin_{name}"] = (cos - inter) / max(1e-6, 1.0 - inter)
@@ -433,6 +435,7 @@ def main():
     print(
         f"{console_prefix()} Run  start: {wandb_name}  "
         f"config: {cfg['config_path']}  batch_size: {batch_size}  max_train_samples: {max_train_samples}  "
+        f"seed: {train_cfg['seed']}  "
         f"max_train_flops: {train_cfg['max_train_flops']}  "
         f"probe_count: {cfg['probe']['count']}  warmup_fraction: {dino_cfg['warmup_fraction']}  "
         f"lr: {dino_cfg['lr']}  adam_beta2: {dino_cfg['adam_beta2']}  kde_loss_weight: {dino_cfg['kde_loss_weight']}  "
@@ -554,8 +557,8 @@ def main():
             # Sinkhorn centres over all gv*b teacher rows at once, per factor. Prototype count per factor
             # sets how thin that statistic is: gv*b rows spread over n_prototypes bins, not over the joint
             # n_prototypes**n_factors code space, which is the point of factorising.
-            t_prob = sinkhorn(teacher_dino_head(t["x_norm_clstoken"]), t_temp).view(gv, b, n_factors, -1)
-        tp = F.layer_norm(t["x_norm_patchtokens"], (student_backbone.embed_dim,))
+            t_prob = sinkhorn(teacher_dino_head(t["cls"]), t_temp).view(gv, b, n_factors, -1)
+        tp = F.layer_norm(t["patches"], (student_backbone.embed_dim,))
         # Cross-view target: view v is aligned against view w != v, rolled by one so gv=2 is the swap pair.
         # Normalised MSE (= 2 - 2cos) against the detached teacher, so this is a direct feature-space
         # invariance term rather than the weaker agreement-on-prototypes the DINO head asks for.
@@ -564,7 +567,7 @@ def main():
         for (_, r), ki, mi in zip(context_regions, keep_idx, mask_idx):
             sv = gf.repeat(r, 1, 1, 1)
             sg = student_backbone(jitter_view(sv) if view_jitter else sv, keep_idx=ki, checkpoint=ckpt, align_from=align_from)
-            cls_tokens.append(sg["x_norm_clstoken"])
+            cls_tokens.append(sg["cls"])
             if align_from is not None:
                 # 2 - 2cos, summed over the feature axis rather than averaged: same geometry as a normalised
                 # MSE but O(1), so align_weight means the same thing at any embed_dim.
@@ -574,7 +577,7 @@ def main():
             # Gathering per region chunk keeps the teacher features unduplicated: only the (2b*r, K, D)
             # result is materialised, not r copies of the (2b, 256, D) source.
             target = torch.cat([tp.gather(1, m[..., None].expand(-1, -1, tp.shape[-1])) for m in mi.chunk(r)])
-            pred = student_predictor(sg["x_norm_patchtokens"], mi, None if cond is None else cond.repeat(gv * r))
+            pred = student_predictor(sg["patches"], mi, None if cond is None else cond.repeat(gv * r))
             jepa_terms.append(r * F.smooth_l1_loss(pred, target))
         cls_all = torch.cat(cls_tokens)  # (gv*b * total_r, D), scale-major
         sg_cls = student_dino_head(cls_all)
@@ -597,7 +600,7 @@ def main():
         # teacher pairs -- at total_r=1 that is exactly the 1/(2L+2) multi-crop normalisation.
         # Locals feed DINO only: KDE and FINO stay on the region CLS rows they are calibrated for.
         if n_local:
-            sl_cls = student_dino_head(student_backbone(lf, checkpoint=ckpt)["x_norm_clstoken"])
+            sl_cls = student_dino_head(student_backbone(lf, checkpoint=ckpt)["cls"])
             ls = F.log_softmax(sl_cls.view(n_local, b, n_factors, -1) / student_temp, dim=-1)
             local_loss = sum(-(t_prob[w] * ls[v]).sum((-2, -1)).mean() for v in range(n_local) for w in range(gv)) / (n_local * gv)
             n_gpairs, n_lpairs = total_r * gv * (gv - 1), n_local * gv
@@ -624,7 +627,7 @@ def main():
         if meta is not None:
             gamma, md, mc = meta  # md (B,n_disc) int64 (-1 missing); mc {factor: (B,dim) float, nan missing}
             phi_s = F.normalize(cls_all.float(), dim=-1)
-            phi_t = F.normalize(t["x_norm_clstoken"].float(), dim=-1)
+            phi_t = F.normalize(t["cls"].float(), dim=-1)
             terms = []  # (factor, per-branch loss 0.03*L_t); combined below, optionally gradient-equalized
             with torch.autocast(device_type="cuda", enabled=False):
                 for j, (f, sign) in enumerate(fino_disc):
@@ -958,6 +961,8 @@ def main():
         "family": cfg["project"]["family"],
         "recipe_id": cfg["project"]["recipe_id"],
         "config_path": cfg["config_path"],
+        "train_seed": int(train_cfg["seed"]),
+        "data_split_seed": int(cfg["data"]["split_seed"]),
         "wandb": wandb_meta,
         "slurm_job_id": slurm_job_id,
         "backbone_activated_params": backbone_activated_params,
@@ -978,8 +983,8 @@ def main():
         "visible_patches_per_sec": visible_patch_presentations / max(1.0, train_loop_wall_seconds),
         "warmup_fraction": dino_cfg["warmup_fraction"],
         "warmup_train_samples": warmup_train_samples,
-        "lr": peak_lr,
-        "lr_config": dino_cfg["lr"],
+        "lr": dino_cfg["lr"],
+        "lr_peak": peak_lr,
         "lr_scale": lr_scale,
         "lr_ref_batch_size": lr_ref_bs,
         "adam_beta2": dino_cfg["adam_beta2"],
@@ -1003,17 +1008,17 @@ def main():
         "probe_target_fractions": [None if max_train_samples == 0 else target / max_train_samples for target in probe_targets],
         **({} if probe_state is None else completed_probe_summary(output_dir)),
     }
-    if probe_state is not None and "final_probe_score" not in summary:
-        raise ValueError("probe.enabled is true but final_probe_score is missing; check probe.count, probe failures, and final checkpoint scheduling")
+    if probe_state is not None and "final_score" not in summary:
+        raise ValueError("probe.enabled is true but final_score is missing; check probe.count, probe failures, and final checkpoint scheduling")
     summary_path.write_text(json.dumps(summary, indent=2) + "\n")
     print(
         f"{console_prefix()} Summary  "
         f"steps: {step}  train_wall: {train_loop_wall_seconds:.2f}s  "
-        f"final_probe_score: {summary.get('final_probe_score')}",
+        f"final_score: {summary.get('final_score')}",
         flush=True,
     )
-    for key in summary.keys():
-        wandb_run.summary[key] = summary[key]
+    for key, value in summary.items():
+        wandb_run.summary[key] = value
     wandb_run.finish()
     finish_labless_autosubmit(labless_autosubmit_file, output_dir, repo_dir)
 

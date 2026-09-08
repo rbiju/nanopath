@@ -8,7 +8,7 @@ after training, while direct runs can still be submitted with one command.
 RUN_DIR=$PWD/data/main/my-run
 ./labless/submit_to_labless.py output_dir=$RUN_DIR \
     run_name=kde-crops \
-    notes="what changed and why"
+    notes="vs main: larger local crops to retain tissue context"
 ```
 
 ## What the submit script does
@@ -17,7 +17,7 @@ RUN_DIR=$PWD/data/main/my-run
 `train.py` finishes. It:
 
 1. Reads `summary.json` and `metrics.jsonl` from `output_dir`.
-2. Extracts the final `mean_probe_score` and probe submetrics.
+2. Extracts `final_score` plus diagnostic probe metrics.
 3. Uses the local `output_dir/labless_source` snapshot written by `train.py` and
    diffs that source against the current main commit for `train.py`, `model.py`,
    `dataloader.py`, `prepare.py`, and the config YAML used by the run.
@@ -25,8 +25,8 @@ RUN_DIR=$PWD/data/main/my-run
    path list from the saved source snapshot.
 5. Writes the submission payload to `output_dir/labless_submission.json`.
 6. Opens GitHub's device sign-in flow, or uses the preauthorized token file
-   written by `submit/train_1gpu.sbatch`, and posts it to
-   `https://api.labless.dev/api/nano-projects/nanopath/submissions`.
+   written by `submit/train_1gpu.sbatch`, and posts it to the Labless nanopath
+   project.
 
 The labless backend stores the submission as a run with saved source context and
 an optional W&B run link. It derives the public contributor from the verified
@@ -45,8 +45,8 @@ RUN_DIR=$PWD/data/main/my-run
 ```
 
 For configs with `max_train_samples=1000000`, `max_train_flops=1e18`, and
-probes enabled, the launcher asks for a Labless run name, notes, and GitHub
-device sign-in before scheduling the GPU job. If any prompt is skipped or login
+probes enabled, the launcher asks for a Labless run name, optional experiment
+note, and GitHub device sign-in before scheduling the GPU job. If the run name is skipped or login
 does not complete, the job still trains but does not auto-submit. Plain
 `sbatch submit/train_1gpu.sbatch ...` also trains without auto-submit because
 there is no interactive prompt before scheduling.
@@ -64,7 +64,7 @@ Then point the submit script at the same run directory:
 ./labless/submit_to_labless.py \
     output_dir=$RUN_DIR \
     run_name=kde-crops \
-    notes="changed the crop schedule and kept all probe paths untouched"
+    notes="vs main: larger local crops to retain tissue context"
 ```
 
 Completed submissions require both `summary.json` and `metrics.jsonl`. The run
@@ -72,8 +72,9 @@ is shown as `unvalidated` until the organizer validates it. A copied config such
 `configs/new_config.yaml` is accepted if the completed `summary.json` reports
 `max_train_samples: 1000000`, `tile_presentations <= 1000000`, and
 `max_train_flops: 1e18`; short local configs are rejected even if they are not named smoke.
-Use the same config you prepared and trained with; off the MedARC cluster, copy
-the config and point its data paths at writable local storage before training.
+Use the same config you prepared and trained with. The 12-task THUNDER
+classification panel, PanNuke plus two-task SegPath panel, and canonical
+train/validation roots are locked together.
 Smoke runs are local setup checks only and are not accepted by labless.
 
 ## Submit a baseline/reference run
@@ -89,10 +90,11 @@ python baselines/dinov2_small_baseline.py configs/main.yaml
 ```
 
 The submit script detects `summary.family == "baseline"` and marks the run as
-`tier=baseline`. Labless currently tracks GenBio-PathFM plus DINOv2 giant and
-small references; other nanopath baselines, including the separate Virchow and
-GigaPath scripts, can stay in the repo README without becoming Labless reference
-rows. The nanopath leaderboard still ranks validated completed full runs by score.
+`tier=baseline`. Labless uses UNI-2-h and Virchow as pathology references;
+DINOv2 giant, large, and small provide natural-image references. Other baselines,
+including GigaPath, can stay in the repo README without becoming Labless
+reference rows. The nanopath leaderboard still ranks validated completed full
+runs by score.
 
 ## Useful options
 
@@ -102,7 +104,7 @@ Arguments are `key=value`; there is no `argparse`.
 |---|---|
 | `output_dir` | Required run directory. |
 | `run_name` | Short plot label, 20 characters or fewer. |
-| `notes` | Short explanation of what changed and why. |
+| `notes` | Starting recipe, main change, and why it might affect probes. |
 | `wandb_url` | Optional W&B run URL for linking the external dashboard; private or unlisted W&B URLs are accepted because labless only validates URL shape. |
 | `tier` | `full` or `baseline`; inferred when omitted. |
 | `hardware` | Override detected hardware string. |
@@ -143,9 +145,9 @@ may be online or offline because source review never depends on the W&B API.
 The payload intentionally makes the run inspectable. It includes:
 
 - verified GitHub login and notes
-- final metric and public probe submetrics: `linear`, `knn`, `few_shot`,
-  `seg_jaccard`, `progression_auc`, `mutation_auc`, `survival_cindex`, and
-  `robustness`
+- final metric and canonical family metrics:
+  `classification_mean_f1`, `seg_mean_f1`, `slide_mean_auc`, `auc_mean`,
+  `survival_mean_cindex`, and `robustness_mean`, plus CRoMa diagnostic cells
 - run family, recipe id, and tier (`baseline` for frozen reference scripts)
 - source snapshot id, optional git remote, commit, full changed source path list,
   changed review files, and a capped review-file snapshot for server-built diffs
@@ -153,12 +155,16 @@ The payload intentionally makes the run inspectable. It includes:
 - W&B run URL
 
 The public API redacts local machine paths, hostnames, users, repo roots, and
-local artifact paths from legacy and new rows.
+local artifact paths from submitted rows.
+
+The final score weights classification, segmentation, progression, mutation,
+survival, and CRoMa robustness at 30%, 15%, 17.5%, 15%, 7.5%, and 15%.
+Labless rejects scores that do not match those submitted components.
 
 Agents can crawl the public experiment ledger directly with the JSON API:
 
 ```bash
-curl -fsS "https://api.labless.dev/api/nano-projects/nanopath/experiment-log?limit=100" \
+curl -fsS "https://api.labless.dev/api/nano-projects/nanopath-v2/experiment-log?limit=100" \
   | jq '.runs[] | {run_id, title, validation, metric_value, summary}'
 ```
 
@@ -179,9 +185,17 @@ and raw data are not posted.
 
 ## Maintainer validation
 
-New completed full runs appear on the plot as `unvalidated`. A maintainer can
-replicate a promising run, then mark it `validated` in labless. The public
-leader label is the highest scoring validated run. Maintainers mark a separate
-`main` state with the full git commit pushed to the project repo, so the submit
-script can diff the saved source snapshot directly against current main.
-Failed runs are not accepted as public submissions.
+New completed full runs appear as `unvalidated`. A maintainer reruns promising
+candidates three times with different randomly selected training seeds. The
+median run becomes validated leader if it beats the incumbent by at least
+0.004; `robust-norm-s9876` is the approved exception. Maintainers separately
+mark the run whose commit is on `main`. Failed runs are not accepted.
+
+Historical v2 runs without retained weights are marked as estimates. Their
+robustness is the original quality-adjusted value minus 0.3063356348369218, the
+mean difference measured on the six plotted nanopath checkpoints (SD 0.01637).
+The five predictive components are unchanged and the new six-family weights
+are applied. Estimated points are labeled with ≈ and cannot establish a leader.
+New submissions must provide measured `croma_mean` and satisfy
+`robustness_mean == (1 + croma_mean) / 2`; historical estimates are a maintainer
+migration exception. Original scores remain available in each run's metrics.
