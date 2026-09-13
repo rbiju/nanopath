@@ -6,7 +6,7 @@
 # a strict load.
 #
 # DINOHead is the small MLP + weight-normed classifier used by train.py for the
-# DINO CLS / iBOT patch self-distillation losses. It is intentionally trivial
+# DINO CLS self-distillation loss. It is intentionally trivial
 # (~15 lines) so we have zero runtime dependency on the dinov2 codebase.
 
 import torch
@@ -142,7 +142,7 @@ class ViT(nn.Module):
         patch_pos = patch_pos.permute(0, 2, 3, 1).reshape(1, h * w, -1).to(self.pos_embed.dtype)
         return torch.cat([cls_pos, patch_pos], dim=1) if cls_pos is not None else patch_pos
 
-    # Build [cls, registers, patches] tokens; iBOT swaps the masked patch positions for mask_token.
+    # Build [cls, registers, patches]; masked objectives swap selected patches for mask_token.
     def _prepare_tokens(self, x, masks=None):
         B, _, H, W = x.shape
         h, w = H // self.patch_size, W // self.patch_size
@@ -212,3 +212,20 @@ class DINOHead(nn.Module):
         x = self.mlp(x)
         x = F.normalize(x, dim=-1, p=2)
         return self.last_layer(x)
+
+
+# I-JEPA predicts EMA-teacher patch features from the student's block-masked tokens.
+class JEPAPredictor(nn.Module):
+    def __init__(self, dim, depth=4, width=0, heads=6):
+        super().__init__()
+        width = width or dim
+        self.proj_in = nn.Linear(dim, width) if width != dim else nn.Identity()
+        self.blocks = nn.ModuleList(Block(width, heads, 4.0, 0.0) for _ in range(depth))
+        self.norm = nn.LayerNorm(width, eps=1e-6)
+        self.proj = nn.Linear(width, dim, bias=True)
+
+    def forward(self, patch_tokens):
+        x = self.proj_in(patch_tokens)
+        for block in self.blocks:
+            x = block(x)
+        return self.proj(self.norm(x))
