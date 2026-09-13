@@ -142,8 +142,13 @@ class ViT(nn.Module):
         patch_pos = patch_pos.permute(0, 2, 3, 1).reshape(1, h * w, -1).to(self.pos_embed.dtype)
         return torch.cat([cls_pos, patch_pos], dim=1) if cls_pos is not None else patch_pos
 
-    # Build [cls, registers, patches]; masked objectives swap selected patches for mask_token.
-    def _prepare_tokens(self, x, masks=None):
+    # Patch-only positional embeddings (1, h*w, dim), shared with the cross JEPA predictor's queries.
+    def patch_pos_embed(self, h, w):
+        return self._interpolate_pos_embed(h, w)[:, int(self._pos_has_cls):]
+
+    # Build [cls, registers, patches]; `masks` swaps selected patches for mask_token, `keep_idx` (B, V) drops
+    # every other patch after the pos embed so kept tokens retain their true grid positions.
+    def _prepare_tokens(self, x, masks=None, keep_idx=None):
         B, _, H, W = x.shape
         h, w = H // self.patch_size, W // self.patch_size
         x = self.patch_embed.proj(x).flatten(2).transpose(1, 2)
@@ -153,14 +158,18 @@ class ViT(nn.Module):
         regs = self.register_tokens.expand(B, -1, -1)
         if self._pos_has_cls:
             x = torch.cat([cls, x], dim=1) + self._interpolate_pos_embed(h, w)
-            return torch.cat([x[:, :1], regs, x[:, 1:]], dim=1)
-        return torch.cat([cls, regs, x + self._interpolate_pos_embed(h, w)], dim=1)
+            cls, x = x[:, :1], x[:, 1:]
+        else:
+            x = x + self._interpolate_pos_embed(h, w)
+        if keep_idx is not None:
+            x = x.gather(1, keep_idx[..., None].expand(-1, -1, x.shape[-1]))
+        return torch.cat([cls, regs, x], dim=1)
 
-    # Return semantic token groups used by train.py and probe.py.
+    # Return semantic token groups used by train.py and probe.py; with `keep_idx`, `patches` holds only kept patches.
     # `checkpoint=True` re-runs each block under torch.utils.checkpoint to trade compute for memory;
     # useful when the 1-GPU batch of 128 (2 globals + 8 locals) does not fit in 80 GB.
-    def forward(self, x, masks=None, checkpoint=False):
-        x = self._prepare_tokens(x, masks)
+    def forward(self, x, masks=None, checkpoint=False, keep_idx=None):
+        x = self._prepare_tokens(x, masks, keep_idx)
         for blk in self.blocks:
             if checkpoint and self.training:
                 x = torch.utils.checkpoint.checkpoint(blk, x, use_reentrant=False)
@@ -229,3 +238,39 @@ class JEPAPredictor(nn.Module):
         for block in self.blocks:
             x = block(x)
         return self.proj(self.norm(x))
+
+
+# Pre-LN cross-attention block: queries read only the fixed visible context, never each other.
+class CrossBlock(nn.Module):
+    def __init__(self, dim, heads, mlp_ratio=4.0):
+        super().__init__()
+        hidden = int(dim * mlp_ratio)
+        self.heads = heads
+        self.norm1, self.norm_ctx, self.norm2 = (nn.LayerNorm(dim, eps=1e-6) for _ in range(3))
+        self.q, self.kv, self.proj = nn.Linear(dim, dim), nn.Linear(dim, dim * 2), nn.Linear(dim, dim)
+        self.fc1, self.fc2 = nn.Linear(dim, hidden), nn.Linear(hidden, dim)
+
+    def forward(self, x, ctx):
+        B, N, C = x.shape
+        q = self.q(self.norm1(x)).reshape(B, N, self.heads, C // self.heads).transpose(1, 2)
+        k, v = self.kv(self.norm_ctx(ctx)).reshape(B, ctx.shape[1], 2, self.heads, C // self.heads).permute(2, 0, 3, 1, 4).unbind(0)
+        attn = F.scaled_dot_product_attention(q, k, v).transpose(1, 2).reshape(B, N, C)
+        x = x + self.proj(attn)
+        return x + self.fc2(F.gelu(self.fc1(self.norm2(x))))
+
+
+# CrossMAE-style I-JEPA predictor: caller-built target queries cross-attend to the encoded [cls, registers, visible] context.
+class CrossJEPAPredictor(nn.Module):
+    def __init__(self, dim, depth=4, width=0, heads=6):
+        super().__init__()
+        width = width or dim
+        self.proj_in = nn.Linear(dim, width) if width != dim else nn.Identity()
+        self.blocks = nn.ModuleList(CrossBlock(width, heads) for _ in range(depth))
+        self.norm = nn.LayerNorm(width, eps=1e-6)
+        self.proj = nn.Linear(width, dim, bias=True)
+
+    def forward(self, context, queries):
+        ctx, q = self.proj_in(context), self.proj_in(queries)
+        for block in self.blocks:
+            q = block(q, ctx)
+        return self.proj(self.norm(q))

@@ -1,8 +1,8 @@
 project:
-  name: main-dinov2
+  name: xarch-baseline
   family: nanopath
-  recipe_id: dinov2-vits14-reg-kde
-  output_dir: /data/$USER/nanopath/main/default
+  recipe_id: xarch-baseline
+  output_dir: /data/$USER/nanopath/20260913-xarch-baseline
   wandb_dir: /data/$USER/nanopath/wandb
 
 data:
@@ -61,11 +61,13 @@ dino:
   clip_grad: 3.0
   kde_loss_weight: 0.005
   kde_concentration: 10.0
-  # Contiguous block masking and the predictor for I-JEPA patch regression.
-  jepa_pred_depth: 4
-  jepa_pred_width: 0
-  jepa_blocks: 4
-  jepa_block_scale: 0.1
+  # I-JEPA patch regression; `type` selects masking + predictor, and train.py documents each type's keys.
+  jepa:
+    type: block
+    depth: 4
+    width: 0
+    blocks: 4
+    block_scale: 0.1
 
 probe:
   enabled: true

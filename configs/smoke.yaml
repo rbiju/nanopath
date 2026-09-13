@@ -61,11 +61,13 @@ dino:
   clip_grad: 3.0
   kde_loss_weight: 0.002
   kde_concentration: 10.0
-  # Contiguous block masking and the predictor for I-JEPA patch regression.
-  jepa_pred_depth: 4
-  jepa_pred_width: 0
-  jepa_blocks: 4
-  jepa_block_scale: 0.1
+  # I-JEPA patch regression; `type` selects masking + predictor, and train.py documents each type's keys.
+  jepa:
+    type: block
+    depth: 4
+    width: 0
+    blocks: 4
+    block_scale: 0.1
 
 probe:
   enabled: true
