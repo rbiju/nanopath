@@ -1,8 +1,8 @@
 project:
-  name: xajpf_f2_bs384_opt_visreg_mse
+  name: xajpf_f1_bs384_v2
   family: nanopath
-  recipe_id: xajpf_f2_bs384_opt_visreg_mse
-  output_dir: /data/$USER/nanopath/20260828-xajpf_f2_bs384_opt_visreg_mse
+  recipe_id: xajpf_f1_bs384_v2
+  output_dir: /data/$USER/nanopath/20260911-xajpf_f1_bs384_v2
   wandb_dir: /data/$USER/nanopath/wandb
 data:
   dataset_dir: /data/nanopath_parquet
@@ -24,7 +24,7 @@ data:
   - 0.35
   color_jitter: 0.3
   color_jitter_saturation: 0.30
-  hed_jitter: 0.01
+  hed_jitter: 0.07
   tissue_thresh: 0.0
 model:
   type: dinov2_vits14_reg
@@ -46,15 +46,18 @@ train:
   val_batches: 16
   global_views: 2
   local_views: 0 # real multi-crop: 112px resampled crops, the magnification that context_regions cannot give
+  masking: region # region = context window, tokens dropped (this branch) | block = iBOT mask_token over the full grid
+  mask_blocks: 4 # masking: block only -- squares stamped per sample
+  mask_scale: 0.10 # masking: block only -- target coverage fraction; side = round(grid * sqrt(this))
   context_regions: # [[side, count], ...]: `count` independent context regions of `side` patches sampled per global view
-    - [12, 1]
-    - [8, 2]
-    - [4, 2]
+    - [8, 4]
+    - [6, 2]
   global_size: 224
   local_size: 112
   resume: null
 dino:
   reg_key: sample
+  lr_key: sample
   lr: 0.000125
   lr_min: 1.0e-06
   lr_ref_batch_size: 128 # lr and lr_min scale linearly by batch_size / this; null disables
@@ -67,7 +70,7 @@ dino:
   drop_path_rate: 0.1
   head_hidden_dim: 2048
   head_bottleneck_dim: 384 # split evenly across head_factors, so it must divide by it
-  head_factors: 2 # codebooks the bottleneck is cut into; 1 = single-head behaviour
+  head_factors: 1 # codebooks the bottleneck is cut into; 1 = single-head behaviour
   head_prototypes: 768 
   prototype_reg: # keys other than `kind` are the regularizer's constructor arguments
     kind: none # none | coding_rate | swd
@@ -75,22 +78,24 @@ dino:
     # coding_rate: eps
     # swd: projections, scale_weight, shape_weight, center_weight
   cls_vis_reg: # VISReg on a FIFO queue of CLS embeddings; keys are QueuedVISReg's constructor arguments
-    weight: 0.3 # 0 disables, and the queue is not even allocated
+    weight: 0.0 # 0 disables, and the queue is not even allocated
     queue_size: 4096 # total samples the statistic sees = queue_size + batch_size
     num_projections: 128
     scale_weight: 1.0
     shape_weight: 1.0
     center_weight: 1.0
   align_from_layer: 6 # null disables; N aligns student/teacher CLS from block N to the last (0-based)
-  align_weight: 0.1 # cross-view 2-2cos alignment on those CLS tokens; raw term is ~2 at zero agreement
+  align_weight: 0.0 # cross-view 2-2cos alignment on those CLS tokens; raw term is ~2 at zero agreement
   clip_grad: 3.0
   kde_loss_weight: 0.005  # disabled when cls_vis_reg is enabled
   kde_concentration: 10.0
+  jepa_predictor: cross # cross = CrossMAE, queries see only visible ctx | self = MAE decoder, queries also see each other
+  jepa_weight: 1.0 # scales the JEPA term; raw smooth_l1 sits near 0.2 against a DINO term near 10
   jepa_pred_depth: 4
   jepa_pred_width: 0
   jepa_targets: 48 # patches sampled without replacement from outside the context
-  jepa_target_decay: 0.0 # e-folds of preference across the available depth: 0 uniform, >0 hugs the context, <0 goes deep
-  jepa_target_decay_end: 0.0
+  jepa_target_decay: -0.5 # e-folds of preference across the available depth: 0 uniform, >0 hugs the context, <0 goes deep
+  jepa_target_decay_end: -0.5
   student_view_jitter: 0.02
   freeze_backbone_fraction: 0.0
 probe:

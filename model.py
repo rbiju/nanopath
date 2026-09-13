@@ -155,16 +155,19 @@ class ViT(nn.Module):
         patch_pos = patch_pos.permute(0, 2, 3, 1).reshape(1, h * w, -1).to(self.pos_embed.dtype)
         return torch.cat([cls_pos, patch_pos], dim=1) if cls_pos is not None else patch_pos
 
-    # Build [cls, registers, patches] tokens. `keep_idx` (B, V) selects which patch positions survive:
-    # MAE-style, masked patches are dropped before the blocks rather than replaced by a mask token, so
-    # the encoder never spends compute on them. Positional embeddings are added BEFORE the gather, so the
-    # surviving tokens carry their true grid positions and absence is what marks a hole.
-    # `mask_token` is consequently unused (it stays only because Meta's checkpoint carries it and
-    # load_pretrained is a strict load); it gets no gradient and AdamW skips it.
-    def _prepare_tokens(self, x, keep_idx=None):
+    # Build [cls, registers, patches] tokens. The two masking protocols are mutually exclusive:
+    # `keep_idx` (B, V) is MAE-style -- masked patches are DROPPED before the blocks, so the encoder never
+    # spends compute on them and absence is what marks a hole. Positional embeddings are added before the
+    # gather, so surviving tokens keep their true grid positions.
+    # `masks` (B, N) bool is iBOT-style -- masked patches stay in the sequence but their content is replaced
+    # by `mask_token`, substituted before the pos embed so a masked slot is mask_token + its own position.
+    # The encoder runs over the full grid and its output has a row for every patch, masked ones included.
+    def _prepare_tokens(self, x, keep_idx=None, masks=None):
         B, _, H, W = x.shape
         h, w = H // self.patch_size, W // self.patch_size
         x = self.patch_embed.proj(x).flatten(2).transpose(1, 2)
+        if masks is not None:
+            x = torch.where(masks.unsqueeze(-1), self.mask_token.to(x.dtype).expand_as(x), x)
         pos = self._interpolate_pos_embed(h, w)
         cls_pos, patch_pos = (pos[:, :1], pos[:, 1:]) if self._pos_has_cls else (0.0, pos)
         x = x + patch_pos
@@ -179,8 +182,8 @@ class ViT(nn.Module):
     # useful when the 1-GPU batch of 128 (2 globals + 8 locals) does not fit in 80 GB.
     # align_from: also return the normed CLS of every block from that index on, as (N, L, D), for the
     # cross-view feature-alignment term. LayerNorm is per token, so norming CLS alone matches norm(x)[:, 0].
-    def forward(self, x, keep_idx=None, checkpoint=False, align_from=None):
-        x = self._prepare_tokens(x, keep_idx)
+    def forward(self, x, keep_idx=None, checkpoint=False, align_from=None, masks=None):
+        x = self._prepare_tokens(x, keep_idx, masks)
         cls_layers = []
         for i, blk in enumerate(self.blocks):
             if checkpoint and self.training:
@@ -508,3 +511,51 @@ class JEPAPredictor(nn.Module):
         for blk in self.blocks:
             q = blk(q, ctx)
         return self.proj(self.norm(q))
+
+
+# MAE-decoder predictor: the same job as JEPAPredictor but with ordinary self-attention, so masked queries
+# CAN pool each other's guesses. Swapping this against JEPAPredictor with everything else held fixed is the
+# controlled test of whether removing that pathway (CrossMAE) is what helps.
+# Two input shapes, matching the two masking protocols:
+#   mask_idx given  -- `tokens` is the visible subset; K queries are built here and self-attention runs over
+#                      the concatenation, so queries see the context AND each other. Returns the K queries.
+#                      Only these fresh queries need `pos`; they have no other handle on which patch they are.
+#   mask_idx None   -- `tokens` is the full grid whose masked slots already carry mask_token (iBOT); plain
+#                      self-attention over it, returning every row for the caller to gather. No pos is added:
+#                      the rows already carry position from the backbone, so `pos` goes unused in this mode.
+class SelfJEPAPredictor(nn.Module):
+    def __init__(self, dim, n_pos, depth=4, width=0, heads=6, n_cond=0):
+        super().__init__()
+        width = width or dim
+        self.proj_in = nn.Linear(dim, width) if width != dim else nn.Identity()
+        self.cond_emb = nn.Embedding(n_cond + 1, width) if n_cond else None
+        self.query = nn.Parameter(torch.zeros(1, 1, width))
+        self.pos = nn.Parameter(torch.zeros(1, n_pos, width))
+        nn.init.trunc_normal_(self.query, std=0.02)
+        nn.init.trunc_normal_(self.pos, std=0.02)
+        self.blocks = nn.ModuleList(Block(width, heads, 4.0, 0.0) for _ in range(depth))
+        self.norm = nn.LayerNorm(width, eps=1e-6)
+        self.proj = nn.Linear(width, dim, bias=True)
+
+    def forward(self, tokens, mask_idx=None, cond=None):
+        x = self.proj_in(tokens)
+        k = 0
+        if mask_idx is not None:
+            k = mask_idx.shape[1]
+            q = self.query + self.pos.expand(x.shape[0], -1, -1).gather(1, mask_idx[..., None].expand(-1, -1, x.shape[-1]))
+            x = torch.cat([x, q], dim=1)
+        if self.cond_emb is not None and cond is not None:
+            x = x + self.cond_emb(cond + 1).unsqueeze(1)
+        for blk in self.blocks:
+            x = blk(x)
+        x = self.proj(self.norm(x))
+        return x[:, -k:] if k else x
+
+
+JEPA_PREDICTORS = {"cross": JEPAPredictor, "self": SelfJEPAPredictor}
+
+
+def make_jepa_predictor(kind, *args, **kwargs):
+    if kind not in JEPA_PREDICTORS:
+        raise ValueError(f"unknown dino.jepa_predictor={kind!r}; expected one of {sorted(JEPA_PREDICTORS)}")
+    return JEPA_PREDICTORS[kind](*args, **kwargs)

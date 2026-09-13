@@ -41,7 +41,10 @@ train:
   eval_every: 50
   val_batches: 4
   global_views: 2
-  local_views: 4 # real multi-crop: 112px resampled crops, the magnification that context_regions cannot give
+  local_views: 0 # real multi-crop: 112px resampled crops, the magnification that context_regions cannot give
+  masking: region # region = context window, tokens dropped (this branch) | block = iBOT mask_token over the full grid
+  mask_blocks: 4 # masking: block only -- squares stamped per sample
+  mask_scale: 0.10 # masking: block only -- target coverage fraction; side = round(grid * sqrt(this))
   context_regions: # [[side, count], ...]: `count` context regions of `side` patches per global view
   - [12, 1] # near-complete view (56% of the 16x16 grid) -- keeps a global-to-global DINO term
   - [8, 1] # small view (25%) -- the local-to-global term
@@ -81,6 +84,8 @@ dino:
   clip_grad: 3.0
   kde_loss_weight: 0.005
   kde_concentration: 10.0
+  jepa_predictor: cross # cross = CrossMAE, queries see only visible ctx | self = MAE decoder, queries also see each other
+  jepa_weight: 1.0 # scales the JEPA term; raw smooth_l1 sits near 0.2 against a DINO term near 10
   jepa_pred_depth: 4
   jepa_pred_width: 0
   jepa_targets: 80 # patches sampled without replacement from outside the context; cap is 112 (256 - 12^2)

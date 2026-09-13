@@ -18,6 +18,7 @@ import subprocess
 import sys
 import time
 from copy import deepcopy
+from functools import partial
 from pathlib import Path
 
 import numpy as np
@@ -30,7 +31,7 @@ from torch.utils.data import DataLoader
 from torch.utils.flop_counter import FlopCounterMode
 
 from dataloader import IMAGE_SIZE, ParquetImageDataset, hed_jitter_batch
-from model import FactoredDINOHead, GradScale, JEPAPredictor, QueuedVISReg, SpecializedViT, load_pretrained, make_prototype_regularizer
+from model import FactoredDINOHead, GradScale, QueuedVISReg, SpecializedViT, ViT, load_pretrained, make_jepa_predictor, make_prototype_regularizer
 from probe import (
     completed_probe_summary,
     collect_probe_results,
@@ -195,6 +196,25 @@ def make_region_idx(batch, grid, device, side, k, decay):
     return keep, keys.topk(k, dim=-1, largest=False).indices  # (B, side**2), (B, k)
 
 
+# iBOT/data2vec block masking, the `masking: block` counterpart to make_region_idx. `n_blocks` squares of
+# side round(grid*sqrt(block_scale)) are stamped at uniform offsets and CLIPPED at the border, so blocks may
+# overlap and coverage is centre-biased -- both are properties of the original recipe, kept so this path
+# reproduces it rather than approximating it. The masked count therefore varies per sample, which is why the
+# loss carries 1/n_masked weights instead of a plain mean.
+# Returns (masks, idx, weights) flattened over the batch: `masks` (B, grid**2) bool drives mask_token
+# substitution in the encoder, `idx` indexes the flattened (B*grid**2) patch rows the loss is gathered at.
+def make_block_mask(batch, grid, device, n_blocks=4, block_scale=0.10):
+    side = max(1, round(grid * block_scale ** 0.5))
+    top, left = torch.randint(grid - side + 1, (2, batch, n_blocks, 1), device=device)
+    pos = torch.arange(side, device=device)
+    rows, cols = top + pos, left + pos  # (B, n_blocks, side)
+    flat = (rows[..., None] * grid + cols[..., None, :]).flatten(1)  # (B, n_blocks*side**2)
+    masks = torch.zeros(batch, grid * grid, dtype=torch.bool, device=device).scatter_(1, flat, True)
+    idx = masks.flatten().nonzero().flatten()
+    weights = (1 / masks.sum(-1).clamp(min=1)).unsqueeze(-1).expand_as(masks)[masks]
+    return masks, idx, weights
+
+
 # AdamW parameter groups with layer-wise LR decay on the backbone:
 # block i gets lr * layerwise_decay^(depth - 1 - i); patch_embed gets the deepest decay
 # multiplied by patch_embed_lr_mult; biases, norms, and token/positional embeddings (backbone
@@ -276,7 +296,12 @@ def main():
     torch.backends.cuda.matmul.allow_tf32 = True
     torch.backends.cudnn.allow_tf32 = True
     variant = cfg["model"]["type"]
-    student_backbone = load_pretrained(SpecializedViT(variant=variant, drop_path_rate=dino_cfg["drop_path_rate"], qkv_blocks=cfg["model"]["qkv_blocks"])).to(device)
+    # qkv_blocks: null builds a PLAIN ViT with no CLS/patch specialization anywhere -- the faithful baseline.
+    # Any integer (0 included) specializes LayerNorm/LayerScale in every block and splits qkv in the first N,
+    # so 0 is "norms only", not "off"; use null to turn the mechanism off entirely.
+    qkv_blocks = cfg["model"].get("qkv_blocks")
+    backbone_cls = ViT if qkv_blocks is None else partial(SpecializedViT, qkv_blocks=int(qkv_blocks))
+    student_backbone = load_pretrained(backbone_cls(variant=variant, drop_path_rate=dino_cfg["drop_path_rate"])).to(device)
     # Set before the teacher is copied and before any checkpoint is written: probe.py reads this off the
     # state dict, so the choice must be baked in by save time.
     student_backbone.set_probe_layers(cfg["model"].get("probe_layers") or [4, 6, 8, 11])
@@ -310,19 +335,35 @@ def main():
     teacher_dino_head = deepcopy(student_dino_head)
     global_grid = train_cfg["global_size"] // student_backbone.patch_size
     global_patches = global_grid ** 2
+    # Masking protocol. "region": the encoder sees only a context window (tokens dropped via keep_idx) and
+    # multi-crop is emulated by multi-scale context_regions. "block": the original iBOT recipe -- the encoder
+    # sees the full grid with masked slots replaced by mask_token, and multi-crop is real local_views crops.
+    # The two differ in what the encoder is shown, so context_regions/local_views mean different things in each.
+    masking = str(train_cfg.get("masking", "region"))
+    if masking not in {"region", "block"}:
+        raise ValueError(f"train.masking={masking!r} invalid: expected 'region' or 'block'")
     # Context-region scales: [[side, count], ...], `count` independent regions of that side sampled per
     # global view. Multi-crop emulated by index gathering; heterogeneous sides give the student both
     # near-complete and small views, so DINO keeps a global-to-global term alongside local-to-global.
-    context_regions = [(int(side), int(count)) for side, count in train_cfg["context_regions"]]
+    # Unused under masking: block, where the student always sees one full-grid view per global crop.
+    context_regions = [(int(side), int(count)) for side, count in train_cfg["context_regions"]] if masking == "region" else [(global_grid, 1)]
+    if not context_regions:
+        raise ValueError("train.context_regions is empty; it is required under masking: region and ignored under masking: block")
     for side, count in context_regions:
         if not 0 < side <= global_grid or count < 1:
             raise ValueError(f"train.context_regions entry [{side}, {count}] invalid: side must be in 1..{global_grid} (the {global_grid}x{global_grid} patch grid) and count >= 1")
     total_regions = sum(count for _, count in context_regions)
-    # Targets come from the complement, so the largest context sets the ceiling on k.
     jepa_targets = int(dino_cfg["jepa_targets"])
-    max_complement = global_patches - max(side ** 2 for side, _ in context_regions)
-    if not 0 < jepa_targets <= max_complement:
-        raise ValueError(f"dino.jepa_targets={jepa_targets} invalid: targets are drawn without replacement from outside the context, so it must be in 1..{max_complement} (the {global_patches}-patch grid minus the largest context region)")
+    if masking == "region":
+        # Targets come from the complement, so the largest context sets the ceiling on k.
+        max_complement = global_patches - max(side ** 2 for side, _ in context_regions)
+        if not 0 < jepa_targets <= max_complement:
+            raise ValueError(f"dino.jepa_targets={jepa_targets} invalid: targets are drawn without replacement from outside the context, so it must be in 1..{max_complement} (the {global_patches}-patch grid minus the largest context region)")
+    # Block masking sizes its own target set from the stamped blocks, so jepa_targets is inert there.
+    mask_blocks, mask_scale = int(train_cfg.get("mask_blocks", 4)), float(train_cfg.get("mask_scale", 0.10))
+    # JEPA term weight: the raw smooth_l1 sits near 0.2 against a DINO term near 10, so 1.0 leaves it at
+    # ~2% of the total. Scales the term only; it does not change what the predictor is asked to do.
+    jepa_weight = float(dino_cfg.get("jepa_weight", 1.0))
     # Target-depth curriculum: cosine from _decay to _decay_end over reg_frac, so it inherits reg_key.
     # Omitting the end value holds the decay constant, which keeps a fixed-lambda run config-identical.
     jepa_decay_start = float(dino_cfg["jepa_target_decay"])
@@ -352,14 +393,24 @@ def main():
             out[f"aug_margin_{name}"] = (cos - inter) / max(1e-6, 1.0 - inter)
         return out
 
-    # One (keep_idx, mask_idx) pair per scale; each is (b * global_views * count, ...). Separate forwards,
-    # since scales have different sequence lengths.
-    def make_region_indices(n_crops, decay):
-        pairs = [make_region_idx(n_crops * count, global_grid, device, side, jepa_targets, decay) for side, count in context_regions]
-        keep, mask = zip(*pairs)
-        return keep, mask
-    # n_pos sizes the predictor's query position table: one row per global-view patch position.
-    student_predictor = JEPAPredictor(student_backbone.embed_dim, global_patches, depth=int(dino_cfg["jepa_pred_depth"]), width=int(dino_cfg["jepa_pred_width"]), n_cond=(fino_meta["n"][jepa_cond] if jepa_cond else 0)).to(device)
+    # Per-step masking draw, shaped so compute_losses consumes both protocols through the same loop.
+    # region: one (keep_idx, mask_idx) pair per scale, each (b * global_views * count, ...) -- separate
+    #   forwards, since scales have different sequence lengths. No mask weights (K is fixed).
+    # block: a single group -- keep is None (the encoder sees everything), mask_idx is per-sample target
+    #   positions and mask_w their 1/n_masked weights, both derived from the same bool mask.
+    def make_masking(n_crops, decay):
+        if masking == "region":
+            keep, mask = zip(*[make_region_idx(n_crops * count, global_grid, device, side, jepa_targets, decay) for side, count in context_regions])
+            return keep, mask, (None,) * len(context_regions), None
+        masks, idx, weights = make_block_mask(n_crops, global_grid, device, mask_blocks, mask_scale)
+        return (None,), (idx,), (weights,), masks
+    # n_pos sizes the predictor's position table: one row per global-view patch position.
+    # "cross" needs a visible-only key/value set, which only the region protocol produces -- under block
+    # masking the encoder output still contains the masked slots, so there is nothing to cross-attend into.
+    predictor_kind = str(dino_cfg.get("jepa_predictor", "cross"))
+    if masking == "block" and predictor_kind == "cross":
+        raise ValueError("dino.jepa_predictor='cross' requires train.masking='region': block masking leaves masked tokens in the encoder output, so there is no visible-only context to attend into. Use masking=region to compare cross vs self.")
+    student_predictor = make_jepa_predictor(predictor_kind, student_backbone.embed_dim, global_patches, depth=int(dino_cfg["jepa_pred_depth"]), width=int(dino_cfg["jepa_pred_width"]), n_cond=(fino_meta["n"][jepa_cond] if jepa_cond else 0)).to(device)
     for p in teacher_dino_head.parameters():
         p.requires_grad = False
     backbone_activated_params = sum(p.numel() for p in student_backbone.parameters() if p.requires_grad)
@@ -550,7 +601,7 @@ def main():
     #
     # Teacher: the full global view, every patch -- 2b rows, one forward, shared by every scale below.
     # Student: context regions at several SCALES, `count` of each per global view, plus `lf` local crops.
-    def compute_losses(gf, lf, b, keep_idx, mask_idx, t_temp, k_scale, ckpt=False, meta=None, cond=None, enqueue=False):
+    def compute_losses(gf, lf, b, keep_idx, mask_idx, t_temp, k_scale, ckpt=False, meta=None, cond=None, enqueue=False, mask_w=None, masks=None):
         gv, total_r, n_local = train_cfg["global_views"], total_regions, train_cfg["local_views"]
         with torch.no_grad():
             t = teacher_backbone(gf, align_from=align_from)
@@ -564,21 +615,28 @@ def main():
         # invariance term rather than the weaker agreement-on-prototypes the DINO head asks for.
         t_align = F.normalize(t["cls_layers"], dim=-1).view(gv, b, -1, student_backbone.embed_dim).roll(1, dims=0).flatten(0, 1) if align_from is not None else None
         cls_tokens, jepa_terms, align_terms = [], [], []
-        for (_, r), ki, mi in zip(context_regions, keep_idx, mask_idx):
+        for (_, r), ki, mi, mw in zip(context_regions, keep_idx, mask_idx, mask_w):
             sv = gf.repeat(r, 1, 1, 1)
-            sg = student_backbone(jitter_view(sv) if view_jitter else sv, keep_idx=ki, checkpoint=ckpt, align_from=align_from)
+            sg = student_backbone(jitter_view(sv) if view_jitter else sv, keep_idx=ki, checkpoint=ckpt, align_from=align_from, masks=masks)
             cls_tokens.append(sg["cls"])
             if align_from is not None:
                 # 2 - 2cos, summed over the feature axis rather than averaged: same geometry as a normalised
                 # MSE but O(1), so align_weight means the same thing at any embed_dim.
                 cos = (F.normalize(sg["cls_layers"], dim=-1) * t_align.repeat(r, 1, 1)).sum(-1)
                 align_terms.append(r * (2 - 2 * cos).mean())
-            # K is fixed and every slot is a distinct unseen patch, so this is a plain mean.
-            # Gathering per region chunk keeps the teacher features unduplicated: only the (2b*r, K, D)
-            # result is materialised, not r copies of the (2b, 256, D) source.
-            target = torch.cat([tp.gather(1, m[..., None].expand(-1, -1, tp.shape[-1])) for m in mi.chunk(r)])
-            pred = student_predictor(sg["patches"], mi, None if cond is None else cond.repeat(gv * r))
-            jepa_terms.append(r * F.smooth_l1_loss(pred, target))
+            if mw is None:
+                # region: K is fixed and every slot is a distinct unseen patch, so this is a plain mean.
+                # Gathering per region chunk keeps the teacher features unduplicated: only the (2b*r, K, D)
+                # result is materialised, not r copies of the (2b, 256, D) source.
+                target = torch.cat([tp.gather(1, m[..., None].expand(-1, -1, tp.shape[-1])) for m in mi.chunk(r)])
+                pred = student_predictor(sg["patches"], mi, None if cond is None else cond.repeat(gv * r))
+                jepa_terms.append(r * F.smooth_l1_loss(pred, target))
+            else:
+                # block: mi indexes the flattened (gv*b*grid**2) rows, so predictor output and target are both
+                # flattened before the gather. Per-token mean then 1/n_masked weights, summed and divided by
+                # the crop count -- a per-sample mean over its own masked patches, as in the original recipe.
+                pred = student_predictor(sg["patches"], None, None if cond is None else cond.repeat(gv * r))
+                jepa_terms.append(F.smooth_l1_loss(pred.flatten(0, 1)[mi], tp.flatten(0, 1)[mi], reduction="none").mean(-1).mul(mw).sum() / max(1, b * gv))
         cls_all = torch.cat(cls_tokens)  # (gv*b * total_r, D), scale-major
         sg_cls = student_dino_head(cls_all)
 
@@ -607,7 +665,7 @@ def main():
             dino_loss = (n_gpairs * dino_loss + n_lpairs * local_loss) / (n_gpairs + n_lpairs)
         # Region-count weighted so the result is a plain mean over all regions regardless of how the
         # scales are split; identical to a flat mean when every scale has the same count.
-        jepa_loss = sum(jepa_terms) / total_r
+        jepa_loss = jepa_weight * sum(jepa_terms) / total_r
         # One KDE term per (region, view) group of b distinct images -- uniformity is only meaningful
         # across different images, never across regions of the same one. Averaged over regions so
         # kde_loss_weight keeps its calibrated meaning (a sum over global views) as the region count varies.
@@ -689,8 +747,8 @@ def main():
             b = vg.shape[0]
             with torch.no_grad(), autocast:
                 gf, lf = vg.transpose(0, 1).flatten(0, 1), vl.transpose(0, 1).flatten(0, 1)
-                keep_idx, mask_idx = make_region_indices(b * train_cfg["global_views"], eval_decay)
-                losses = compute_losses(gf, lf, b, keep_idx, mask_idx, eval_teacher_temp, eval_kde_scale)
+                keep_idx, mask_idx, mask_w, masks = make_masking(b * train_cfg["global_views"], eval_decay)
+                losses = compute_losses(gf, lf, b, keep_idx, mask_idx, eval_teacher_temp, eval_kde_scale, mask_w=mask_w, masks=masks)
             if vb_idx == 0:  # measured once, not averaged: one batch is plenty for a cosine mean over b images
                 with torch.no_grad(), autocast:
                     aug_stats = augmentation_sensitivity(vg[:, 0])
@@ -795,7 +853,7 @@ def main():
                 group["lr"] = base_lr * group["lr_mult"]
                 group["weight_decay"] = wd * group["wd_mult"]
             jepa_decay = cosine_schedule(jepa_decay_start, jepa_decay_end, reg_frac)
-            keep_idx, mask_idx = make_region_indices(batch_size * train_cfg["global_views"], jepa_decay)
+            keep_idx, mask_idx, mask_w, masks = make_masking(batch_size * train_cfg["global_views"], jepa_decay)
             kde_scale = min(1.0, max(0.0, (reg_frac - 0.1) / 0.4))
             # Wrap forward + backward + opt.step in FlopCounterMode on the first step only;
             # subsequent steps reuse measured_flops_per_step (fixed shapes => fixed cost).
@@ -815,7 +873,7 @@ def main():
                     cond = batch["meta_disc"][:, cond_col].to(device, non_blocking=True) if jepa_cond else None
                     losses = compute_losses(
                         gf, lf, batch_size, keep_idx, mask_idx, teacher_temp, kde_scale,
-                        ckpt=activation_checkpointing, meta=meta, cond=cond, enqueue=True,
+                        ckpt=activation_checkpointing, meta=meta, cond=cond, enqueue=True, mask_w=mask_w, masks=masks,
                     )
                     # Every term compute_losses returns is optimised; a new one joins the total for free.
                     total_loss = sum(v for k, v in losses.items() if not k.startswith("_"))
@@ -999,6 +1057,10 @@ def main():
         "cls_vis_reg": cls_reg_cfg,
         "align_from_layer": align_from,
         "align_weight": align_weight,
+        "qkv_blocks": qkv_blocks,
+        "masking": masking,
+        "jepa_predictor": predictor_kind,
+        "jepa_weight": jepa_weight,
         "jepa_targets": jepa_targets,
         "jepa_target_decay": jepa_decay_start,
         "jepa_target_decay_end": jepa_decay_end,
