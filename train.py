@@ -2,7 +2,7 @@
 # DINO CLS self-distillation (Sinkhorn-Knopp centred teacher targets),
 # I-JEPA masked-patch prediction, and a KDE uniformity term on the
 # L2-normalised CLS tokens. YAML drives the tunable knobs (backbone variant,
-# LR + LR scheduler, drop path, layerwise decay, KDE weight + concentration,
+# optimizer (AdamW or Muon), LR + LR scheduler, drop path, layerwise decay, KDE weight + concentration,
 # FLOP/sample budgets, batch size); other objective hyperparameters are hardcoded
 # inline at their use sites.
 
@@ -30,7 +30,7 @@ import yaml
 from torch.utils.data import DataLoader
 from torch.utils.flop_counter import FlopCounterMode
 
-from dataloader import GPUAugment, TCGATileDataset, TILE_SIZE
+from dataloader import GPUAugment, StudentAugment, TCGATileDataset, TILE_SIZE
 from model import CrossJEPAPredictor, DINOHead, JEPAPredictor, ViT, load_pretrained
 from probe import (
     completed_probe_summary,
@@ -212,7 +212,9 @@ def make_region_idx(batch, grid, device, n_blocks, side, k, decay):
 # block i gets lr * layerwise_decay^(depth - 1 - i); patch_embed gets the deepest decay
 # multiplied by patch_embed_lr_mult; biases and norms get no weight decay; the head's
 # final weight-norm last_layer parameters get an LR-freeze for the first dino.freeze_last_layer_fraction.
-def build_param_groups(student_backbone, student_dino_head, student_predictor, layerwise_decay, patch_embed_lr_mult):
+# With `muon`, hidden matrices (transformer blocks + DINO head MLP) get group["muon"] = number of stacked sub-matrices
+# (fused qkv=3, kv=2, else 1); 0 means AdamW. Embeddings, tokens, norms, biases, proj_in/proj, and last_layer stay AdamW.
+def build_param_groups(student_backbone, student_dino_head, student_predictor, layerwise_decay, patch_embed_lr_mult, muon):
     depth = len(student_backbone.blocks)
     # Coalesce params that share (lr_mult, wd_mult, last_layer) into a single group each (~30 groups
     # instead of one-per-param), so AdamW's foreach path fuses the step across many tensors rather than
@@ -229,9 +231,37 @@ def build_param_groups(student_backbone, student_dino_head, student_predictor, l
             elif kind == "backbone" and name.startswith("patch_embed."):
                 lr_mult = (layerwise_decay ** depth) * patch_embed_lr_mult
             wd_mult = 0.0 if name.endswith("bias") or "norm" in name or p.ndim < 2 else 1.0
-            key = (lr_mult, wd_mult, "last_layer" in name)
-            coalesced.setdefault(key, {"params": [], "lr_mult": lr_mult, "wd_mult": wd_mult, "last_layer": key[2]})["params"].append(p)
+            split = 3 if "qkv" in name else 2 if name.endswith(".kv.weight") else 1
+            split = split if muon and p.ndim == 2 and (name.startswith("blocks.") or kind == "dino_head" and name.startswith("mlp.")) else 0
+            key = (lr_mult, wd_mult, "last_layer" in name, split)
+            coalesced.setdefault(key, {"params": [], "lr_mult": lr_mult, "wd_mult": wd_mult, "last_layer": key[2], "muon": split})["params"].append(p)
     return list(coalesced.values())
+
+
+# Quintic Newton-Schulz: pushes every singular value of a (S, m, n) stack toward ~1, i.e. approximately U V^T.
+def newton_schulz(G):
+    X = G.mT if G.shape[-2] > G.shape[-1] else G
+    X = X / (X.norm(dim=(-2, -1), keepdim=True) + 1e-7)
+    for _ in range(5):
+        A = X @ X.mT
+        X = 3.4445 * X + (-4.7750 * A + 2.0315 * A @ A) @ X
+    return X.mT if G.shape[-2] > G.shape[-1] else X
+
+
+# Muon: Nesterov momentum (0.95) orthogonalized per sub-matrix, so every direction of a weight moves equally.
+# The 0.2*sqrt(max(m, n)) scale matches AdamW's update RMS (Moonlight), so dino.lr, layerwise decay, and the WD schedule carry over.
+class Muon(torch.optim.Optimizer):
+    def __init__(self, params, compile_ns): super().__init__(params, {"lr": 1.0, "weight_decay": 0.0}); self.ns = torch.compile(newton_schulz, disable=not compile_ns)
+
+    @torch.no_grad()
+    def step(self):
+        for group in self.param_groups:
+            for p in group["params"]:
+                buf = self.state[p].setdefault("momentum_buffer", torch.zeros_like(p))
+                buf.lerp_(p.grad, 0.05)
+                G = p.grad.lerp(buf, 0.95).view(group["muon"], -1, p.shape[1])
+                update = self.ns(G.bfloat16()).reshape_as(p).to(p.dtype)
+                p.mul_(1 - group["lr"] * group["weight_decay"]).add_(update, alpha=-group["lr"] * 0.2 * max(G.shape[-2:]) ** 0.5)
 
 
 # EMA-update teacher modules from student modules with a single multiplicative decay.
@@ -297,8 +327,12 @@ def main():
     for p in teacher_dino_head.parameters():
         p.requires_grad = False
     backbone_activated_params = sum(p.numel() for p in student_backbone.parameters() if p.requires_grad)
-    # AdamW param groups carry per-parameter LR/WD multipliers (LWD + patch_embed + biases-no-WD).
-    opt = torch.optim.AdamW(build_param_groups(student_backbone, student_dino_head, student_predictor, dino_cfg["layerwise_decay"], dino_cfg["patch_embed_lr_mult"]), lr=1.0, betas=(0.9, dino_cfg["adam_beta2"]), fused=train_cfg["fused_adamw"])
+    # Param groups carry per-parameter LR/WD multipliers (LWD + patch_embed + biases-no-WD); dino.optimizer is adamw or muon,
+    # and muon keeps AdamW for everything that isn't a hidden matrix, so opts = [AdamW] or [AdamW, Muon].
+    muon = {"adamw": False, "muon": True}[dino_cfg["optimizer"]]
+    param_groups = build_param_groups(student_backbone, student_dino_head, student_predictor, dino_cfg["layerwise_decay"], dino_cfg["patch_embed_lr_mult"], muon)
+    opt = torch.optim.AdamW([g for g in param_groups if not g["muon"]], lr=1.0, betas=(0.9, dino_cfg["adam_beta2"]), fused=train_cfg["fused_adamw"])
+    opts = [opt, Muon([g for g in param_groups if g["muon"]], train_cfg["compile"])] if muon else [opt]
     step = 0
     batch_size = int(train_cfg["batch_size"])
     max_train_samples = int(train_cfg["max_train_samples"])
@@ -346,6 +380,8 @@ def main():
         for state in checkpoint["opt"]["state"].values():
             state["step"] = state["step"].to(device if train_cfg["fused_adamw"] else "cpu")
         opt.load_state_dict(checkpoint["opt"])
+        for o, state in zip(opts[1:], checkpoint["muon"]):
+            o.load_state_dict(state)
         step = int(checkpoint["step"])
         examples_seen = int(checkpoint["examples_seen"])
         visible_patch_presentations = int(checkpoint["visible_patch_presentations"])
@@ -374,7 +410,7 @@ def main():
         f"seed: {train_cfg['seed']}  "
         f"max_train_flops: {train_cfg['max_train_flops']}  "
         f"probe_count: {cfg['probe']['count']}  warmup_fraction: {dino_cfg['warmup_fraction']}  "
-        f"lr: {dino_cfg['lr']}  adam_beta2: {dino_cfg['adam_beta2']}  kde_loss_weight: {dino_cfg['kde_loss_weight']}  "
+        f"optimizer: {dino_cfg['optimizer']}  lr: {dino_cfg['lr']}  adam_beta2: {dino_cfg['adam_beta2']}  kde_loss_weight: {dino_cfg['kde_loss_weight']}  "
         f"kde_concentration: {dino_cfg['kde_concentration']}  drop_path: {dino_cfg['drop_path_rate']}  "
         f"layerwise_decay: {dino_cfg['layerwise_decay']}  pillow: {PIL.__version__} ({PIL.__file__})",
         flush=True,
@@ -428,9 +464,17 @@ def main():
             # Compile before timing; preserve the training RNG state through warmup.
             rng = torch.cuda.get_rng_state(device)
             for views, size in [(train_cfg["global_views"], train_cfg["global_size"]), (train_cfg["local_views"], train_cfg["local_size"])]:
-                augment(torch.zeros(batch_size, views, 3, size, size, dtype=torch.uint8, device=device))
+                if views:
+                    augment(torch.zeros(batch_size, views, 3, size, size, dtype=torch.uint8, device=device))
             torch.cuda.synchronize(device)
             torch.cuda.set_rng_state(rng, device)
+    # Optional data.student_augment: {hed_jitter, blur_prob, blur_sigma: [lo, hi]}; absent means the student sees the teacher's pixels.
+    student_augment = torch.nn.Identity()
+    if "student_augment" in cfg["data"]:
+        student_augment_cfg = cfg["data"]["student_augment"]
+        if set(student_augment_cfg) != {"hed_jitter", "blur_prob", "blur_sigma"}:
+            raise ValueError(f"data.student_augment keys {sorted(student_augment_cfg)} invalid; expected exactly hed_jitter, blur_prob, blur_sigma")
+        student_augment = StudentAugment(cfg["data"], **student_augment_cfg).to(device)
     train_ds = TCGATileDataset(cfg, is_train=True)
     val_ds = TCGATileDataset(cfg, is_train=False)
 
@@ -467,7 +511,7 @@ def main():
         if not full:
             return payload
         return {**payload, "dino_head": cpu_state(student_dino_head), "dino_head_ema": cpu_state(teacher_dino_head), "predictor": cpu_state(student_predictor),
-                "opt": opt.state_dict(), "examples_seen": examples_seen,
+                "opt": opt.state_dict(), "muon": [o.state_dict() for o in opts[1:]], "examples_seen": examples_seen,
                 "visible_patch_presentations": visible_patch_presentations, "train_flops": train_flops, "wandb": wandb_meta}
 
     def save_latest_checkpoint(checkpoint_step):
@@ -502,6 +546,11 @@ def main():
         return [(count, *make_region_idx(n_crops * count, global_grid, device, n, side, int(jepa_cfg["targets"]), float(jepa_cfg["target_decay"])), None, None)
                 for n, side, count in context_regions]
 
+    # Augment a collated (B, V, 3, H, W) view stack and flatten crop-major, so [crop0_img0, crop0_img1, ..., crop1_img0, ...]
+    # chunks cleanly per crop for teacher/student alignment. None when the dataloader omitted the key (local_views: 0).
+    def load_views(batch, key):
+        return augment(batch[key].to(device, non_blocking=True)).transpose(0, 1).flatten(0, 1) if key in batch else None
+
     # Compute (dino_loss, jepa_loss, kde) for one batch of (gf, lf) crops with the given mask groups +
     # schedule values. Used by both the train step and evaluate() (no_grad).
     def compute_losses(gf, lf, b, mask_groups, t_temp, k_scale, ckpt=False):
@@ -515,7 +564,9 @@ def main():
         # Each context region is one more student-teacher pair, so the multi-crop mean is over 2L + 2R pairs.
         global_loss, jepa_loss, kde = 0.0, 0.0, 0.0
         for count, keep_idx, mask_idx, masks, mask_w in mask_groups:
-            sg = student_backbone(gf if count == 1 else gf.repeat(count, 1, 1, 1), masks=masks, checkpoint=ckpt, keep_idx=keep_idx)
+            # Each region copy draws its own student noise; the teacher and JEPA targets stay on the clean crop.
+            sv = student_augment(gf if count == 1 else gf.repeat(count, 1, 1, 1))
+            sg = student_backbone(sv, masks=masks, checkpoint=ckpt, keep_idx=keep_idx)
             t_flat = t_prob.flatten(0, 1)
             global_loss = global_loss + dino_ce_fn(student_dino_head(sg["cls"]), t_flat if count == 1 else t_flat.repeat(count, 1)) * 2 * count / (2 * L + 2 * R)
             if keep_idx is None:
@@ -533,6 +584,8 @@ def main():
                 jepa = F.smooth_l1_loss(student_predictor(context, queries), patch_target)
             jepa_loss = jepa_loss + jepa * count / R
             kde = kde + dino_cfg["kde_loss_weight"] * k_scale * sum(kde_loss(x, dino_cfg["kde_concentration"]) for x in sg["cls"].chunk(train_cfg["global_views"] * count)) / R
+        if lf is None:
+            return global_loss, jepa_loss, kde
         sl_cls = student_dino_head(student_backbone(lf, checkpoint=ckpt)["cls"])
         # CE is linear in targets; keep the original reduction order for eager recipes.
         local_loss = (dino_ce_fn(sl_cls.view(L, b, -1), t_prob.sum(0)) * L if train_cfg["compile"]
@@ -553,10 +606,9 @@ def main():
         for vb_idx, vbatch in enumerate(val_loader):
             if vb_idx >= int(train_cfg["val_batches"]):
                 break
-            vg, vl = [augment(vbatch[key].to(device, non_blocking=True)) for key in ("global_views", "local_views")]
-            b = vg.shape[0]
+            gf, lf = load_views(vbatch, "global_views"), load_views(vbatch, "local_views")
+            b = vbatch["global_views"].shape[0]
             with torch.no_grad(), autocast:
-                gf, lf = vg.transpose(0, 1).flatten(0, 1), vl.transpose(0, 1).flatten(0, 1)
                 dino_l, jepa_l, kde_v = compute_losses(gf, lf, b, draw_masks(b * train_cfg["global_views"]), eval_teacher_temp, eval_kde_scale)
             sums += torch.tensor([float(dino_l), float(jepa_l), float(kde_v), float(dino_l + jepa_l + kde_v)], device=device)
             n_batches += 1
@@ -627,7 +679,7 @@ def main():
             # Data identifiers stay on CPU and feed coverage metrics; image tensors move below.
             for key, batch_key in (("sample", "sample_idx"), ("slide", "slide_id"), ("patient", "patient_id")):
                 pending_ids[key].update(int(x) for x in batch[batch_key].tolist())
-            global_views, local_views = [augment(batch[key].to(device, non_blocking=True)) for key in ("global_views", "local_views")]
+            gf, lf = load_views(batch, "global_views"), load_views(batch, "local_views")
             visible_now = batch_size * (train_cfg["global_views"] * visible_global_patches + train_cfg["local_views"] * local_patches)
             # LR warmup uses the 1M-tile sample cap; decay/WD/teacher/freeze/KDE stay on the public FLOP budget.
             frac = min(1.0, train_flops / max_train_flops)
@@ -639,7 +691,7 @@ def main():
             wd = cosine_schedule(0.04, 0.2, frac)
             teacher_temp = 0.04 + min(1.0, frac / 0.2727) * (0.07 - 0.04)
             last_layer_lr = 0.0 if frac < dino_cfg["freeze_last_layer_fraction"] else lr
-            for group in opt.param_groups:
+            for group in (g for o in opts for g in o.param_groups):
                 base_lr = last_layer_lr if group["last_layer"] else lr
                 group["lr"] = base_lr * group["lr_mult"]
                 group["weight_decay"] = wd * group["wd_mult"]
@@ -651,22 +703,20 @@ def main():
             # Compiled kernels are opaque to the counter; measure the first step eagerly.
             with flop_ctx, torch.compiler.set_stance("force_eager" if measured_flops_per_step is None else "default"):
                 with autocast:
-                    # Crop-major flatten: collate shape is (B, V, 3, H, W) but DINO wants per-crop chunks
-                    # so [crop0_img0, crop0_img1, ..., crop1_img0, ...] for clean teacher/student alignment.
-                    gf = global_views.transpose(0, 1).flatten(0, 1)
-                    lf = local_views.transpose(0, 1).flatten(0, 1)
                     dino_loss_value, jepa_loss, kde = compute_losses(
                         gf, lf, batch_size, mask_groups, teacher_temp, kde_scale,
                         ckpt=activation_checkpointing,
                     )
                     total_loss = dino_loss_value + jepa_loss + kde
-                opt.zero_grad(set_to_none=True)
+                for o in opts:
+                    o.zero_grad(set_to_none=True)
                 total_loss.backward()
                 grad_norm = nn.utils.clip_grad_norm_(
                     [*student_backbone.parameters(), *student_dino_head.parameters(), *student_predictor.parameters()],
                     dino_cfg["clip_grad"],
                 )
-                opt.step()
+                for o in opts:
+                    o.step()
             if measured_flops_per_step is None:
                 measured_flops_per_step = int(flop_ctx.get_total_flops())
                 print(f"{console_prefix()} measured_flops_per_step: {measured_flops_per_step:,}", flush=True)
@@ -819,6 +869,7 @@ def main():
         "visible_patches_per_sec": visible_patch_presentations / max(1.0, train_loop_wall_seconds),
         "warmup_fraction": dino_cfg["warmup_fraction"],
         "warmup_train_samples": warmup_train_samples,
+        "optimizer": dino_cfg["optimizer"],
         "lr": dino_cfg["lr"],
         "adam_beta2": dino_cfg["adam_beta2"],
         "kde_loss_weight": dino_cfg["kde_loss_weight"],

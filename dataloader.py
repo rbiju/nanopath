@@ -116,6 +116,29 @@ class GPUAugment(nn.Module):
         return ((x - self.mean) / self.std).reshape(shape)
 
 
+# Extra stain/focus noise on student global inputs only, so the student must match teacher targets from a perturbed copy.
+# Operates on normalised crops: denormalise, HED jitter, random Gaussian blur, renormalise, in float32 outside autocast.
+class StudentAugment(nn.Module):
+    def __init__(self, data, hed_jitter, blur_prob, blur_sigma):
+        super().__init__()
+        self.hed = HEDJitter(float(hed_jitter)) if hed_jitter > 0 else nn.Identity()
+        self.blur_prob, (self.blur_lo, self.blur_hi) = float(blur_prob), map(float, blur_sigma)
+        for name in ("mean", "std"):
+            self.register_buffer(name, torch.tensor(data[name]).view(1, 3, 1, 1))
+
+    @torch.no_grad()
+    def forward(self, views):
+        import kornia as K
+        with torch.autocast(device_type=views.device.type, enabled=False):
+            x = self.hed((views.float() * self.std + self.mean).clamp(0.0, 1.0))
+            if self.blur_prob > 0:
+                n = x.shape[0]
+                sigma = (self.blur_lo + torch.rand(n, 1, device=x.device) * (self.blur_hi - self.blur_lo)).expand(-1, 2)
+                blurred = K.filters.gaussian_blur2d(x, (9, 9), sigma, border_type="reflect", separable=True)
+                x = torch.where(torch.rand(n, 1, 1, 1, device=x.device) < self.blur_prob, blurred, x)
+            return ((x - self.mean) / self.std).to(views.dtype)
+
+
 # Map-style TCGA tile dataset that emits global/local multi-view stacks for train.py.
 class TCGATileDataset(Dataset):
     # Glob shards, build a (shard_idx, row_in_shard) index over the requested patient
@@ -210,11 +233,12 @@ class TCGATileDataset(Dataset):
         slide_key = int.from_bytes(hashlib.blake2b(slide_stem.encode(), digest_size=8).digest(), "big") & 0x7FFFFFFFFFFFFFFF
         patient_key = int.from_bytes(hashlib.blake2b(patient_id.encode(), digest_size=8).digest(), "big") & 0x7FFFFFFFFFFFFFFF
         # Augmentations are stochastic per view; reproducibility comes from worker seeds.
-        global_views = torch.stack([self.global_aug(tile) for _ in range(self.global_views)])
-        local_views = torch.stack([self.local_aug(tile) for _ in range(self.local_views)])
+        views = {"global_views": torch.stack([self.global_aug(tile) for _ in range(self.global_views)])}
+        # local_views: 0 omits the key entirely, so collate never stacks an empty list.
+        if self.local_views:
+            views["local_views"] = torch.stack([self.local_aug(tile) for _ in range(self.local_views)])
         return {
-            "global_views": global_views,
-            "local_views": local_views,
+            **views,
             "sample_idx": torch.tensor(int(idx), dtype=torch.int64),
             "slide_id": torch.tensor(slide_key, dtype=torch.int64),
             "patient_id": torch.tensor(patient_key, dtype=torch.int64),

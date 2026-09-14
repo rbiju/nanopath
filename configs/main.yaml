@@ -1,8 +1,8 @@
 project:
-  name: xarch-baseline
+  name: xarch-00
   family: nanopath
-  recipe_id: xarch-baseline
-  output_dir: /data/$USER/nanopath/20260913-xarch-baseline
+  recipe_id: xarch-00
+  output_dir: /data/$USER/nanopath/20260913-xarch-00
   wandb_dir: /data/$USER/nanopath/wandb
 
 data:
@@ -18,7 +18,11 @@ data:
   color_jitter: 0.45
   color_jitter_saturation: 0.4
   hed_jitter: 0.12
-  tissue_thresh: 0.5 # training rejects tiles unless this fraction of pixels has RGB saturation > 0.07
+  tissue_thresh: 0.0
+  student_augment:
+    hed_jitter: 0.05
+    blur_prob: 0.5
+    blur_sigma: [0.1, 1.0]
 
 model:
   type: dinov2_vits14_reg
@@ -48,6 +52,7 @@ train:
   resume: null # optional explicit checkpoint path; null means always start fresh and wipe output_dir
 
 dino:
+  optimizer: adamw # adamw, or muon: Muon on hidden matrices (blocks + head MLP), AdamW on the rest
   lr: 1.0e-4
   lr_min: 1.0e-6
   adam_beta2: 0.99
@@ -63,11 +68,13 @@ dino:
   kde_concentration: 10.0
   # I-JEPA patch regression; `type` selects masking + predictor, and train.py documents each type's keys.
   jepa:
-    type: block
+    type: cross
     depth: 4
     width: 0
-    blocks: 4
-    block_scale: 0.1
+    context_regions:
+      - {blocks: 4, side: 4, count: 2}
+    targets: 64
+    target_decay: -0.5
 
 probe:
   enabled: true
