@@ -22,11 +22,13 @@ data:
 
 model:
   type: dinov2_vits14_reg
+  cls_specialization: null # or {qkv_blocks: 4, lr_mult: null}: CLS-only norms/LayerScales in every block + qkv in the first qkv_blocks; lr_mult null = follow layerwise decay
 
 train:
   seed: 1337
   bf16: true
   activation_checkpointing: false
+  activation_memory_budget: 0.5 # compiled backward saves <= this fraction of default activations, recomputing the cheapest ops; 1.0 = off. Exclusive with activation_checkpointing
   compile: true
   fused_adamw: true
   batch_size: 128
@@ -67,7 +69,7 @@ dino:
   kde_loss_weight: 0.002
   kde_concentration: 10.0
   kde_radius: 0.0 # chord distance on the unit sphere; CLS pairs closer than this attract, farther repel (0 = pure repulsion)
-  iso_loss_weight: 0.0 # flattens the CLS covariance spectrum (D / participation_ratio - 1); ramps in with LR warmup, 0 = off
+  iso_loss_weight: 0.0 # flattens the backbone CLS covariance spectrum (D / participation_ratio - 1); ramps in with LR warmup, 0 = off
   # I-JEPA patch regression; `type` selects masking + predictor, and train.py documents each type's keys.
   jepa:
     type: block

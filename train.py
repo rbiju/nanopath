@@ -1,7 +1,7 @@
 # DINO/JEPA pretraining on TCGA tiles (single-GPU), initialized from DINOv2. Loss terms:
 # DINO CLS self-distillation (Sinkhorn-Knopp centred teacher targets),
-# I-JEPA masked-patch prediction, a KDE uniformity term, and an optional isotropy term on the
-# L2-normalised CLS tokens. YAML drives the tunable knobs (backbone variant,
+# I-JEPA masked-patch prediction, a KDE uniformity term on the
+# L2-normalised CLS tokens, and an optional CLS isotropy term. YAML drives the tunable knobs (backbone variant,
 # optimizer (AdamW or Muon), LR + LR scheduler, drop path, layerwise decay, KDE weight + concentration, isotropy weight,
 # FLOP/sample budgets, batch size); other objective hyperparameters are hardcoded
 # inline at their use sites.
@@ -31,7 +31,7 @@ from torch.utils.data import DataLoader
 from torch.utils.flop_counter import FlopCounterMode
 
 from dataloader import GPUAugment, StudentAugment, TCGATileDataset, TILE_SIZE, UniqueSlideBatchSampler
-from model import CrossJEPAPredictor, DINOHead, FactoredDINOHead, JEPAPredictor, ViT, load_pretrained
+from model import CrossJEPAPredictor, DINOHead, FactoredDINOHead, JEPAPredictor, ViT, load_pretrained, specialize_cls_weights
 from probe import (
     completed_probe_summary,
     collect_probe_results,
@@ -222,8 +222,10 @@ def make_region_idx(batch, grid, device, n_blocks, side, k, decay):
 # multiplied by patch_embed_lr_mult; biases and norms get no weight decay; the head's
 # final weight-norm last_layer parameters get an LR-freeze for the first dino.freeze_last_layer_fraction.
 # With `muon`, hidden matrices (transformer blocks + DINO head MLP) get group["muon"] = number of stacked sub-matrices
-# (fused qkv=3, kv=2, else 1); 0 means AdamW. Embeddings, tokens, norms, biases, proj_in/proj, and last_layer stay AdamW.
-def build_param_groups(student_backbone, student_dino_head, student_predictor, layerwise_decay, patch_embed_lr_mult, muon):
+# (fused qkv=3, kv=2, else 1); 0 means AdamW. Embeddings, tokens, norms, biases, proj_in/proj, last_layer, and CLS-specialized
+# (`.cls.`) matrices stay AdamW, the latter because their one-token-per-image gradients are too low-rank to orthogonalize.
+# `cls_lr_mult` (None = follow layer-wise decay) sets the LR of `.cls.` backbone copies.
+def build_param_groups(student_backbone, student_dino_head, student_predictor, layerwise_decay, patch_embed_lr_mult, muon, cls_lr_mult=None):
     depth = len(student_backbone.blocks)
     # Coalesce params that share (lr_mult, wd_mult, last_layer) into a single group each (~30 groups
     # instead of one-per-param), so AdamW's foreach path fuses the step across many tensors rather than
@@ -235,13 +237,15 @@ def build_param_groups(student_backbone, student_dino_head, student_predictor, l
             if not p.requires_grad:
                 continue
             lr_mult = 1.0
-            if kind == "backbone" and name.startswith("blocks."):
+            if kind == "backbone" and ".cls." in name and cls_lr_mult is not None:
+                lr_mult = cls_lr_mult
+            elif kind == "backbone" and name.startswith("blocks."):
                 lr_mult = layerwise_decay ** (depth - 1 - int(name.split(".")[1]))
             elif kind == "backbone" and name.startswith("patch_embed."):
                 lr_mult = (layerwise_decay ** depth) * patch_embed_lr_mult
             wd_mult = 0.0 if name.endswith("bias") or "norm" in name or p.ndim < 2 else 1.0
             split = 3 if "qkv" in name else 2 if name.endswith(".kv.weight") else 1
-            split = split if muon and p.ndim == 2 and (name.startswith("blocks.") or kind == "dino_head" and name.startswith("mlp.")) else 0
+            split = split if muon and p.ndim == 2 and ".cls." not in name and (name.startswith("blocks.") or kind == "dino_head" and name.startswith("mlp.")) else 0
             key = (lr_mult, wd_mult, "last_layer" in name or kind == "dino_head" and name == "prototypes", split)
             coalesced.setdefault(key, {"params": [], "lr_mult": lr_mult, "wd_mult": wd_mult, "last_layer": key[2], "muon": split})["params"].append(p)
     return list(coalesced.values())
@@ -301,7 +305,15 @@ def main():
     torch.backends.cuda.matmul.allow_tf32 = True
     torch.backends.cudnn.allow_tf32 = True
     variant = cfg["model"]["type"]
-    student_backbone = load_pretrained(ViT(variant=variant, drop_path_rate=dino_cfg["drop_path_rate"])).to(device)
+    # model.cls_specialization: null keeps the plain ViT; {qkv_blocks, lr_mult} gives CLS its own norms/LayerScales (all blocks) and qkv (first qkv_blocks).
+    # lr_mult: null keeps the CLS copies on layer-wise decay like their patch twins; a number bypasses it with lr * lr_mult.
+    cls_spec = cfg["model"]["cls_specialization"]
+    if cls_spec is not None and set(cls_spec) != {"qkv_blocks", "lr_mult"}:
+        raise ValueError(f"model.cls_specialization keys {sorted(cls_spec)} invalid; expected null or exactly qkv_blocks, lr_mult")
+    student_backbone = ViT(variant=variant, drop_path_rate=dino_cfg["drop_path_rate"])
+    if cls_spec is not None:
+        specialize_cls_weights(student_backbone, int(cls_spec["qkv_blocks"]))
+    student_backbone = load_pretrained(student_backbone).to(device)
     teacher_backbone = deepcopy(student_backbone)
     teacher_backbone.train(False)
     for p in teacher_backbone.parameters():
@@ -356,7 +368,7 @@ def main():
     # Param groups carry per-parameter LR/WD multipliers (LWD + patch_embed + biases-no-WD); dino.optimizer is adamw or muon,
     # and muon keeps AdamW for everything that isn't a hidden matrix, so opts = [AdamW] or [AdamW, Muon].
     muon = {"adamw": False, "muon": True}[dino_cfg["optimizer"]]
-    param_groups = build_param_groups(student_backbone, student_dino_head, student_predictor, dino_cfg["layerwise_decay"], dino_cfg["patch_embed_lr_mult"], muon)
+    param_groups = build_param_groups(student_backbone, student_dino_head, student_predictor, dino_cfg["layerwise_decay"], dino_cfg["patch_embed_lr_mult"], muon, None if cls_spec is None else cls_spec["lr_mult"])
     opt = torch.optim.AdamW([g for g in param_groups if not g["muon"]], lr=1.0, betas=(0.9, dino_cfg["adam_beta2"]), fused=train_cfg["fused_adamw"])
     opts = [opt, Muon([g for g in param_groups if g["muon"]], train_cfg["compile"])] if muon else [opt]
     step = 0
@@ -369,6 +381,11 @@ def main():
     wandb_dir = Path(cfg["project"]["wandb_dir"])
     for key, name in [("TORCHINDUCTOR_CACHE_DIR", "inductor"), ("TRITON_CACHE_DIR", "triton")]:
         os.environ.setdefault(key, str(wandb_dir.parent / name))
+    # Compiled backward keeps at most this fraction of the default-saved activations, recomputing the cheapest ops (1.0 = off).
+    # Read at each graph's first compile, so it must be set before any compiled module runs; it overlaps with block checkpointing.
+    if train_cfg["activation_checkpointing"] and train_cfg["activation_memory_budget"] < 1.0:
+        raise ValueError("use either train.activation_checkpointing or train.activation_memory_budget < 1.0, not both")
+    torch._functorch.config.activation_memory_budget = float(train_cfg["activation_memory_budget"])
     # Compile calls in place so checkpoint keys and parameter ownership stay unchanged.
     for module in (student_backbone, teacher_backbone, student_dino_head, teacher_dino_head, student_predictor):
         module.compile(dynamic=isinstance(module, (DINOHead, FactoredDINOHead)), disable=not train_cfg["compile"])
@@ -612,9 +629,9 @@ def main():
                 context = torch.cat([*([] if context_cls is None else [context_cls[:, None]]), sg["registers"], sg["patches"]], dim=1)
                 jepa = F.smooth_l1_loss(student_predictor(context, queries), patch_target)
             jepa_loss = jepa_loss + jepa * count / R
-            cls_chunks = sg["cls"].chunk(train_cfg["global_views"] * count)
-            kde = kde + dino_cfg["kde_loss_weight"] * k_scale * sum(kde_loss(x, dino_cfg["kde_concentration"], dino_cfg["kde_radius"]) for x in cls_chunks) / R
-            iso = iso + sum(isotropy_loss(x) for x in cls_chunks) / (train_cfg["global_views"] * R)
+            kde = kde + dino_cfg["kde_loss_weight"] * k_scale * sum(kde_loss(x, dino_cfg["kde_concentration"], dino_cfg["kde_radius"]) for x in sg["cls"].chunk(train_cfg["global_views"] * count)) / R
+            # Isotropy acts on backbone CLS, in front of the DINO head, so the head can still collapse its bottleneck for prototype matching.
+            iso = iso + sum(isotropy_loss(x) for x in sg["cls"].chunk(train_cfg["global_views"] * count)) / (train_cfg["global_views"] * R)
         if lf is None:
             return global_loss, jepa_loss, kde, iso
         sl_cls = student_dino_head(student_backbone(lf, checkpoint=ckpt)["cls"])
@@ -690,8 +707,8 @@ def main():
     last_console_monotonic = time.monotonic()
     data_wait_started_at = time.monotonic()
     autocast = torch.autocast(device_type="cuda", dtype=torch.bfloat16) if train_cfg["bf16"] else contextlib.nullcontext()
-    # Per-step FLOPs are measured once via FlopCounterMode on the first wrapped step (forward +
-    # backward + opt.step) and reused for every subsequent step since the shapes don't change.
+    # Per-step FLOPs are measured once on the first step (a scaled eager forward + backward probe plus the eager
+    # opt.step) and reused for every subsequent step since the shapes don't change.
     # Counts the EMA teacher forward + all objective heads, not just the backbone, so the
     # 1e18 leaderboard cap reflects real GPU work.
     measured_flops_per_step = None
@@ -729,30 +746,46 @@ def main():
                 group["weight_decay"] = wd * group["wd_mult"]
             mask_groups = draw_masks(batch_size * train_cfg["global_views"])
             kde_scale = min(1.0, max(0.0, (frac - 0.1) / 0.4))
-            # Wrap forward + backward + opt.step in FlopCounterMode on the first step only;
-            # subsequent steps reuse measured_flops_per_step (fixed shapes => fixed cost).
-            flop_ctx = FlopCounterMode(display=False) if measured_flops_per_step is None else contextlib.nullcontext()
-            # Compiled kernels are opaque to the counter; measure the first step eagerly.
-            with flop_ctx, torch.compiler.set_stance("force_eager" if measured_flops_per_step is None else "default"):
-                with autocast:
-                    dino_loss_value, jepa_loss, kde, iso = compute_losses(
-                        gf, lf, batch_size, mask_groups, teacher_temp, kde_scale,
-                        ckpt=activation_checkpointing,
-                    )
-                    # Isotropy ramps in with LR warmup so it doesn't reshape the pretrained CLS space before the LR is live.
-                    total_loss = dino_loss_value + jepa_loss + kde + dino_cfg["iso_loss_weight"] * warmup * iso
+            if measured_flops_per_step is None:
+                # Compiled kernels are opaque to FlopCounterMode, so forward + backward FLOPs are counted once on an eager,
+                # no-update pass over a 32-image slice and scaled to the batch (linear, bar negligible b^2 KDE terms). The real
+                # steps all run compiled, so eager memory never caps the batch size. RNG is restored so the probe's masks,
+                # drop path, and student noise leave the training stream untouched.
+                probe_b = min(batch_size, 32)
+                rng = random.getstate(), torch.random.get_rng_state(), torch.cuda.get_rng_state(device)
+                probe_views = [None if v is None else v.view(-1, batch_size, *v.shape[1:])[:, :probe_b].flatten(0, 1) for v in (gf, lf)]
+                with FlopCounterMode(display=False) as probe_ctx, torch.compiler.set_stance("force_eager"):
+                    with autocast:
+                        p_dino, p_jepa, p_kde, p_iso = compute_losses(*probe_views, probe_b, draw_masks(probe_b * train_cfg["global_views"]), teacher_temp, kde_scale, ckpt=activation_checkpointing)
+                        probe_loss = p_dino + p_jepa + p_kde + dino_cfg["iso_loss_weight"] * warmup * p_iso
+                    probe_loss.backward()
                 for o in opts:
                     o.zero_grad(set_to_none=True)
-                total_loss.backward()
-                grad_norm = nn.utils.clip_grad_norm_(
-                    [*student_backbone.parameters(), *student_dino_head.parameters(), *student_predictor.parameters()],
-                    dino_cfg["clip_grad"],
+                random.setstate(rng[0])
+                torch.random.set_rng_state(rng[1])
+                torch.cuda.set_rng_state(rng[2], device)
+            with autocast:
+                dino_loss_value, jepa_loss, kde, iso = compute_losses(
+                    gf, lf, batch_size, mask_groups, teacher_temp, kde_scale,
+                    ckpt=activation_checkpointing,
                 )
+                # Isotropy ramps in with LR warmup so it doesn't reshape the pretrained CLS space before the LR is live.
+                total_loss = dino_loss_value + jepa_loss + kde + dino_cfg["iso_loss_weight"] * warmup * iso
+            for o in opts:
+                o.zero_grad(set_to_none=True)
+            total_loss.backward()
+            grad_norm = nn.utils.clip_grad_norm_(
+                [*student_backbone.parameters(), *student_dino_head.parameters(), *student_predictor.parameters()],
+                dino_cfg["clip_grad"],
+            )
+            # The optimizer step is batch-independent (only Muon's Newton-Schulz matmuls count), so the first one is counted eagerly as-is.
+            opt_ctx = FlopCounterMode(display=False) if measured_flops_per_step is None else contextlib.nullcontext()
+            with opt_ctx, torch.compiler.set_stance("force_eager" if measured_flops_per_step is None else "default"):
                 for o in opts:
                     o.step()
             if measured_flops_per_step is None:
-                measured_flops_per_step = int(flop_ctx.get_total_flops())
-                print(f"{console_prefix()} measured_flops_per_step: {measured_flops_per_step:,}", flush=True)
+                measured_flops_per_step = int(probe_ctx.get_total_flops()) * batch_size // probe_b + int(opt_ctx.get_total_flops())
+                print(f"{console_prefix()} measured_flops_per_step: {measured_flops_per_step:,}  (fwd+bwd counted at batch {probe_b}, scaled to {batch_size})", flush=True)
             step_train_flops = measured_flops_per_step
             with torch.no_grad():
                 m = cosine_schedule(0.994, 1.0, frac)
@@ -889,6 +922,7 @@ def main():
         "backbone_activated_params": backbone_activated_params,
         "batch_size": batch_size,
         "unique_slide_batches": train_cfg["unique_slide_batches"],
+        "activation_memory_budget": train_cfg["activation_memory_budget"],
         "max_train_samples": max_train_samples,
         "max_train_flops": max_train_flops,
         "train_loop_wall_seconds": train_loop_wall_seconds,
@@ -916,6 +950,7 @@ def main():
         "iso_loss_weight": dino_cfg["iso_loss_weight"],
         "drop_path_rate": dino_cfg["drop_path_rate"],
         "layerwise_decay": dino_cfg["layerwise_decay"],
+        "cls_specialization": cls_spec,
         "probe_target_samples": probe_targets,
         "probe_target_fractions": [None if max_train_samples == 0 else target / max_train_samples for target in probe_targets],
         **({} if probe_state is None else completed_probe_summary(output_dir)),

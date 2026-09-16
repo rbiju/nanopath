@@ -10,6 +10,8 @@
 # (~15 lines) so we have zero runtime dependency on the dinov2 codebase. FactoredDINOHead swaps
 # the weight-normed layer for a Parameter prototype bank split into per-factor codebooks.
 
+from copy import deepcopy
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -192,11 +194,38 @@ class ViT(nn.Module):
     def probe_features(self, x):
         return self(x)["cls"]
 
+    # Specialized checkpoints carry `.cls.` keys; a plain ViT (probe.py, notebooks) rewraps itself to match before loading.
+    def load_state_dict(self, state_dict, *args, **kwargs):
+        if any(".cls." in k for k in state_dict):
+            specialize_cls_weights(self, sum(f"blocks.{i}.attn.qkv.cls.weight" in state_dict for i in range(len(self.blocks))))
+        return super().load_state_dict(state_dict, *args, **kwargs)
 
-# Strict-load the model's declared pretrained weights; incompatible layouts fail loudly.
+
+# Runs a deep-copied `cls` layer on token 0 and the original `patch` layer on registers + patches, so attention still sees one sequence.
+class Specialized(nn.Module):
+    def __init__(self, layer):
+        super().__init__()
+        self.patch, self.cls = layer, deepcopy(layer)
+
+    def forward(self, x):
+        return torch.cat([self.cls(x[:, :1]), self.patch(x[:, 1:])], dim=1)
+
+
+# CLS/patch weight specialization: CLS gets its own LayerNorms + LayerScales in every block and its own qkv in the first `qkv_blocks`; idempotent.
+def specialize_cls_weights(model, qkv_blocks):
+    for i, blk in enumerate(model.blocks):
+        if isinstance(blk.norm1, Specialized):
+            continue
+        blk.norm1, blk.norm2, blk.ls1, blk.ls2 = (Specialized(m) for m in (blk.norm1, blk.norm2, blk.ls1, blk.ls2))
+        if i < qkv_blocks:
+            blk.attn.qkv = Specialized(blk.attn.qkv)
+    return model
+
+
+# Strict-load the model's declared pretrained weights; both halves of a Specialized layer load the same tensor, so step 0 matches DINOv2.
 def load_pretrained(model):
     state = torch.hub.load_state_dict_from_url(model.pretrained_url, progress=False, map_location="cpu")
-    model.load_state_dict(state, strict=True)
+    model.load_state_dict({k: state[k.replace(".cls.", ".").replace(".patch.", ".")] for k in model.state_dict()}, strict=True)
     return model
 
 
