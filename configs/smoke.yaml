@@ -34,6 +34,7 @@ train:
   num_workers: 8
   prefetch_factor: 2
   persistent_workers: true
+  unique_slide_batches: false # true = no two tiles from the same slide share a batch (tissue_thresh rejections resample within the slide)
   max_train_samples: 1000000 # full-run sample cap; smoke normally reaches max_train_flops first
   max_train_flops: 5000000000000000 # 5.0e15 — short enough to finish in a few minutes
   log_every: 5
@@ -59,9 +60,14 @@ dino:
   drop_path_rate: 0.1
   head_hidden_dim: 2048
   head_bottleneck_dim: 384
+  # DINO prototype layer; `type` selects it, and train.py documents each type's keys.
+  head:
+    type: weight_norm
   clip_grad: 3.0
   kde_loss_weight: 0.002
   kde_concentration: 10.0
+  kde_radius: 0.0 # chord distance on the unit sphere; CLS pairs closer than this attract, farther repel (0 = pure repulsion)
+  iso_loss_weight: 0.0 # flattens the CLS covariance spectrum (D / participation_ratio - 1); ramps in with LR warmup, 0 = off
   # I-JEPA patch regression; `type` selects masking + predictor, and train.py documents each type's keys.
   jepa:
     type: block

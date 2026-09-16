@@ -139,6 +139,28 @@ class StudentAugment(nn.Module):
             return ((x - self.mean) / self.std).to(views.dtype)
 
 
+# Batch sampler with no repeated slide per batch: each batch draws distinct slides weighted by remaining tiles (so tiles
+# are still visited ~uniformly), then pops each slide's next shuffled tile; the epoch ends when fewer than batch_size slides remain.
+class UniqueSlideBatchSampler(torch.utils.data.Sampler):
+    def __init__(self, slide_of, batch_size, seed):
+        self.slide_of, self.batch_size, self.seed, self.epoch = torch.as_tensor(slide_of, dtype=torch.long), batch_size, seed, 0
+
+    def __len__(self):
+        return len(self.slide_of) // self.batch_size
+
+    def __iter__(self):
+        g = torch.Generator().manual_seed(self.seed + self.epoch)
+        self.epoch += 1
+        perm = torch.randperm(len(self.slide_of), generator=g)
+        order = perm[self.slide_of[perm].argsort(stable=True)]  # tiles grouped by slide, shuffled within each slide
+        counts = torch.bincount(self.slide_of)
+        starts, remaining = counts.cumsum(0) - counts, counts.clone()
+        while int((remaining > 0).sum()) >= self.batch_size:
+            slides = torch.multinomial(remaining.double(), self.batch_size, replacement=False, generator=g)
+            remaining[slides] -= 1
+            yield order[starts[slides] + remaining[slides]].tolist()
+
+
 # Map-style TCGA tile dataset that emits global/local multi-view stacks for train.py.
 class TCGATileDataset(Dataset):
     # Glob shards, build a (shard_idx, row_in_shard) index over the requested patient
@@ -163,6 +185,8 @@ class TCGATileDataset(Dataset):
         # the JPEG bytes column stays on disk until __getitem__.
         in_split_shard = []
         in_split_row = []
+        in_split_slide = []
+        slide_codes = {}
         for shard_idx, shard_path in enumerate(self.shards):
             paths = pq.read_table(str(shard_path), columns=["path"], memory_map=True)["path"].to_pylist()
             for row_idx, p in enumerate(paths):
@@ -171,11 +195,15 @@ class TCGATileDataset(Dataset):
                 if patient_in_val(patient_id_from_relpath(p), data["split_seed"], data["val_fraction"]) != is_train:
                     in_split_shard.append(shard_idx)
                     in_split_row.append(row_idx)
+                    in_split_slide.append(slide_codes.setdefault(p.split("/", 1)[0], len(slide_codes)))
         if not in_split_shard:
             raise ValueError(f"no {'train' if is_train else 'val'} tiles found in {dataset_dir}; check val_fraction={data['val_fraction']}")
         # Two parallel int32 arrays (~32 MB total for 4M tiles) shared COW across DataLoader fork-workers.
         self.shard_of = np.asarray(in_split_shard, dtype=np.int32)
         self.row_of = np.asarray(in_split_row, dtype=np.int32)
+        # Dense 0..S-1 slide code per tile; unique-slide batching reads it, and tissue rejections then resample within the slide.
+        self.slide_of = np.asarray(in_split_slide, dtype=np.int32)
+        self.unique_slide_batches = is_train and bool(train["unique_slide_batches"])
         mean, std = data["mean"], data["std"]
         self.global_views = int(train["global_views"])
         self.local_views = int(train["local_views"])
@@ -225,7 +253,8 @@ class TCGATileDataset(Dataset):
             sat = (rgb.amax(0) - rgb.amin(0)) / (rgb.amax(0) + 1e-6)
             if float((sat > 0.07).float().mean()) >= self.tissue_thresh:
                 break
-            idx = random.randint(0, self.shard_of.shape[0] - 1)
+            # Same-slide replacement keeps the sampler's no-repeated-slide guarantee intact.
+            idx = random.choice(np.flatnonzero(self.slide_of == self.slide_of[idx])) if self.unique_slide_batches else random.randint(0, self.shard_of.shape[0] - 1)
         else:
             raise RuntimeError(f"no tile met tissue_thresh={self.tissue_thresh} after 1000 samples")
         slide_stem = rel.split("/", 1)[0]

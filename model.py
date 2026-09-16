@@ -7,7 +7,8 @@
 #
 # DINOHead is the small MLP + weight-normed classifier used by train.py for the
 # DINO CLS self-distillation loss. It is intentionally trivial
-# (~15 lines) so we have zero runtime dependency on the dinov2 codebase.
+# (~15 lines) so we have zero runtime dependency on the dinov2 codebase. FactoredDINOHead swaps
+# the weight-normed layer for a Parameter prototype bank split into per-factor codebooks.
 
 import torch
 import torch.nn as nn
@@ -217,10 +218,32 @@ class DINOHead(nn.Module):
             self.last_layer.parametrizations.weight.original0.fill_(1.0)
         self.last_layer.parametrizations.weight.original0.requires_grad_(False)
 
+    # Returns (B, 1, n_prototypes): a single codebook in the (B, factors, K) layout FactoredDINOHead shares.
     def forward(self, x):
         x = self.mlp(x)
         x = F.normalize(x, dim=-1, p=2)
-        return self.last_layer(x)
+        return self.last_layer(x)[:, None]
+
+
+# DINO head with prototypes as a plain Parameter, split into `factors` codebooks: the bottleneck is cut into `factors`
+# chunks, each L2-normalised and scored against its own n_prototypes/factors prototypes, giving (K/F)^F joint codes.
+class FactoredDINOHead(nn.Module):
+    def __init__(self, in_dim, n_prototypes, hidden_dim=2048, bottleneck_dim=384, nlayers=3, factors=1):
+        super().__init__()
+        layers = [nn.Linear(in_dim, hidden_dim), nn.GELU()]
+        for _ in range(nlayers - 2):
+            layers += [nn.Linear(hidden_dim, hidden_dim), nn.GELU()]
+        layers.append(nn.Linear(hidden_dim, bottleneck_dim))
+        self.mlp = nn.Sequential(*layers)
+        self.factors = factors
+        self.prototypes = nn.Parameter(torch.empty(n_prototypes, bottleneck_dim // factors))
+        nn.init.kaiming_uniform_(self.prototypes, a=5 ** 0.5)
+
+    # Returns (B, factors, n_prototypes // factors) cosine logits; non-divisible sizes fail loudly in view().
+    def forward(self, x):
+        chunks = F.normalize(self.mlp(x).view(x.shape[0], self.factors, -1), dim=-1)
+        protos = F.normalize(self.prototypes, dim=-1).view(self.factors, -1, chunks.shape[-1])
+        return torch.einsum("bfd,fkd->bfk", chunks, protos)
 
 
 # I-JEPA predicts EMA-teacher patch features from the student's block-masked tokens.
