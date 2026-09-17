@@ -729,23 +729,25 @@ def main():
                 pending_ids[key].update(int(x) for x in batch[batch_key].tolist())
             gf, lf = load_views(batch, "global_views"), load_views(batch, "local_views")
             visible_now = batch_size * (train_cfg["global_views"] * visible_global_patches + train_cfg["local_views"] * local_patches)
-            # Schedules run on sample progress at the block baseline's FLOP pace (0.1862 of the budget at the 1M cap), so
-            # FLOP-cheaper architectures keep identical LR/WD/teacher/freeze/KDE/EMA trajectories; real FLOPs still enforce the cap.
-            frac = min(1.0, 0.1862 * examples_seen / max_train_samples)
+            # dino.schedule_progress drives every schedule below: `samples` runs each over the full sample budget, while `pace` keeps the
+            # legacy sample progress at the block baseline's FLOP pace (0.1862 of the budget at the 1M cap), so FLOP-cheaper architectures
+            # share one trajectory and the arcs deliberately stop early. Real FLOPs still enforce the cap either way.
+            sample_frac = min(1.0, examples_seen / max_train_samples)
+            prog = {"pace": min(1.0, 0.1862 * sample_frac), "samples": sample_frac}[dino_cfg["schedule_progress"]]
             warmup = min(1.0, examples_seen / max(1, warmup_train_samples))
             if warmup < 1.0:
                 lr = dino_cfg["lr"] * warmup
             else:
-                lr = cosine_schedule(dino_cfg["lr"], dino_cfg["lr_min"], (frac - dino_cfg["warmup_fraction"]) / max(1e-9, 1 - dino_cfg["warmup_fraction"]))
-            wd = cosine_schedule(0.04, 0.2, frac)
-            teacher_temp = temp_scale * (0.04 + min(1.0, frac / 0.2727) * (0.07 - 0.04))
-            last_layer_lr = 0.0 if frac < dino_cfg["freeze_last_layer_fraction"] else lr
+                lr = cosine_schedule(dino_cfg["lr"], dino_cfg["lr_min"], (prog - dino_cfg["warmup_fraction"]) / max(1e-9, 1 - dino_cfg["warmup_fraction"]))
+            wd = cosine_schedule(0.04, 0.2, prog)
+            teacher_temp = temp_scale * (0.04 + min(1.0, prog / 0.2727) * (0.07 - 0.04))
+            last_layer_lr = 0.0 if prog < dino_cfg["freeze_last_layer_fraction"] else lr
             for group in (g for o in opts for g in o.param_groups):
                 base_lr = last_layer_lr if group["last_layer"] else lr
                 group["lr"] = base_lr * group["lr_mult"]
                 group["weight_decay"] = wd * group["wd_mult"]
             mask_groups = draw_masks(batch_size * train_cfg["global_views"])
-            kde_scale = min(1.0, max(0.0, (frac - 0.1) / 0.4))
+            kde_scale = min(1.0, max(0.0, (prog - 0.1) / 0.4))
             if measured_flops_per_step is None:
                 # Compiled kernels are opaque to FlopCounterMode, so forward + backward FLOPs are counted once on an eager,
                 # no-update pass over a 32-image slice and scaled to the batch (linear, bar negligible b^2 KDE terms). The real
@@ -788,7 +790,8 @@ def main():
                 print(f"{console_prefix()} measured_flops_per_step: {measured_flops_per_step:,}  (fwd+bwd counted at batch {probe_b}, scaled to {batch_size})", flush=True)
             step_train_flops = measured_flops_per_step
             with torch.no_grad():
-                m = cosine_schedule(0.994, 1.0, frac)
+                # Per-step momentum is rescaled to a 128-image reference batch, so the teacher lags the student by a fixed number of samples at any batch size.
+                m = cosine_schedule(0.994, 1.0, prog) ** (batch_size / 128)
                 update_ema(student_backbone, teacher_backbone, m)
                 update_ema(student_dino_head, teacher_dino_head, m)
             examples_seen += batch_size
@@ -941,6 +944,7 @@ def main():
         "warmup_train_samples": warmup_train_samples,
         "optimizer": dino_cfg["optimizer"],
         "lr": dino_cfg["lr"],
+        "schedule_progress": dino_cfg["schedule_progress"],
         "adam_beta2": dino_cfg["adam_beta2"],
         "kde_loss_weight": dino_cfg["kde_loss_weight"],
         "kde_concentration": dino_cfg["kde_concentration"],

@@ -54,6 +54,7 @@ dino:
   optimizer: adamw # adamw, or muon: Muon on hidden matrices (blocks + head MLP), AdamW on the rest
   lr: 1.0e-4
   lr_min: 1.0e-6
+  schedule_progress: pace # samples | pace: what drives every schedule (LR, WD, teacher temp, freeze, KDE, EMA); pace = legacy 0.1862 FLOP pace, so the arcs stop early
   adam_beta2: 0.99
   warmup_fraction: 0.03
   freeze_last_layer_fraction: 0.0091

@@ -1,8 +1,8 @@
 project:
-  name: xarch_01_iso1
+  name: xarch_01_baseline_sample_sched_lr
   family: nanopath
-  recipe_id: xarch_01_iso1
-  output_dir: /data/$USER/nanopath/20260916-xarch_01_iso1
+  recipe_id: xarch_01_baseline_sample_sched_lr
+  output_dir: /data/$USER/nanopath/20260917-xarch_01_baseline_sample_sched_lr
   wandb_dir: /data/$USER/nanopath/wandb
 
 data:
@@ -59,8 +59,9 @@ train:
 
 dino:
   optimizer: adamw # adamw | muon
-  lr: 1.0e-4
+  lr: 2.0e-4
   lr_min: 1.0e-6
+  schedule_progress: samples # samples | pace: what drives every schedule (LR, WD, teacher temp, freeze, KDE, EMA); pace = legacy 0.1862 FLOP pace, so the arcs stop early
   adam_beta2: 0.999
   warmup_fraction: 0.0909
   freeze_last_layer_fraction: 0.0091
@@ -80,7 +81,7 @@ dino:
   kde_loss_weight: 0.005
   kde_concentration: 10.0
   kde_radius: 0.0 # chord distance on the unit sphere; CLS pairs closer than this attract, farther repel (0 = pure repulsion)
-  iso_loss_weight: 0.01 # flattens the backbone CLS covariance spectrum (D / participation_ratio - 1); ramps in with LR warmup, 0 = off
+  iso_loss_weight: 0.0 # flattens the backbone CLS covariance spectrum (D / participation_ratio - 1); ramps in with LR warmup, 0 = off
   # I-JEPA patch regression; `type` selects masking + predictor, and train.py documents each type's keys.
   jepa:
     type: cross

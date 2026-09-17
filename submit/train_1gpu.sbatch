@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-#SBATCH --job-name=xarch_01_iso1
+#SBATCH --job-name=xarch_01_baseline_sample_sched_lr
 #SBATCH --nodes=1
 #SBATCH --ntasks-per-node=1
 #SBATCH --gpus-per-task=1
