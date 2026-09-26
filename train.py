@@ -27,7 +27,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import wandb
 import yaml
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, Subset
 from torch.utils.flop_counter import FlopCounterMode
 
 from dataloader import GPUAugment, StudentAugment, TCGATileDataset, TILE_SIZE, UniqueSlideBatchSampler
@@ -552,7 +552,10 @@ def main():
     # train.unique_slide_batches swaps plain shuffling for a batch sampler that never puts two tiles from one slide in a batch.
     train_loader = (DataLoader(train_ds, batch_sampler=UniqueSlideBatchSampler(train_ds.slide_of, batch_size, train_cfg["seed"]), **{k: v for k, v in loader_kwargs.items() if k not in ("batch_size", "drop_last")})
                     if train_cfg["unique_slide_batches"] else DataLoader(train_ds, shuffle=True, **loader_kwargs))
-    val_loader = DataLoader(val_ds, shuffle=False, **loader_kwargs)
+    # The val split is stored slide-contiguous, so read a fixed random subset (seeded by split_seed, identical across runs and evals)
+    # to give each val batch many slides; unshuffled batches held 1-2 slides and skewed every batch-level val metric.
+    val_subset = torch.randperm(len(val_ds), generator=torch.Generator().manual_seed(cfg["data"]["split_seed"]))[:int(train_cfg["val_batches"]) * batch_size]
+    val_loader = DataLoader(Subset(val_ds, val_subset.tolist()), shuffle=False, **loader_kwargs)
 
     activation_checkpointing = bool(train_cfg["activation_checkpointing"])
     local_patches = (train_cfg["local_size"] // student_backbone.patch_size) ** 2
