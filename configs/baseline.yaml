@@ -57,6 +57,7 @@ dino:
   lr_min: 1.0e-6
   schedule_progress: pace # samples | pace: what drives every schedule (LR, WD, teacher temp, freeze, KDE, EMA); pace = legacy 0.1862 FLOP pace, so the arcs stop early
   adam_beta2: 0.999
+  weight_decay: [0.04, 0.2] # cosine [start, end] over schedule_progress; decoupled, so each step shrinks weights by lr * wd
   warmup_fraction: 0.0909
   freeze_last_layer_fraction: 0.0091
   layerwise_decay: 0.7
@@ -64,6 +65,7 @@ dino:
   drop_path_rate: 0.1
   head_hidden_dim: 2048
   head_bottleneck_dim: 384
+  temp_scale: auto # multiplies both DINO temperatures; auto = sqrt(ln 131072 / ln K) per codebook size (1.0 for weight_norm), or a number
   # DINO prototype layer; `type` selects it, and train.py documents each type's keys.
   head:
     type: weight_norm
