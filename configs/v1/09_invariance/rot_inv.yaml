@@ -1,0 +1,159 @@
+project:
+  name: xarch_01_inv_rotd8
+  family: nanopath
+  recipe_id: xarch_01_inv_rotd8
+  output_dir: /data/$USER/nanopath/20260929-xarch_01_inv_rotd8
+  wandb_dir: /data/$USER/nanopath/wandb
+
+data:
+  # dataset_dir holds the parquet shards (shard-NNNNN.parquet) that train.py reads.
+  # `prepare.py … download=True` populates it from the medarc/nanopath training mirror.
+  dataset_dir: /data/nanopath_parquet
+  split_seed: 7777
+  val_fraction: 0.05
+  mean: [0.485, 0.456, 0.406]
+  std: [0.229, 0.224, 0.225]
+  global_crop_scale: [0.4, 1.0]
+  local_crop_scale: [0.08, 0.35]
+  color_jitter: 0.3
+  color_jitter_saturation: 0.25
+  hed_jitter: 0.06
+  tissue_thresh: 0.0
+  rot90: true # true adds a random transpose to the H/V flips, so views cover 90/270-degree rotations too
+  student_augment:
+    hed_jitter: 0.05
+    blur_prob: 0.5
+    blur_sigma: [0.1, 1.0]
+
+model:
+  type: dinov2_vits14_reg
+  cls_specialization: null
+  # cls_specialization:
+  #   qkv_blocks: 4
+  #   lr_mult: null
+  block_expansion: null
+  # block_expansion:
+  #   chunks: 4
+  #   freeze_base: true
+  #   freeze_embeddings: false
+
+train:
+  seed: 7777
+  bf16: true
+  activation_checkpointing: false
+  activation_memory_budget: 0.5   # Exclusive with activation_checkpointing
+  compile: true
+  fused_adamw: true
+  batch_size: 128
+  gpu_augment: true
+  num_workers: 8
+  prefetch_factor: 2
+  persistent_workers: true
+  unique_slide_batches: true # true = no two tiles from the same slide share a batch (tissue_thresh rejections resample within the slide)
+  max_train_samples: 1000000 # tile presentations; global/local crops still count as one sample
+  max_train_flops: 1000000000000000000 # 1.0e18, the leaderboard FLOP budget
+  log_every: 20
+  save_every: 1000
+  # Validation pass every `eval_every` steps over `val_batches` held-out batches
+  eval_every: 200
+  val_batches: 16
+  global_views: 2
+  local_views: 8
+  global_size: 224
+  local_size: 112
+  resume: null # optional explicit checkpoint path; null means always start fresh and wipe output_dir
+
+dino:
+  optimizer: muon # adamw | muon
+  lr: 3.0e-4
+  lr_min: 1.0e-6
+  schedule_progress: samples # samples | pace: what drives every schedule (LR, WD, teacher temp, freeze, KDE, EMA); pace = legacy 0.1862 FLOP pace, so the arcs stop early
+  adam_beta2: 0.999
+  weight_decay: [0.04, 0.2] # cosine [start, end] over schedule_progress; decoupled, so each step shrinks weights by lr * wd
+  warmup_fraction: 0.0909
+  freeze_last_layer_fraction: 0.0091
+  layerwise_decay: 0.7
+  patch_embed_lr_mult: 0.2
+  drop_path_rate: 0.1
+  head_hidden_dim: 2048
+  head_bottleneck_dim: 384
+  temp_scale: 1.0
+  # DINO prototype layer; `type` selects it, and train.py documents each type's keys.
+  head:
+    # type: weight_norm
+    type: factored
+    prototypes: 1024
+    factors: 2
+    decorr_weight: 0.05 # cross-factor chunk correlation penalty, 0 = off
+    separate_mlps: true # true = each factor gets its own head MLP instead of slicing one shared output
+  # What keeps the DINO head from collapsing onto a few prototypes; `type` selects it, and train.py documents each type's keys.
+  balance:
+    type: sinkhorn # sinkhorn | center | memax {weight} | simdino {weight}
+
+  clip_grad: 20.0
+  kde_loss_weight: 0.005
+  kde_concentration: 10.0
+  kde_radius: 0.0 # chord distance on the unit sphere; CLS pairs closer than this attract, farther repel (0 = pure repulsion)
+  iso_loss_weight: 0.0 # flattens the backbone CLS covariance spectrum (D / participation_ratio - 1); ramps in with LR warmup, 0 = off
+  # I-JEPA patch regression; `type` selects masking + predictor, and train.py documents each type's keys.
+  jepa:
+    type: cross
+    depth: 4
+    width: 0
+    context_regions:
+      - {blocks: 4, side: 4, count: 3}
+    targets: 64
+    target_decay: -0.5
+    context_cls: none
+
+probe:
+  enabled: true
+  model_weights: ema
+  count: 1 # 4 means probing at 25%, 50%, 75%, and 100% of the sample cap. 1 means probing just at the end.
+  datasets:
+    - bach
+    - bracs
+    - break_his
+    - crc
+    - esca
+    - mhist
+    - pcam
+    - spider_breast
+    - spider_colorectal
+    - spider_skin
+    - spider_thorax
+    - wilds
+  segmentation_datasets:
+    - pannuke
+    - segpath_epithelial
+    - segpath_lymphocytes
+  slide_datasets:
+    - ucla_lung
+  auc_datasets:
+    - surgen
+  survival_datasets:
+    - leopard_bcr
+    - cptac_pda_os
+  robustness_datasets:
+    - pathorob
+  dataset_roots:
+    bach: /data/thunder-data/bach
+    bracs: /data/thunder-data/bracs
+    break_his: /data/thunder-data/break_his
+    crc: /data/thunder-data/crc
+    esca: /data/thunder-data/esca
+    mhist: /data/thunder-data/mhist
+    pcam: /data/thunder-data/patch_camelyon
+    spider_breast: /data/thunder-data/spider_breast
+    spider_colorectal: /data/thunder-data/spider_colorectal
+    spider_skin: /data/thunder-data/spider_skin
+    spider_thorax: /data/thunder-data/spider_thorax
+    wilds: /data/thunder-data/wilds
+    pannuke: /data/thunder-data/pannuke
+    segpath_epithelial: /data/thunder-data/segpath_epithelial
+    segpath_lymphocytes: /data/thunder-data/segpath_lymphocytes
+    cptac_pda_os: /data/CPTAC-PDA
+    leopard_bcr: /data/leopard_bcr
+    pathorob: /data/pathorob
+    surgen: /data/surgen
+    ucla_lung: /data/ucla-lung
