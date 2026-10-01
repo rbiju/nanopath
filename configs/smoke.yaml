@@ -19,10 +19,12 @@ data:
   color_jitter_saturation: 0.4
   hed_jitter: 0.12
   tissue_thresh: 0.5 # training rejects tiles unless this fraction of pixels has RGB saturation > 0.07
+  rot90: false # true adds a random transpose to the H/V flips, so views cover 90/270-degree rotations too
 
 model:
   type: dinov2_vits14_reg
   cls_specialization: null # or {qkv_blocks: 4, lr_mult: null}: CLS-only norms/LayerScales in every block + qkv in the first qkv_blocks; lr_mult null = follow layerwise decay
+  block_expansion: null # or {chunks: 4, freeze_base: true, freeze_embeddings: false}: insert an identity-init block copy after every depth/chunks blocks; freeze_base trains only the new blocks; freeze_embeddings also freezes patch/pos embeds + tokens
 
 train:
   seed: 1337
@@ -68,6 +70,9 @@ dino:
   # DINO prototype layer; `type` selects it, and train.py documents each type's keys.
   head:
     type: weight_norm
+  # What keeps the DINO head from collapsing onto a few prototypes; `type` selects it, and train.py documents each type's keys.
+  balance:
+    type: sinkhorn # sinkhorn | center | memax {weight} | simdino {weight}
   clip_grad: 3.0
   kde_loss_weight: 0.002
   kde_concentration: 10.0

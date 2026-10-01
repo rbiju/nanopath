@@ -12,7 +12,7 @@
 # lightweight DINO/iBOT/KDE validation pass), so the held-out patient slice
 # stays cleanly out-of-distribution from optimization.
 #
-# Each view uses PIL crop/resize/flips, then optional HED jitter, color jitter,
+# Each view uses PIL crop/resize/flips (+ optional transpose for 90-degree rotations), then optional HED jitter, color jitter,
 # grayscale/blur, and normalization.
 #
 # This file is the *pretraining* input pipeline only. The downstream probes
@@ -208,8 +208,11 @@ class TCGATileDataset(Dataset):
         self.global_views = int(train["global_views"])
         self.local_views = int(train["local_views"])
         # Global and local views differ only in crop scale/size; the stochastic tail is shared.
+        # data.rot90 adds a random transpose to the H/V flips, so views cover all 8 square symmetries (90/270 rotations included).
         augment = [
-            v2.RandomHorizontalFlip(), v2.RandomVerticalFlip(), v2.ToImage(),
+            v2.RandomHorizontalFlip(), v2.RandomVerticalFlip(),
+            *([v2.RandomApply([v2.Lambda(lambda im: im.transpose(Image.Transpose.TRANSPOSE), Image.Image)])] if data["rot90"] else []),
+            v2.ToImage(),
         ]
         if not train["gpu_augment"]:
             augment += [

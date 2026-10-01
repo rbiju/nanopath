@@ -194,8 +194,12 @@ class ViT(nn.Module):
     def probe_features(self, x):
         return self(x)["cls"]
 
-    # Specialized checkpoints carry `.cls.` keys; a plain ViT (probe.py, notebooks) rewraps itself to match before loading.
+    # Expanded checkpoints carry extra blocks and specialized ones `.cls.` keys; a plain ViT (probe.py, notebooks) rebuilds itself to match
+    # before loading. Expansion goes first: copies inherit their source's specialization, so specialized qkv stays a contiguous prefix.
     def load_state_dict(self, state_dict, *args, **kwargs):
+        n_blocks = len({k.split(".")[1] for k in state_dict if k.startswith("blocks.")})
+        if n_blocks > len(self.blocks):
+            expand_blocks(self, n_blocks - len(self.blocks))
         if any(".cls." in k for k in state_dict):
             specialize_cls_weights(self, sum(f"blocks.{i}.attn.qkv.cls.weight" in state_dict for i in range(len(self.blocks))))
         return super().load_state_dict(state_dict, *args, **kwargs)
@@ -220,6 +224,20 @@ def specialize_cls_weights(model, qkv_blocks):
         if i < qkv_blocks:
             blk.attn.qkv = Specialized(blk.attn.qkv)
     return model
+
+
+# Block expansion (LLaMA Pro): after every depth/chunks blocks, insert a deepcopy of the chunk's last block with attn.proj and the MLP output
+# zeroed, so each new block is an exact identity at step 0 yet still gets gradients; run after load_pretrained (it shifts block keys).
+# Adds exactly `chunks` blocks (depth must divide evenly) and returns them so train.py can freeze the rest.
+def expand_blocks(model, chunks):
+    new, per = [], len(model.blocks) // chunks
+    for i in range(chunks):
+        blk = deepcopy(model.blocks[(i + 1) * per - 1 + i])
+        for m in (blk.attn.proj, blk.mlp.w3 if isinstance(blk.mlp, SwiGLU) else blk.mlp.fc2):
+            nn.init.zeros_(m.weight), nn.init.zeros_(m.bias)
+        model.blocks.insert((i + 1) * (per + 1) - 1, blk)
+        new.append(blk)
+    return new
 
 
 # Strict-load the model's declared pretrained weights; both halves of a Specialized layer load the same tensor, so step 0 matches DINOv2.
