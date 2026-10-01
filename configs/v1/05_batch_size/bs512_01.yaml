@@ -1,8 +1,8 @@
 project:
-  name: xarch_01_memax_02
+  name: xarch_01_bs512_01
   family: nanopath
-  recipe_id: xarch_01_memax_02
-  output_dir: /data/$USER/nanopath/20261001-xarch_01_memax_02
+  recipe_id: xarch_01_bs512_01
+  output_dir: /data/$USER/nanopath/20261001-xarch_01_bs512_01
   wandb_dir: /data/$USER/nanopath/wandb
 
 data:
@@ -44,7 +44,7 @@ train:
   activation_memory_budget: 0.5   # Exclusive with activation_checkpointing
   compile: true
   fused_adamw: true
-  batch_size: 128
+  batch_size: 512
   gpu_augment: true
   num_workers: 8
   prefetch_factor: 2
@@ -52,23 +52,23 @@ train:
   unique_slide_batches: true # true = no two tiles from the same slide share a batch (tissue_thresh rejections resample within the slide)
   max_train_samples: 1000000 # tile presentations; global/local crops still count as one sample
   max_train_flops: 1000000000000000000 # 1.0e18, the leaderboard FLOP budget
-  log_every: 20
-  save_every: 1000
+  log_every: 7 # 20 at batch 128; keeps the same cadence in samples
+  save_every: 333 # 1000 at batch 128
   # Validation pass every `eval_every` steps over `val_batches` held-out batches
-  eval_every: 200
-  val_batches: 16
+  eval_every: 67 # 200 at batch 128
+  val_batches: 6 # 2304 val tiles, ~the 2048 of 16 x 128
   global_views: 2
   local_views: 8
   global_size: 224
   local_size: 112
-  resume: null # optional explicit checkpoint path; null means always start fresh and wipe output_dir
+  resume: null
 
 dino:
   optimizer: muon # adamw | muon
-  lr: 3.0e-4
+  lr: 1.0e-3
   lr_min: 1.0e-6
   schedule_progress: samples # samples | pace: what drives every schedule (LR, WD, teacher temp, freeze, KDE, EMA); pace = legacy 0.1862 FLOP pace, so the arcs stop early
-  adam_beta2: 0.999
+  adam_beta2: 0.997 # 0.999^3: same second-moment horizon in samples as 0.999 at batch 128
   weight_decay: [0.04, 0.2] # cosine [start, end] over schedule_progress; decoupled, so each step shrinks weights by lr * wd
   warmup_fraction: 0.0909
   freeze_last_layer_fraction: 0.0091
@@ -88,8 +88,7 @@ dino:
     separate_mlps: true # true = each factor gets its own head MLP instead of slicing one shared output
   # What keeps the DINO head from collapsing onto a few prototypes; `type` selects it, and train.py documents each type's keys.
   balance:
-    type: memax # sinkhorn | center | memax {weight} | simdino {weight}
-    weight: 1.0
+    type: sinkhorn # sinkhorn | center | memax {weight} | simdino {weight}
 
   clip_grad: 20.0
   kde_loss_weight: 0.005

@@ -13,7 +13,7 @@
 # stays cleanly out-of-distribution from optimization.
 #
 # Each view uses PIL crop/resize/flips (+ optional transpose for 90-degree rotations), then optional HED jitter, color jitter,
-# grayscale/blur, and normalization.
+# grayscale/blur, and normalization. Optional student-only GPU noise follows: StudentAugment on globals, LocalAugment (site scrubbing) on locals.
 #
 # This file is the *pretraining* input pipeline only. The downstream probes
 # (probe.py) do not import anything from here.
@@ -27,6 +27,7 @@ import numpy as np
 import pyarrow.parquet as pq
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from PIL import Image
 from torch.utils.data import Dataset
 from torchvision.transforms import v2
@@ -136,6 +137,41 @@ class StudentAugment(nn.Module):
                 sigma = (self.blur_lo + torch.rand(n, 1, device=x.device) * (self.blur_hi - self.blur_lo)).expand(-1, 2)
                 blurred = K.filters.gaussian_blur2d(x, (9, 9), sigma, border_type="reflect", separable=True)
                 x = torch.where(torch.rand(n, 1, 1, 1, device=x.device) < self.blur_prob, blurred, x)
+            return ((x - self.mean) / self.std).to(views.dtype)
+
+
+# Site-scrubbing noise on student local crops (the teacher never sees locals), so the student must reach teacher targets without the
+# stain/scanner signature of the tile's site. Each op hits each crop with its own probability, on normalised (L*b, 3, H, W) crop-major views:
+#   stain_mix: Reinhard transfer of LAB mean/std from another image's crop in the same local slot (batches are unique-slide, so real site stains);
+#   rescale: down- then up-sample by one random factor in [0.5, 1) per call (20x vs 40x scans); jpeg: recompress at quality 30-90;
+#   noise: Gaussian sensor noise with per-crop sigma up to 0.03.
+class LocalAugment(nn.Module):
+    def __init__(self, data, stain_mix, rescale, jpeg, noise):
+        super().__init__()
+        self.probs = (float(stain_mix), float(rescale), float(jpeg), float(noise))
+        for name in ("mean", "std"):
+            self.register_buffer(name, torch.tensor(data[name]).view(1, 3, 1, 1))
+
+    @torch.no_grad()
+    def forward(self, views, b):
+        import kornia as K
+        with torch.autocast(device_type=views.device.type, enabled=False):
+            x = (views.float() * self.std + self.mean).clamp(0.0, 1.0)
+            n, size, ar = x.shape[0], x.shape[-1], torch.arange(views.shape[0], device=views.device)
+            # Donor = a different image (so a different slide) in the same local slot; stats come from every crop before any op runs.
+            lab = K.color.rgb_to_lab(x)
+            mu, sd = lab.mean((-2, -1), keepdim=True), lab.std((-2, -1), keepdim=True) + 1e-4
+            donor = ar // b * b + (ar % b + torch.randint(1, b, (n,), device=x.device)) % b
+            scale = 0.5 + 0.5 * random.random()
+            ops = (lambda c, i: K.color.lab_to_rgb((lab[i] - mu[i]) / sd[i] * sd[donor[i]] + mu[donor[i]]),
+                   lambda c, i: F.interpolate(F.interpolate(c, scale_factor=scale, mode="bilinear", antialias=True), size=size, mode="bilinear"),
+                   lambda c, i: K.enhance.jpeg_codec_differentiable(c, 30 + 60 * torch.rand(len(i), device=c.device)),
+                   lambda c, i: (c + 0.03 * torch.rand(len(i), 1, 1, 1, device=c.device) * torch.randn_like(c)).clamp(0.0, 1.0))
+            # Run each op only on its selected crops (JPEG on every local would be wasted compute).
+            for p, op in zip(self.probs, ops):
+                idx = (torch.rand(n, device=x.device) < p).nonzero().flatten()
+                if len(idx):
+                    x[idx] = op(x[idx], idx).clamp(0.0, 1.0)
             return ((x - self.mean) / self.std).to(views.dtype)
 
 

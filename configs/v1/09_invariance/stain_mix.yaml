@@ -1,8 +1,8 @@
 project:
-  name: xarch_01_memax_02
+  name: xarch_01_site_stain_mix
   family: nanopath
-  recipe_id: xarch_01_memax_02
-  output_dir: /data/$USER/nanopath/20261001-xarch_01_memax_02
+  recipe_id: xarch_01_site_stain_mix
+  output_dir: /data/$USER/nanopath/20261001-xarch_01_site_stain_mix
   wandb_dir: /data/$USER/nanopath/wandb
 
 data:
@@ -19,11 +19,16 @@ data:
   color_jitter_saturation: 0.25
   hed_jitter: 0.06
   tissue_thresh: 0.0
-  rot90: false # true adds a random transpose to the H/V flips, so views cover 90/270-degree rotations too
+  rot90: true
   student_augment:
     hed_jitter: 0.05
     blur_prob: 0.5
     blur_sigma: [0.1, 1.0]
+  local_augment:
+    stain_mix: 0.5 # LAB mean/std of another slide's crop in the batch
+    rescale: 0.25 # down/up-sample by [0.5, 1)
+    jpeg: 0.25 # recompress at quality 30-90
+    noise: 0.25 # Gaussian noise, sigma up to 0.03
 
 model:
   type: dinov2_vits14_reg
@@ -88,8 +93,7 @@ dino:
     separate_mlps: true # true = each factor gets its own head MLP instead of slicing one shared output
   # What keeps the DINO head from collapsing onto a few prototypes; `type` selects it, and train.py documents each type's keys.
   balance:
-    type: memax # sinkhorn | center | memax {weight} | simdino {weight}
-    weight: 1.0
+    type: sinkhorn # sinkhorn | center | memax {weight} | simdino {weight}
 
   clip_grad: 20.0
   kde_loss_weight: 0.005

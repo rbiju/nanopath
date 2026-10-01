@@ -30,7 +30,7 @@ import yaml
 from torch.utils.data import DataLoader, Subset
 from torch.utils.flop_counter import FlopCounterMode
 
-from dataloader import GPUAugment, StudentAugment, TCGATileDataset, TILE_SIZE, UniqueSlideBatchSampler
+from dataloader import GPUAugment, LocalAugment, StudentAugment, TCGATileDataset, TILE_SIZE, UniqueSlideBatchSampler
 from model import CrossJEPAPredictor, DINOHead, FactoredDINOHead, JEPAPredictor, ViT, expand_blocks, load_pretrained, specialize_cls_weights
 from probe import (
     completed_probe_summary,
@@ -576,6 +576,12 @@ def main():
         if set(student_augment_cfg) != {"hed_jitter", "blur_prob", "blur_sigma"}:
             raise ValueError(f"data.student_augment keys {sorted(student_augment_cfg)} invalid; expected exactly hed_jitter, blur_prob, blur_sigma")
         student_augment = StudentAugment(cfg["data"], **student_augment_cfg).to(device)
+    # Optional data.local_augment: {stain_mix, rescale, jpeg, noise} per-crop probabilities of site-scrubbing ops on student local crops.
+    local_augment = lambda views, b: views
+    if "local_augment" in cfg["data"]:
+        if set(cfg["data"]["local_augment"]) != {"stain_mix", "rescale", "jpeg", "noise"}:
+            raise ValueError(f"data.local_augment keys {sorted(cfg['data']['local_augment'])} invalid; expected exactly stain_mix, rescale, jpeg, noise")
+        local_augment = LocalAugment(cfg["data"], **cfg["data"]["local_augment"]).to(device)
     train_ds = TCGATileDataset(cfg, is_train=True)
     val_ds = TCGATileDataset(cfg, is_train=False)
 
@@ -715,7 +721,7 @@ def main():
                 p_sum = p_sum + anchor_probs(s_logits)
         local_loss = 0.0
         if lf is not None:
-            sl_cls = student_dino_head(student_backbone(lf, checkpoint=ckpt)["cls"])[head_out]
+            sl_cls = student_dino_head(student_backbone(local_augment(lf, b), checkpoint=ckpt)["cls"])[head_out]
             # CE is linear in targets; keep the original reduction order for eager recipes.
             local_loss = (dino_ce_fn(sl_cls.view(L, b, *sl_cls.shape[1:]), t_prob.sum(0), student_temp) * L if train_cfg["compile"]
                           else sum(dino_ce_fn(x, y, student_temp) for x in sl_cls.chunk(L) for y in t_prob)) / (2 * L + 2 * R)
