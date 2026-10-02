@@ -110,6 +110,7 @@ dino:
     targets: 64
     target_decay: -0.5
     context_cls: none
+    dihedral: 0.0 # probability each student global copy gets a random 90-degree rotation/flip vs the upright teacher; 0 = off
 
 probe:
   enabled: true

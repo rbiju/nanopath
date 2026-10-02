@@ -397,11 +397,14 @@ def main():
     #   cross: {depth, width, context_regions: [{blocks, side, count}, ...], targets, target_decay, context_cls}. Student sees only
     #          `count` contexts of `blocks` side x side squares per global view; cross-attention predictor regresses `targets` unseen patches.
     #          context_cls picks the CLS the predictor reads: student (JEPA trains the student CLS), teacher (frozen EMA CLS of the full clean crop), or none.
+    #   both:  dihedral is the probability that each student global copy gets a random non-identity 90-degree rotation/flip (teacher stays upright),
+    #          so DINO and JEPA must match upright targets from rotated views; 0 = off.
     jepa_cfg = dict(dino_cfg["jepa"])
     jepa_type = jepa_cfg.pop("type")
-    jepa_args = {"block": {"depth", "width", "blocks", "block_scale"}, "cross": {"depth", "width", "context_regions", "targets", "target_decay", "context_cls"}}
+    jepa_args = {"block": {"depth", "width", "blocks", "block_scale", "dihedral"}, "cross": {"depth", "width", "context_regions", "targets", "target_decay", "context_cls", "dihedral"}}
     if jepa_type not in jepa_args or set(jepa_cfg) != jepa_args[jepa_type]:
         raise ValueError(f"dino.jepa type={jepa_type!r} with keys {sorted(jepa_cfg)} invalid; expected one of {jepa_args}")
+    dihedral = float(jepa_cfg["dihedral"])
     if jepa_type == "block":
         context_regions = [(1, global_grid, 1)]
         student_predictor = JEPAPredictor(student_backbone.embed_dim, int(jepa_cfg["depth"]), int(jepa_cfg["width"])).to(device)
@@ -690,13 +693,28 @@ def main():
         for count, keep_idx, mask_idx, masks, mask_w in mask_groups:
             # Each region copy draws its own student noise; the teacher and JEPA targets stay on the clean crop.
             sv = student_augment(gf if count == 1 else gf.repeat(count, 1, 1, 1))
+            inv = None
+            if dihedral > 0:
+                # Element e of D4 (rot90 by e % 4, then a flip when e >= 4) per copy; 224 px = 16 x 16 whole patches, so it permutes patches exactly.
+                # Running it on an index grid gives inv[c, p] = where original patch p lands, so context and queries move with the tissue.
+                elem = torch.where(torch.rand(len(sv), device=sv.device) < dihedral, torch.randint(1, 8, (len(sv),), device=sv.device), 0)
+                src = torch.arange(global_patches, device=sv.device).view(1, global_grid, global_grid).repeat(len(sv), 1, 1)
+                sv = sv.clone()  # never rotate gf in place: the teacher crop is reused by later mask groups
+                for e in range(1, 8):
+                    sel = elem == e
+                    sv[sel], src[sel] = ((torch.rot90(z[sel], e % 4, (-2, -1)).flip(-1) if e >= 4 else torch.rot90(z[sel], e, (-2, -1))) for z in (sv, src))
+                inv = src.flatten(1).argsort(1)
+                keep_idx = None if keep_idx is None else inv.gather(1, keep_idx)
+                masks = None if masks is None else torch.zeros_like(masks).scatter_(1, inv, masks)
             sg = student_backbone(sv, masks=masks, checkpoint=ckpt, keep_idx=keep_idx)
             t_flat = t_prob.flatten(0, 1)
             s_logits, s_chunks = student_dino_head(sg["cls"])
             global_loss = global_loss + dino_ce_fn((s_logits, s_chunks)[head_out], t_flat if count == 1 else t_flat.repeat(count, 1, 1), student_temp) * 2 * count / (2 * L + 2 * R)
             if keep_idx is None:
                 patch_target = F.layer_norm(t["patches"].flatten(0, 1), (D,))[mask_idx]
-                patch_prediction = student_predictor(sg["patches"]).flatten(0, 1)[mask_idx]
+                patch_prediction = student_predictor(sg["patches"])
+                # Back to the teacher's upright patch order, so mask_idx picks the prediction for each original patch.
+                patch_prediction = (patch_prediction if inv is None else patch_prediction.gather(1, inv[..., None].expand(-1, -1, D))).flatten(0, 1)[mask_idx]
                 jepa = jepa_loss_fn(patch_prediction, patch_target, mask_w) / max(1, b * 2)
             else:
                 # Gather targets per region chunk so the teacher grid is never duplicated count times.
@@ -704,7 +722,9 @@ def main():
                 patch_target = torch.cat([tp.gather(1, m[..., None].expand(-1, -1, D)) for m in mask_idx.chunk(count)])
                 # Queries are the backbone's own mask_token (trained by JEPA) + patch pos (detached, so only the encoder path trains it).
                 query_table = student_backbone.mask_token + student_backbone.patch_pos_embed(global_grid, global_grid).detach()
-                queries = query_table.expand(mask_idx.shape[0], -1, -1).gather(1, mask_idx[..., None].expand(-1, -1, D))
+                # Queries sit where each target patch lands in the student's (possibly rotated) frame; targets stay upright.
+                query_idx = mask_idx if inv is None else inv.gather(1, mask_idx)
+                queries = query_table.expand(mask_idx.shape[0], -1, -1).gather(1, query_idx[..., None].expand(-1, -1, D))
                 context_cls = {"student": sg["cls"], "teacher": t["cls"].repeat(count, 1), "none": None}[jepa_cfg["context_cls"]]
                 context = torch.cat([*([] if context_cls is None else [context_cls[:, None]]), sg["registers"], sg["patches"]], dim=1)
                 jepa = F.smooth_l1_loss(student_predictor(context, queries), patch_target)
