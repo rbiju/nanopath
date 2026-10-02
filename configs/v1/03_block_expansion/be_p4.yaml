@@ -49,6 +49,7 @@ train:
   prefetch_factor: 2
   persistent_workers: true
   unique_slide_batches: true # true = no two tiles from the same slide share a batch (tissue_thresh rejections resample within the slide)
+  site_balance: 0.0 # tissue-source-site balance (needs unique_slide_batches): site share ~ site_tiles^(1 - x); 0 = tile-uniform, 1 = sites as equal as one-tile-per-slide allows
   max_train_samples: 1000000 # tile presentations; global/local crops still count as one sample
   max_train_flops: 1000000000000000000 # 1.0e18, the leaderboard FLOP budget
   log_every: 20
@@ -65,10 +66,12 @@ train:
 dino:
   optimizer: muon # adamw | muon
   lr: 3.0e-4
+  head_lr_mult: 1.0 # LR multiplier for the DINO head + JEPA predictor (randomly initialised); backbone keeps dino.lr
   lr_min: 1.0e-6
   schedule_progress: samples # samples | pace: what drives every schedule (LR, WD, teacher temp, freeze, KDE, EMA); pace = legacy 0.1862 FLOP pace, so the arcs stop early
   adam_beta2: 0.999
   weight_decay: [0.04, 0.2] # cosine [start, end] over schedule_progress; decoupled, so each step shrinks weights by lr * wd
+  teacher_momentum: [0.994, 1.0] # teacher EMA cosine [start, end] over schedule_progress at a 128-image batch; rescaled per step for other batch sizes
   warmup_fraction: 0.0909
   freeze_last_layer_fraction: 0.0091
   layerwise_decay: 0.7

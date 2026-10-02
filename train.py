@@ -2,7 +2,7 @@
 # DINO CLS self-distillation (teacher targets balanced by Sinkhorn-Knopp, centering, ME-MAX, or SimDINO's coding rate),
 # I-JEPA masked-patch prediction, a KDE uniformity term on the
 # L2-normalised CLS tokens, and an optional CLS isotropy term. YAML drives the tunable knobs (backbone variant,
-# optimizer (AdamW or Muon), LR + LR scheduler, drop path, layerwise decay, KDE weight + concentration, isotropy weight,
+# optimizer (AdamW or Muon), LR + LR scheduler, head/predictor LR multiplier, teacher EMA momentum, drop path, layerwise decay, KDE weight + concentration, isotropy weight,
 # FLOP/sample budgets, batch size, CLS specialization, block expansion); other objective hyperparameters are hardcoded
 # inline at their use sites.
 
@@ -244,8 +244,9 @@ def make_region_idx(batch, grid, device, n_blocks, side, k, decay):
 # With `muon`, hidden matrices (transformer blocks + DINO head MLP) get group["muon"] = number of stacked sub-matrices
 # (fused qkv=3, kv=2, else 1); 0 means AdamW. Embeddings, tokens, norms, biases, proj_in/proj, last_layer, and CLS-specialized
 # (`.cls.`) matrices stay AdamW, the latter because their one-token-per-image gradients are too low-rank to orthogonalize.
-# `cls_lr_mult` (None = follow layer-wise decay) sets the LR of `.cls.` backbone copies.
-def build_param_groups(student_backbone, student_dino_head, student_predictor, layerwise_decay, patch_embed_lr_mult, muon, cls_lr_mult=None):
+# `cls_lr_mult` (None = follow layer-wise decay) sets the LR of `.cls.` backbone copies; `head_lr_mult` scales the randomly initialised
+# DINO head and JEPA predictor, so they can fit harder while the pretrained backbone keeps its LR.
+def build_param_groups(student_backbone, student_dino_head, student_predictor, layerwise_decay, patch_embed_lr_mult, muon, head_lr_mult, cls_lr_mult=None):
     depth = len(student_backbone.blocks)
     # Coalesce params that share (lr_mult, wd_mult, last_layer) into a single group each (~30 groups
     # instead of one-per-param), so AdamW's foreach path fuses the step across many tensors rather than
@@ -256,7 +257,7 @@ def build_param_groups(student_backbone, student_dino_head, student_predictor, l
         for name, p in module.named_parameters():
             if not p.requires_grad:
                 continue
-            lr_mult = 1.0
+            lr_mult = 1.0 if kind == "backbone" else head_lr_mult
             if kind == "backbone" and ".cls." in name and cls_lr_mult is not None:
                 lr_mult = cls_lr_mult
             elif kind == "backbone" and name.startswith("blocks."):
@@ -428,7 +429,7 @@ def main():
     # Param groups carry per-parameter LR/WD multipliers (LWD + patch_embed + biases-no-WD); dino.optimizer is adamw or muon,
     # and muon keeps AdamW for everything that isn't a hidden matrix, so opts = [AdamW] or [AdamW, Muon].
     muon = {"adamw": False, "muon": True}[dino_cfg["optimizer"]]
-    param_groups = build_param_groups(student_backbone, student_dino_head, student_predictor, dino_cfg["layerwise_decay"], dino_cfg["patch_embed_lr_mult"], muon, None if cls_spec is None else cls_spec["lr_mult"])
+    param_groups = build_param_groups(student_backbone, student_dino_head, student_predictor, dino_cfg["layerwise_decay"], dino_cfg["patch_embed_lr_mult"], muon, float(dino_cfg["head_lr_mult"]), None if cls_spec is None else cls_spec["lr_mult"])
     opt = torch.optim.AdamW([g for g in param_groups if not g["muon"]], lr=1.0, betas=(0.9, dino_cfg["adam_beta2"]), fused=train_cfg["fused_adamw"])
     opts = [opt, Muon([g for g in param_groups if g["muon"]], train_cfg["compile"])] if muon else [opt]
     step = 0
@@ -598,8 +599,11 @@ def main():
         "prefetch_factor": train_cfg["prefetch_factor"] if train_cfg["num_workers"] > 0 else None,
         "persistent_workers": train_cfg["persistent_workers"] and train_cfg["num_workers"] > 0,
     }
-    # train.unique_slide_batches swaps plain shuffling for a batch sampler that never puts two tiles from one slide in a batch.
-    train_loader = (DataLoader(train_ds, batch_sampler=UniqueSlideBatchSampler(train_ds.slide_of, batch_size, train_cfg["seed"]), **{k: v for k, v in loader_kwargs.items() if k not in ("batch_size", "drop_last")})
+    # train.unique_slide_batches swaps plain shuffling for a batch sampler that never puts two tiles from one slide in a batch;
+    # train.site_balance (needs it) dials tissue-source-site sampling from tile-uniform (0) to every site equally often (1).
+    if train_cfg["site_balance"] > 0 and not train_cfg["unique_slide_batches"]:
+        raise ValueError("train.site_balance > 0 requires train.unique_slide_batches: true")
+    train_loader = (DataLoader(train_ds, batch_sampler=UniqueSlideBatchSampler(train_ds.slide_of, train_ds.site_of, batch_size, train_cfg["seed"], float(train_cfg["site_balance"])), **{k: v for k, v in loader_kwargs.items() if k not in ("batch_size", "drop_last")})
                     if train_cfg["unique_slide_batches"] else DataLoader(train_ds, shuffle=True, **loader_kwargs))
     # The val split is stored slide-contiguous, so read a fixed random subset (seeded by split_seed, identical across runs and evals)
     # to give each val batch many slides; unshuffled batches held 1-2 slides and skewed every batch-level val metric.
@@ -905,8 +909,9 @@ def main():
                 print(f"{console_prefix()} measured_flops_per_step: {measured_flops_per_step:,}  (fwd+bwd counted at batch {probe_b}, scaled to {batch_size})", flush=True)
             step_train_flops = measured_flops_per_step
             with torch.no_grad():
-                # Per-step momentum is rescaled to a 128-image reference batch, so the teacher lags the student by a fixed number of samples at any batch size.
-                m = cosine_schedule(0.994, 1.0, prog) ** (batch_size / 128)
+                # dino.teacher_momentum is a cosine [start, end] at the 128-image reference batch; per-step momentum is rescaled so the teacher
+                # lags the student by a fixed number of samples at any batch size.
+                m = cosine_schedule(*dino_cfg["teacher_momentum"], prog) ** (batch_size / 128)
                 update_ema(student_backbone, teacher_backbone, m)
                 update_ema(student_dino_head, teacher_dino_head, m)
             examples_seen += batch_size
@@ -1042,6 +1047,7 @@ def main():
         "backbone_activated_params": backbone_activated_params,
         "batch_size": batch_size,
         "unique_slide_batches": train_cfg["unique_slide_batches"],
+        "site_balance": train_cfg["site_balance"],
         "activation_memory_budget": train_cfg["activation_memory_budget"],
         "max_train_samples": max_train_samples,
         "max_train_flops": max_train_flops,
@@ -1073,6 +1079,8 @@ def main():
         "drop_path_rate": dino_cfg["drop_path_rate"],
         "layerwise_decay": dino_cfg["layerwise_decay"],
         "weight_decay": dino_cfg["weight_decay"],
+        "head_lr_mult": dino_cfg["head_lr_mult"],
+        "teacher_momentum": dino_cfg["teacher_momentum"],
         "cls_specialization": cls_spec,
         "block_expansion": expansion,
         "probe_target_samples": probe_targets,

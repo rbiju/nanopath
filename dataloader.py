@@ -175,11 +175,16 @@ class LocalAugment(nn.Module):
             return ((x - self.mean) / self.std).to(views.dtype)
 
 
-# Batch sampler with no repeated slide per batch: each batch draws distinct slides weighted by remaining tiles (so tiles
-# are still visited ~uniformly), then pops each slide's next shuffled tile; the epoch ends when fewer than batch_size slides remain.
+# Batch sampler with no repeated slide per batch: each batch draws distinct slides weighted by remaining tiles x (tiles at the slide's
+# tissue source site)^-site_balance, then pops each slide's next shuffled tile. A site's share of draws is ~ site_tiles^(1 - site_balance):
+# 0 visits tiles ~uniformly and ends the epoch when fewer than batch_size slides remain; 1 draws every site equally often. With
+# site_balance > 0 an exhausted slide refills (replaying its shuffled order), so small sites keep their share instead of dropping out.
 class UniqueSlideBatchSampler(torch.utils.data.Sampler):
-    def __init__(self, slide_of, batch_size, seed):
+    def __init__(self, slide_of, site_of, batch_size, seed, site_balance):
         self.slide_of, self.batch_size, self.seed, self.epoch = torch.as_tensor(slide_of, dtype=torch.long), batch_size, seed, 0
+        slide_site = torch.empty(int(self.slide_of.max()) + 1, dtype=torch.long)
+        slide_site[self.slide_of] = torch.as_tensor(site_of, dtype=torch.long)
+        self.site_weight, self.refill = torch.bincount(slide_site.new_tensor(site_of))[slide_site].double() ** -site_balance, site_balance > 0
 
     def __len__(self):
         return len(self.slide_of) // self.batch_size
@@ -191,10 +196,14 @@ class UniqueSlideBatchSampler(torch.utils.data.Sampler):
         order = perm[self.slide_of[perm].argsort(stable=True)]  # tiles grouped by slide, shuffled within each slide
         counts = torch.bincount(self.slide_of)
         starts, remaining = counts.cumsum(0) - counts, counts.clone()
-        while int((remaining > 0).sum()) >= self.batch_size:
-            slides = torch.multinomial(remaining.double(), self.batch_size, replacement=False, generator=g)
+        for _ in range(len(self)):
+            if int((remaining > 0).sum()) < self.batch_size:
+                break
+            slides = torch.multinomial(remaining.double() * self.site_weight, self.batch_size, replacement=False, generator=g)
             remaining[slides] -= 1
             yield order[starts[slides] + remaining[slides]].tolist()
+            if self.refill:
+                remaining[slides] = torch.where(remaining[slides] == 0, counts[slides], remaining[slides])
 
 
 # Map-style TCGA tile dataset that emits global/local multi-view stacks for train.py.
@@ -221,8 +230,8 @@ class TCGATileDataset(Dataset):
         # the JPEG bytes column stays on disk until __getitem__.
         in_split_shard = []
         in_split_row = []
-        in_split_slide = []
-        slide_codes = {}
+        in_split_slide, in_split_site = [], []
+        slide_codes, site_codes = {}, {}
         for shard_idx, shard_path in enumerate(self.shards):
             paths = pq.read_table(str(shard_path), columns=["path"], memory_map=True)["path"].to_pylist()
             for row_idx, p in enumerate(paths):
@@ -232,6 +241,7 @@ class TCGATileDataset(Dataset):
                     in_split_shard.append(shard_idx)
                     in_split_row.append(row_idx)
                     in_split_slide.append(slide_codes.setdefault(p.split("/", 1)[0], len(slide_codes)))
+                    in_split_site.append(site_codes.setdefault(p.split("-", 2)[1], len(site_codes)))  # TCGA-XX-...: XX = tissue source site
         if not in_split_shard:
             raise ValueError(f"no {'train' if is_train else 'val'} tiles found in {dataset_dir}; check val_fraction={data['val_fraction']}")
         # Two parallel int32 arrays (~32 MB total for 4M tiles) shared COW across DataLoader fork-workers.
@@ -239,6 +249,7 @@ class TCGATileDataset(Dataset):
         self.row_of = np.asarray(in_split_row, dtype=np.int32)
         # Dense 0..S-1 slide code per tile; unique-slide batching reads it, and tissue rejections then resample within the slide.
         self.slide_of = np.asarray(in_split_slide, dtype=np.int32)
+        self.site_of = np.asarray(in_split_site, dtype=np.int32)
         self.unique_slide_batches = is_train and bool(train["unique_slide_batches"])
         mean, std = data["mean"], data["std"]
         self.global_views = int(train["global_views"])

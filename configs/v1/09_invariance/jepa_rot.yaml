@@ -1,8 +1,8 @@
 project:
-  name: xarch_01_simdino_w1
+  name: xarch_01_inv_jepa_rot
   family: nanopath
-  recipe_id: xarch_01_simdino_w1
-  output_dir: /data/$USER/nanopath/20260929-xarch_01_simdino_w1
+  recipe_id: xarch_01_inv_jepa_rot
+  output_dir: /data/$USER/nanopath/20261002-xarch_01_inv_jepa_rot
   wandb_dir: /data/$USER/nanopath/wandb
 
 data:
@@ -19,7 +19,7 @@ data:
   color_jitter_saturation: 0.25
   hed_jitter: 0.06
   tissue_thresh: 0.0
-  rot90: false # true adds a random transpose to the H/V flips, so views cover 90/270-degree rotations too
+  rot90: true # true adds a random transpose to the H/V flips, so views cover 90/270-degree rotations too
   student_augment:
     hed_jitter: 0.05
     blur_prob: 0.5
@@ -84,15 +84,14 @@ dino:
   # DINO prototype layer; `type` selects it, and train.py documents each type's keys.
   head:
     # type: weight_norm
-    type: factored # prototypes are unused under simdino; the two factors are two separately aligned 192-d embeddings
+    type: factored
     prototypes: 1024
     factors: 2
     decorr_weight: 0.05 # cross-factor chunk correlation penalty, 0 = off
     separate_mlps: true # true = each factor gets its own head MLP instead of slicing one shared output
   # What keeps the DINO head from collapsing onto a few prototypes; `type` selects it, and train.py documents each type's keys.
   balance:
-    type: simdino # sinkhorn | center | memax {weight} | simdino {weight}
-    weight: 1.0 # scales the per-dimension coding rate (~0.8 per factor when isotropic) against the cosine alignment
+    type: sinkhorn # sinkhorn | center | memax {weight} | simdino {weight}
 
   clip_grad: 20.0
   kde_loss_weight: 0.005
@@ -109,7 +108,7 @@ dino:
     targets: 64
     target_decay: -0.5
     context_cls: none
-    dihedral: 0.0 # probability each student global copy gets a random 90-degree rotation/flip vs the upright teacher; 0 = off
+    dihedral: 1.0 # probability each student global copy gets a random 90-degree rotation/flip vs the upright teacher; 0 = off
 
 probe:
   enabled: true

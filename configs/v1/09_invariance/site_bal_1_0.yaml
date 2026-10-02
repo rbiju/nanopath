@@ -1,8 +1,8 @@
 project:
-  name: xarch_01_simdino_w1
+  name: xarch_01_site_bal_1_0
   family: nanopath
-  recipe_id: xarch_01_simdino_w1
-  output_dir: /data/$USER/nanopath/20260929-xarch_01_simdino_w1
+  recipe_id: xarch_01_site_bal_1_0
+  output_dir: /data/$USER/nanopath/20261002-xarch_01_site_bal_1_0
   wandb_dir: /data/$USER/nanopath/wandb
 
 data:
@@ -50,7 +50,7 @@ train:
   prefetch_factor: 2
   persistent_workers: true
   unique_slide_batches: true # true = no two tiles from the same slide share a batch (tissue_thresh rejections resample within the slide)
-  site_balance: 0.0 # tissue-source-site balance (needs unique_slide_batches): site share ~ site_tiles^(1 - x); 0 = tile-uniform, 1 = sites as equal as one-tile-per-slide allows
+  site_balance: 1.0 # tissue-source-site balance (needs unique_slide_batches): site share ~ site_tiles^(1 - x); 0 = tile-uniform, 1 = sites as equal as one-tile-per-slide allows
   max_train_samples: 1000000 # tile presentations; global/local crops still count as one sample
   max_train_flops: 1000000000000000000 # 1.0e18, the leaderboard FLOP budget
   log_every: 20
@@ -84,15 +84,14 @@ dino:
   # DINO prototype layer; `type` selects it, and train.py documents each type's keys.
   head:
     # type: weight_norm
-    type: factored # prototypes are unused under simdino; the two factors are two separately aligned 192-d embeddings
+    type: factored
     prototypes: 1024
     factors: 2
     decorr_weight: 0.05 # cross-factor chunk correlation penalty, 0 = off
     separate_mlps: true # true = each factor gets its own head MLP instead of slicing one shared output
   # What keeps the DINO head from collapsing onto a few prototypes; `type` selects it, and train.py documents each type's keys.
   balance:
-    type: simdino # sinkhorn | center | memax {weight} | simdino {weight}
-    weight: 1.0 # scales the per-dimension coding rate (~0.8 per factor when isotropic) against the cosine alignment
+    type: sinkhorn # sinkhorn | center | memax {weight} | simdino {weight}
 
   clip_grad: 20.0
   kde_loss_weight: 0.005
