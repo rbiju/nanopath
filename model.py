@@ -265,11 +265,12 @@ class DINOHead(nn.Module):
             self.last_layer.parametrizations.weight.original0.fill_(1.0)
         self.last_layer.parametrizations.weight.original0.requires_grad_(False)
 
-    # Returns (logits (B, 1, n_prototypes), normalized bottleneck (B, 1, bottleneck)) in the (B, factors, ...) layout FactoredDINOHead shares.
+    # Returns (logits (B, 1, n_prototypes), normalized bottleneck (B, 1, bottleneck), raw bottleneck (B, 1, bottleneck)) in the
+    # (B, factors, ...) layout FactoredDINOHead shares; the raw output feeds SIGReg, which needs un-normalised embeddings.
     def forward(self, x):
-        x = self.mlp(x)
-        x = F.normalize(x, dim=-1, p=2)
-        return self.last_layer(x)[:, None], x[:, None]
+        z = self.mlp(x)
+        x = F.normalize(z, dim=-1, p=2)
+        return self.last_layer(x)[:, None], x[:, None], z[:, None]
 
 
 # DINO head with prototypes as a plain Parameter, split into `factors` codebooks: the bottleneck is cut into `factors`
@@ -285,12 +286,14 @@ class FactoredDINOHead(nn.Module):
         self.prototypes = nn.Parameter(torch.empty(n_prototypes, bottleneck_dim // factors))
         nn.init.kaiming_uniform_(self.prototypes, a=5 ** 0.5)
 
-    # Returns (cosine logits (B, factors, n_prototypes // factors), normalized chunks (B, factors, bottleneck // factors)); non-divisible sizes fail loudly in view().
+    # Returns (cosine logits (B, factors, n_prototypes // factors), normalized chunks (B, factors, bottleneck // factors), raw chunks
+    # (same shape, pre-normalisation, for SIGReg)); non-divisible sizes fail loudly in view().
     def forward(self, x):
         z = torch.cat([m(x) for m in self.mlp], -1) if isinstance(self.mlp, nn.ModuleList) else self.mlp(x)
-        chunks = F.normalize(z.view(x.shape[0], self.factors, -1), dim=-1)
+        z = z.view(x.shape[0], self.factors, -1)
+        chunks = F.normalize(z, dim=-1)
         protos = F.normalize(self.prototypes, dim=-1).view(self.factors, -1, chunks.shape[-1])
-        return torch.einsum("bfd,fkd->bfk", chunks, protos), chunks
+        return torch.einsum("bfd,fkd->bfk", chunks, protos), chunks, z
 
 
 # I-JEPA predicts EMA-teacher patch features from the student's block-masked tokens.

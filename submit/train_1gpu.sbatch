@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-#SBATCH --job-name=xarch_01_site_stain_mix
+#SBATCH --job-name=xarch_01_simdino_01
 #SBATCH --nodes=1
 #SBATCH --ntasks-per-node=1
 #SBATCH --gpus-per-task=1

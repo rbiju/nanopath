@@ -168,6 +168,16 @@ def coding_rate(z, eps=0.5):
         return 0.5 * torch.logdet(torch.eye(d, device=z.device) + gram).sum() / d
 
 
+# SIGReg (LeJEPA): Epps-Pulley distance between the empirical characteristic function of `n_dirs` fresh random 1-D projections (slices) of
+# (N, D) raw embeddings and N(0, 1)'s, Gaussian-weighted over t in [-3, 3] (even integrand, so [0, 3] doubled); O(1) for an isotropic standard Gaussian batch.
+def sigreg(z, n_dirs):
+    with torch.autocast("cuda", enabled=False):
+        t = torch.linspace(0, 3, 17, device=z.device)
+        gauss = torch.exp(-t ** 2 / 2)  # N(0, 1)'s characteristic function, also the integration weight
+        x = (z.float() @ F.normalize(torch.randn(z.shape[1], n_dirs, device=z.device), dim=0))[..., None] * t  # (N, dirs, knots)
+        return 2 * len(z) * torch.trapezoid(((x.cos().mean(0) - gauss) ** 2 + x.sin().mean(0) ** 2) * gauss, t).mean()
+
+
 # Weight masked-patch regression by each image's inverse mask count.
 def jepa_regression(student, teacher, weights):
     return F.smooth_l1_loss(student, teacher, reduction="none").mean(-1).mul(weights).sum()
@@ -357,20 +367,21 @@ def main():
     teacher_backbone.train(False)
     for p in teacher_backbone.parameters():
         p.requires_grad = False
-    # dino.head.type picks the prototype layer; its sibling keys are exactly that type's arguments.
-    #   weight_norm: {}. DINOv2's single 131072-way weight-normed last_layer.
-    #   factored: {prototypes, factors, decorr_weight, separate_mlps}. `prototypes` Parameter vectors split evenly into `factors` codebooks over equal
-    #             bottleneck chunks; decorr_weight penalizes cross-factor chunk correlation (0 = off), ramped in with LR warmup; separate_mlps gives
-    #             each factor its own head MLP instead of slicing one shared output.
+    # dino.head.type picks the prototype layer; its sibling keys are exactly that type's arguments. Every type takes hidden_dim and
+    # bottleneck_dim: the 3-layer head MLP is embed_dim -> hidden_dim -> hidden_dim -> bottleneck_dim (the projection SIGReg/SimDINO act on).
+    #   weight_norm: {hidden_dim, bottleneck_dim}. DINOv2's single 131072-way weight-normed last_layer.
+    #   factored: {hidden_dim, bottleneck_dim, prototypes, factors, decorr_weight, separate_mlps}. `prototypes` Parameter vectors split evenly into
+    #             `factors` codebooks over equal bottleneck chunks; decorr_weight penalizes cross-factor chunk correlation (0 = off), ramped in with
+    #             LR warmup; separate_mlps gives each factor its own head MLP instead of slicing one shared output.
     head_cfg = dict(dino_cfg["head"])
     head_type = head_cfg.pop("type")
-    head_args = {"weight_norm": set(), "factored": {"prototypes", "factors", "decorr_weight", "separate_mlps"}}
+    head_args = {"weight_norm": {"hidden_dim", "bottleneck_dim"}, "factored": {"hidden_dim", "bottleneck_dim", "prototypes", "factors", "decorr_weight", "separate_mlps"}}
     if head_type not in head_args or set(head_cfg) != head_args[head_type]:
         raise ValueError(f"dino.head type={head_type!r} with keys {sorted(head_cfg)} invalid; expected one of {head_args}")
     if head_type == "weight_norm":
-        student_dino_head, codebook_size = DINOHead(student_backbone.embed_dim, 131072, dino_cfg["head_hidden_dim"], dino_cfg["head_bottleneck_dim"], 3).to(device), 131072
+        student_dino_head, codebook_size = DINOHead(student_backbone.embed_dim, 131072, int(head_cfg["hidden_dim"]), int(head_cfg["bottleneck_dim"]), 3).to(device), 131072
     else:
-        student_dino_head = FactoredDINOHead(student_backbone.embed_dim, int(head_cfg["prototypes"]), dino_cfg["head_hidden_dim"], dino_cfg["head_bottleneck_dim"], 3, int(head_cfg["factors"]), bool(head_cfg["separate_mlps"])).to(device)
+        student_dino_head = FactoredDINOHead(student_backbone.embed_dim, int(head_cfg["prototypes"]), int(head_cfg["hidden_dim"]), int(head_cfg["bottleneck_dim"]), 3, int(head_cfg["factors"]), bool(head_cfg["separate_mlps"])).to(device)
         codebook_size = int(head_cfg["prototypes"]) // int(head_cfg["factors"])
     decorr_weight = 0.0 if head_type == "weight_norm" else float(head_cfg["decorr_weight"])
     # dino.temp_scale multiplies both DINO temperatures: `auto` = sqrt(ln 131072 / ln K), since softmax sharpness is relative to ~1/sqrt(2 ln K)
@@ -382,14 +393,17 @@ def main():
     #   memax: {weight}. MSN: teacher softmax at a fixed 0.025 temperature, no balancing; weight * -entropy of the student's batch-mean
     #          prediction (all global + local views) spreads prototype use. The `balance` log is this negative entropy for every non-SimDINO type.
     #   simdino: {weight}. Prototypes unused: student head chunks align (cosine) to the teacher's, and weight * -coding_rate prevents collapse.
+    #   sigreg: {weight, slices}. LeJEPA: prototypes unused; every student view's raw head output regresses (MSE) the mean of the teacher's two
+    #          global-view outputs, and weight * SIGReg over `slices` fresh random directions pushes each view-batch toward an isotropic Gaussian.
     balance_cfg = dict(dino_cfg["balance"])
     balance_type = balance_cfg.pop("type")
-    balance_args = {"sinkhorn": set(), "center": set(), "memax": {"weight"}, "simdino": {"weight"}}
+    balance_args = {"sinkhorn": set(), "center": set(), "memax": {"weight"}, "simdino": {"weight"}, "sigreg": {"weight", "slices"}}
     if balance_type not in balance_args or set(balance_cfg) != balance_args[balance_type]:
         raise ValueError(f"dino.balance type={balance_type!r} with keys {sorted(balance_cfg)} invalid; expected one of {balance_args}")
     balance_weight = float(balance_cfg.get("weight", 0.0))
-    student_temp = None if balance_type == "simdino" else 0.1 * temp_scale
-    head_out = int(balance_type == "simdino")  # DINO heads return (logits, normalized chunks); SimDINO trains on the chunks
+    sigreg_slices = int(balance_cfg.get("slices", 0))
+    student_temp = None if balance_type in ("simdino", "sigreg") else 0.1 * temp_scale
+    head_out = {"simdino": 1, "sigreg": 2}.get(balance_type, 0)  # DINO heads return (logits, normalized chunks, raw chunks)
     center = torch.zeros(1 if head_type == "weight_norm" else int(head_cfg["factors"]), codebook_size, device=device)
     global_grid = train_cfg["global_size"] // student_backbone.patch_size
     global_patches = global_grid ** 2
@@ -683,6 +697,8 @@ def main():
                 t_prob = sinkhorn_fn(t_swap, t_temp)
             elif balance_type == "simdino":
                 t_prob = t_swap
+            elif balance_type == "sigreg":  # LeJEPA target: mean of the teacher's two global-view raw outputs, in both global slots
+                t_prob = ((t_cls[0] + t_cls[1]) / 2).repeat(2, 1, 1)
             else:  # memax never moves the center off 0, leaving the plain sharpened softmax
                 t_prob = F.softmax((t_swap.float() - center) / t_temp, dim=-1)
             # Update after use, as in DINO; evaluate() puts the student in eval mode, so val batches never move the center.
@@ -694,6 +710,8 @@ def main():
         global_loss, jepa_loss, kde, iso, decorr, bal, p_sum = 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0
         # Summed student softmax over the batch (F, K); detached unless memax trains on it, so a 131k-prototype head keeps no softmax graph.
         anchor_probs = lambda x: F.softmax((x if balance_type == "memax" else x.detach()).float() / student_temp, dim=-1).sum(0)
+        # Student-vs-teacher CLS term: MSE on raw head outputs for sigreg, else DINO CE (cosine for simdino).
+        cls_loss = (lambda s, y: (s.float() - y.float()).square().mean()) if balance_type == "sigreg" else (lambda s, y: dino_ce_fn(s, y, student_temp))
         for count, keep_idx, mask_idx, masks, mask_w in mask_groups:
             # Each region copy draws its own student noise; the teacher and JEPA targets stay on the clean crop.
             sv = student_augment(gf if count == 1 else gf.repeat(count, 1, 1, 1))
@@ -712,8 +730,8 @@ def main():
                 masks = None if masks is None else torch.zeros_like(masks).scatter_(1, inv, masks)
             sg = student_backbone(sv, masks=masks, checkpoint=ckpt, keep_idx=keep_idx)
             t_flat = t_prob.flatten(0, 1)
-            s_logits, s_chunks = student_dino_head(sg["cls"])
-            global_loss = global_loss + dino_ce_fn((s_logits, s_chunks)[head_out], t_flat if count == 1 else t_flat.repeat(count, 1, 1), student_temp) * 2 * count / (2 * L + 2 * R)
+            s_logits, s_chunks, s_raw = student_dino_head(sg["cls"])
+            global_loss = global_loss + cls_loss((s_logits, s_chunks, s_raw)[head_out], t_flat if count == 1 else t_flat.repeat(count, 1, 1)) * 2 * count / (2 * L + 2 * R)
             if keep_idx is None:
                 patch_target = F.layer_norm(t["patches"].flatten(0, 1), (D,))[mask_idx]
                 patch_prediction = student_predictor(sg["patches"])
@@ -738,18 +756,25 @@ def main():
             iso = iso + sum(isotropy_loss(x) for x in sg["cls"].chunk(train_cfg["global_views"] * count)) / (train_cfg["global_views"] * R)
             # Factor decorrelation acts on the head's per-factor bottleneck chunks, per batch of distinct images, so factored codebooks stop copying each other.
             decorr = decorr + sum(factor_decorrelation(x) for x in s_chunks.chunk(train_cfg["global_views"] * count)) / (train_cfg["global_views"] * R)
-            # Balance term: SimDINO's negative coding rate per batch of distinct images, else accumulate the student's predictions for ME-MAX.
-            if head_out:
+            # Balance term per batch of distinct images: SimDINO's negative coding rate, SIGReg (summed here, averaged below), else ME-MAX's predictions.
+            if head_out == 1:
                 bal = bal + sum(-coding_rate(z) for z in s_chunks.chunk(train_cfg["global_views"] * count)) / (train_cfg["global_views"] * R)
+            elif head_out == 2:
+                bal = bal + sum(sigreg(z.flatten(1), sigreg_slices) for z in s_raw.chunk(train_cfg["global_views"] * count))
             else:
                 p_sum = p_sum + anchor_probs(s_logits)
         local_loss = 0.0
         if lf is not None:
             sl_cls = student_dino_head(student_backbone(local_augment(lf, b), checkpoint=ckpt)["cls"])[head_out]
-            # CE is linear in targets; keep the original reduction order for eager recipes.
-            local_loss = (dino_ce_fn(sl_cls.view(L, b, *sl_cls.shape[1:]), t_prob.sum(0), student_temp) * L if train_cfg["compile"]
-                          else sum(dino_ce_fn(x, y, student_temp) for x in sl_cls.chunk(L) for y in t_prob)) / (2 * L + 2 * R)
+            # CE is linear in targets, so compiled recipes sum the two teacher targets; MSE is not, but sigreg's two target slots hold the
+            # same center, so it is 2 x MSE to that center. Eager recipes keep the original reduction order.
+            local_loss = (cls_loss(sl_cls.view(L, b, *sl_cls.shape[1:]), t_prob[0]) * 2 * L if balance_type == "sigreg"
+                          else dino_ce_fn(sl_cls.view(L, b, *sl_cls.shape[1:]), t_prob.sum(0), student_temp) * L if train_cfg["compile"]
+                          else sum(cls_loss(x, y) for x in sl_cls.chunk(L) for y in t_prob)) / (2 * L + 2 * R)
             p_sum = p_sum if head_out else p_sum + anchor_probs(sl_cls)
+        if head_out == 2:
+            # SIGReg is averaged over every student view slot: each global region copy and each local crop.
+            bal = (bal + (0.0 if lf is None else sum(sigreg(z.flatten(1), sigreg_slices) for z in sl_cls.chunk(L)))) / (train_cfg["global_views"] * R + (0 if lf is None else L))
         if not head_out:
             # ME-MAX (MSN): negative entropy of the student's mean prediction over every anchor view (globals + locals) in the batch, summed over factors.
             p_bar = p_sum / (b * (2 * R + (0 if lf is None else L)))

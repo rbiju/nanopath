@@ -78,13 +78,13 @@ dino:
   layerwise_decay: 0.7
   patch_embed_lr_mult: 0.2
   drop_path_rate: 0.1
-  head_hidden_dim: 2048
-  head_bottleneck_dim: 384
   temp_scale: 1.0
   # DINO prototype layer; `type` selects it, and train.py documents each type's keys.
   head:
     # type: weight_norm
     type: factored
+    hidden_dim: 2048
+    bottleneck_dim: 384
     prototypes: 1024
     factors: 2
     decorr_weight: 0.0 # cross-factor chunk correlation penalty, 0 = off
