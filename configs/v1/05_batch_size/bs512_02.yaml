@@ -65,7 +65,7 @@ train:
   resume: null
 
 dino:
-  optimizer: muon # adamw | muon
+  optimizer: muon # adamw | muon | muown
   lr: 2.0e-3
   head_lr_mult: 1.0 # LR multiplier for the DINO head + JEPA predictor (randomly initialised); backbone keeps dino.lr
   lr_min: 1.0e-6

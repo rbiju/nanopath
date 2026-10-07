@@ -65,7 +65,7 @@ train:
   resume: null # optional explicit checkpoint path; null means always start fresh and wipe output_dir
 
 dino:
-  optimizer: adamw # adamw | muon
+  optimizer: adamw # adamw | muon | muown
   lr: 3.0e-4
   head_lr_mult: 1.0 # LR multiplier for the DINO head + JEPA predictor (randomly initialised); backbone keeps dino.lr
   lr_min: 1.0e-6

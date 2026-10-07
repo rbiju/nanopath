@@ -312,6 +312,39 @@ class Muon(torch.optim.Optimizer):
                 p.mul_(1 - group["lr"] * group["weight_decay"]).add_(update, alpha=-group["lr"] * 0.2 * max(G.shape[-2:]) ** 0.5)
 
 
+# Muown: Muon with weight normalization kept inside the optimizer. Each matrix is held implicitly as W = g * v / ||v|| per output row:
+# Muon (same momentum, sub-matrix split, and RMS scale as Muon above) steps the direction v, bias-corrected Adam steps the row magnitudes g,
+# then W is recomposed in place. Decoupled WD shrinks W afterwards and g is resynced to the new row norms, keeping ||W_i|| == g_i.
+class Muown(torch.optim.Optimizer):
+    def __init__(self, params, compile_ns, beta2): super().__init__(params, {"lr": 1.0, "weight_decay": 0.0}); self.ns, self.beta2 = torch.compile(newton_schulz, disable=not compile_ns), beta2
+
+    @torch.no_grad()
+    def step(self):
+        for group in self.param_groups:
+            lr, wd = group["lr"], group["weight_decay"]
+            for p in group["params"]:
+                st = self.state[p]
+                if not st:
+                    norm = p.norm(dim=1, keepdim=True)
+                    st.update(g=norm.clone(), v_norm=norm.clone(), momentum_buffer=torch.zeros_like(p), m_g=torch.zeros_like(norm), v_g=torch.zeros_like(norm), step=0)
+                st["step"] += 1
+                g, buf = st["g"], st["momentum_buffer"]
+                # Weight-norm Jacobian through the unit row direction u = W / g (stable even for tiny g): dL/dg = <grad, u>, dL/dv = g/||v|| (grad - u dL/dg).
+                u = p / g
+                grad_g = (p.grad * u).sum(1, keepdim=True)
+                grad_v = (g / st["v_norm"]) * (p.grad - u * grad_g)
+                buf.lerp_(grad_v, 0.05)
+                G = grad_v.lerp(buf, 0.95).view(group["muon"], -1, p.shape[1])
+                v = (u * st["v_norm"]).add_(self.ns(G.bfloat16()).reshape_as(p).to(p.dtype), alpha=-lr * 0.2 * max(G.shape[-2:]) ** 0.5)
+                st["m_g"].lerp_(grad_g, 0.1)
+                st["v_g"].lerp_(grad_g.square(), 1 - self.beta2)
+                g.addcdiv_(st["m_g"] / (1 - 0.9 ** st["step"]), (st["v_g"] / (1 - self.beta2 ** st["step"])).sqrt_().add_(1e-8), value=-lr)
+                w_old = p.clone()
+                st["v_norm"] = v.norm(dim=1, keepdim=True)
+                p.copy_(g * v / st["v_norm"]).add_(w_old, alpha=-lr * wd)
+                g.copy_(p.norm(dim=1, keepdim=True))
+
+
 # EMA-update teacher modules from student modules with a single multiplicative decay.
 # Params are fused into two _foreach kernels (mul then add) instead of a Python per-tensor loop;
 # numerically identical (pt = pt*m + ps*(1-m) per tensor). Called under torch.no_grad() by the caller.
@@ -440,12 +473,13 @@ def main():
     for p in teacher_dino_head.parameters():
         p.requires_grad = False
     backbone_activated_params = sum(p.numel() for p in student_backbone.parameters() if p.requires_grad)
-    # Param groups carry per-parameter LR/WD multipliers (LWD + patch_embed + biases-no-WD); dino.optimizer is adamw or muon,
-    # and muon keeps AdamW for everything that isn't a hidden matrix, so opts = [AdamW] or [AdamW, Muon].
-    muon = {"adamw": False, "muon": True}[dino_cfg["optimizer"]]
+    # Param groups carry per-parameter LR/WD multipliers (LWD + patch_embed + biases-no-WD); dino.optimizer is adamw, muon, or muown,
+    # and muon/muown keep AdamW for everything that isn't a hidden matrix, so opts = [AdamW], [AdamW, Muon], or [AdamW, Muown].
+    muon = {"adamw": False, "muon": True, "muown": True}[dino_cfg["optimizer"]]
     param_groups = build_param_groups(student_backbone, student_dino_head, student_predictor, dino_cfg["layerwise_decay"], dino_cfg["patch_embed_lr_mult"], muon, float(dino_cfg["head_lr_mult"]), None if cls_spec is None else cls_spec["lr_mult"])
     opt = torch.optim.AdamW([g for g in param_groups if not g["muon"]], lr=1.0, betas=(0.9, dino_cfg["adam_beta2"]), fused=train_cfg["fused_adamw"])
-    opts = [opt, Muon([g for g in param_groups if g["muon"]], train_cfg["compile"])] if muon else [opt]
+    hidden = [g for g in param_groups if g["muon"]]
+    opts = [opt, Muown(hidden, train_cfg["compile"], dino_cfg["adam_beta2"]) if dino_cfg["optimizer"] == "muown" else Muon(hidden, train_cfg["compile"])] if muon else [opt]
     step = 0
     batch_size = int(train_cfg["batch_size"])
     max_train_samples = int(train_cfg["max_train_samples"])
