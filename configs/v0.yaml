@@ -96,6 +96,7 @@ dino:
     target_decay: -0.5
     context_cls: none
     dihedral: 0.0 # probability each student global copy gets a random 90-degree rotation/flip vs the upright teacher; 0 = off
+    predict_regions: 3 # how many region copies (random each step) run the JEPA predictor; the rest only feed DINO
 
 probe:
   enabled: true

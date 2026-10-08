@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-#SBATCH --job-name=xarch_01_sigreg_w05
+#SBATCH --job-name=xarch_01_regions_streamlined_02
 #SBATCH --nodes=1
 #SBATCH --ntasks-per-node=1
 #SBATCH --gpus-per-task=1
@@ -7,8 +7,8 @@
 #SBATCH --output=slurm/%j.out
 #SBATCH --error=slurm/%j.err
 #SBATCH --partition=n
-#SBATCH --account=training
-#SBATCH --qos=normal
+#SBATCH --account=plus
+#SBATCH --qos=high
 
 set -euo pipefail
 

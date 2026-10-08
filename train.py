@@ -30,7 +30,7 @@ import yaml
 from torch.utils.data import DataLoader, Subset
 from torch.utils.flop_counter import FlopCounterMode
 
-from dataloader import GPUAugment, LocalAugment, StudentAugment, TCGATileDataset, TILE_SIZE, UniqueSlideBatchSampler
+from dataloader import GPUAugment, StudentAugment, TCGATileDataset, TILE_SIZE, UniqueSlideBatchSampler
 from model import CrossJEPAPredictor, DINOHead, FactoredDINOHead, JEPAPredictor, ViT, expand_blocks, load_pretrained, specialize_cls_weights
 from probe import (
     completed_probe_summary,
@@ -395,6 +395,9 @@ def main():
         # Everything outside blocks.* and the final norm is the token-embedding path.
         for name, p in student_backbone.named_parameters():
             p.requires_grad_(p.requires_grad and (name.startswith(("blocks.", "norm.")) or not expansion["freeze_embeddings"]))
+    # dino.patch_embed_lr_mult: 0 freezes the patch projection outright, so backward never keeps the full-resolution conv input.
+    if dino_cfg["patch_embed_lr_mult"] == 0:
+        student_backbone.patch_embed.requires_grad_(False)
     student_backbone = student_backbone.to(device)
     teacher_backbone = deepcopy(student_backbone)
     teacher_backbone.train(False)
@@ -442,17 +445,19 @@ def main():
     global_patches = global_grid ** 2
     # dino.jepa.type picks the masking protocol + predictor; its sibling keys are exactly that type's arguments.
     #   block: {depth, width, blocks, block_scale}. Student sees the full grid with mask_token blocks; self-attention predictor.
-    #   cross: {depth, width, context_regions: [{blocks, side, count}, ...], targets, target_decay, context_cls}. Student sees only
+    #   cross: {depth, width, context_regions: [{blocks, side, count}, ...], targets, target_decay, context_cls, predict_regions}. Student sees only
     #          `count` contexts of `blocks` side x side squares per global view; cross-attention predictor regresses `targets` unseen patches.
+    #          Every region type must hold the same blocks * side^2 tokens, so all copies stack into one student pass.
     #          context_cls picks the CLS the predictor reads: student (JEPA trains the student CLS), teacher (frozen EMA CLS of the full clean crop), or none.
+    #          predict_regions: how many of the stacked region copies (picked at random each step) run the predictor; the rest only feed DINO.
     #   both:  dihedral is the probability that each student global copy gets a random non-identity 90-degree rotation/flip (teacher stays upright),
     #          so DINO and JEPA must match upright targets from rotated views; 0 = off.
     jepa_cfg = dict(dino_cfg["jepa"])
     jepa_type = jepa_cfg.pop("type")
-    jepa_args = {"block": {"depth", "width", "blocks", "block_scale", "dihedral"}, "cross": {"depth", "width", "context_regions", "targets", "target_decay", "context_cls", "dihedral"}}
+    jepa_args = {"block": {"depth", "width", "blocks", "block_scale", "dihedral"}, "cross": {"depth", "width", "context_regions", "targets", "target_decay", "context_cls", "dihedral", "predict_regions"}}
     if jepa_type not in jepa_args or set(jepa_cfg) != jepa_args[jepa_type]:
         raise ValueError(f"dino.jepa type={jepa_type!r} with keys {sorted(jepa_cfg)} invalid; expected one of {jepa_args}")
-    dihedral = float(jepa_cfg["dihedral"])
+    dihedral, predict_regions = float(jepa_cfg["dihedral"]), int(jepa_cfg.get("predict_regions", 0))
     if jepa_type == "block":
         context_regions = [(1, global_grid, 1)]
         student_predictor = JEPAPredictor(student_backbone.embed_dim, int(jepa_cfg["depth"]), int(jepa_cfg["width"])).to(device)
@@ -462,8 +467,10 @@ def main():
         context_regions = [(int(r["blocks"]), int(r["side"]), int(r["count"])) for r in jepa_cfg["context_regions"]]
         # Targets come from outside the block union, so the no-overlap context size bounds k.
         max_targets = global_patches - max((n * side ** 2 for n, side, _ in context_regions), default=global_patches)
-        if not context_regions or any(not 0 < side <= global_grid or n < 1 or count < 1 for n, side, count in context_regions) or not 0 < int(jepa_cfg["targets"]) <= max_targets:
-            raise ValueError(f"dino.jepa cross needs sides in 1..{global_grid}, blocks and counts >= 1, and targets in 1..{max_targets}")
+        if (not context_regions or any(not 0 < side <= global_grid or n < 1 or count < 1 for n, side, count in context_regions) or not 0 < int(jepa_cfg["targets"]) <= max_targets
+                or len({n * side ** 2 for n, side, _ in context_regions}) != 1 or not 0 < int(jepa_cfg["predict_regions"]) <= sum(c for *_, c in context_regions)):
+            raise ValueError(f"dino.jepa cross needs sides in 1..{global_grid}, blocks and counts >= 1, targets in 1..{max_targets}, equal blocks * side^2 "
+                             "across context_regions, and predict_regions in 1..sum(count)")
         if jepa_cfg["context_cls"] not in {"student", "teacher", "none"}:
             raise ValueError(f"dino.jepa.context_cls={jepa_cfg['context_cls']!r} invalid; expected student, teacher, or none")
         student_predictor = CrossJEPAPredictor(student_backbone.embed_dim, int(jepa_cfg["depth"]), int(jepa_cfg["width"])).to(device)
@@ -621,19 +628,16 @@ def main():
                     augment(torch.zeros(batch_size, views, 3, size, size, dtype=torch.uint8, device=device))
             torch.cuda.synchronize(device)
             torch.cuda.set_rng_state(rng, device)
-    # Optional data.student_augment: {hed_jitter, blur_prob, blur_sigma: [lo, hi]}; absent means the student sees the teacher's pixels.
-    student_augment = torch.nn.Identity()
+    # Optional data.student_augment (student global/region copies) and data.local_augment (student locals): any of StudentAugment's
+    # {hed_jitter, blur_prob, blur_sigma: [lo, hi], stain_mix, hue, rescale, jpeg, noise}; absent means the student sees the teacher's pixels.
+    student_augment, local_augment = (lambda views, b: views), (lambda views, b: views)
+    aug_keys = {"hed_jitter", "blur_prob", "blur_sigma", "stain_mix", "hue", "rescale", "jpeg", "noise"}
+    if not set(cfg["data"].get("student_augment", {})) | set(cfg["data"].get("local_augment", {})) <= aug_keys:
+        raise ValueError(f"data.student_augment / data.local_augment keys must be a subset of {sorted(aug_keys)}")
     if "student_augment" in cfg["data"]:
-        student_augment_cfg = cfg["data"]["student_augment"]
-        if set(student_augment_cfg) != {"hed_jitter", "blur_prob", "blur_sigma"}:
-            raise ValueError(f"data.student_augment keys {sorted(student_augment_cfg)} invalid; expected exactly hed_jitter, blur_prob, blur_sigma")
-        student_augment = StudentAugment(cfg["data"], **student_augment_cfg).to(device)
-    # Optional data.local_augment: {stain_mix, rescale, jpeg, noise} per-crop probabilities of site-scrubbing ops on student local crops.
-    local_augment = lambda views, b: views
+        student_augment = StudentAugment(cfg["data"], **cfg["data"]["student_augment"]).to(device)
     if "local_augment" in cfg["data"]:
-        if set(cfg["data"]["local_augment"]) != {"stain_mix", "rescale", "jpeg", "noise"}:
-            raise ValueError(f"data.local_augment keys {sorted(cfg['data']['local_augment'])} invalid; expected exactly stain_mix, rescale, jpeg, noise")
-        local_augment = LocalAugment(cfg["data"], **cfg["data"]["local_augment"]).to(device)
+        local_augment = StudentAugment(cfg["data"], **cfg["data"]["local_augment"]).to(device)
     train_ds = TCGATileDataset(cfg, is_train=True)
     val_ds = TCGATileDataset(cfg, is_train=False)
 
@@ -705,13 +709,13 @@ def main():
         }
 
     # One JEPA draw per student pass over the global views, as (count, keep_idx, mask_idx, masks, mask_w) groups.
-    # block is a single full-grid group; cross has one group per context scale since sequence lengths differ.
+    # block is a single full-grid group; cross stacks every region type's copies (copy-major, equal token counts) into one group.
     def draw_masks(n_crops):
         if jepa_type == "block":
             masks, mask_idx, mask_w = make_block_mask(n_crops, global_grid, device, int(jepa_cfg["blocks"]), float(jepa_cfg["block_scale"]))
             return [(1, None, mask_idx, masks, mask_w)]
-        return [(count, *make_region_idx(n_crops * count, global_grid, device, n, side, int(jepa_cfg["targets"]), float(jepa_cfg["target_decay"])), None, None)
-                for n, side, count in context_regions]
+        draws = [make_region_idx(n_crops * count, global_grid, device, n, side, int(jepa_cfg["targets"]), float(jepa_cfg["target_decay"])) for n, side, count in context_regions]
+        return [(total_regions, *(torch.cat(x) for x in zip(*draws)), None, None)]
 
     # Augment a collated (B, V, 3, H, W) view stack and flatten crop-major, so [crop0_img0, crop0_img1, ..., crop1_img0, ...]
     # chunks cleanly per crop for teacher/student alignment. None when the dataloader omitted the key (local_views: 0).
@@ -748,7 +752,7 @@ def main():
         cls_loss = (lambda s, y: (s.float() - y.float()).square().mean()) if balance_type == "sigreg" else (lambda s, y: dino_ce_fn(s, y, student_temp))
         for count, keep_idx, mask_idx, masks, mask_w in mask_groups:
             # Each region copy draws its own student noise; the teacher and JEPA targets stay on the clean crop.
-            sv = student_augment(gf if count == 1 else gf.repeat(count, 1, 1, 1))
+            sv = student_augment(gf if count == 1 else gf.repeat(count, 1, 1, 1), b)
             inv = None
             if dihedral > 0:
                 # Element e of D4 (rot90 by e % 4, then a flip when e >= 4) per copy; 224 px = 16 x 16 whole patches, so it permutes patches exactly.
@@ -773,16 +777,20 @@ def main():
                 patch_prediction = (patch_prediction if inv is None else patch_prediction.gather(1, inv[..., None].expand(-1, -1, D))).flatten(0, 1)[mask_idx]
                 jepa = jepa_loss_fn(patch_prediction, patch_target, mask_w) / max(1, b * 2)
             else:
+                # Only a random predict_regions of the count copies (same picks for every image) run the predictor, so its activations scale with that, not count.
+                sel = torch.randperm(count, device=gf.device)[:predict_regions]
+                pick = lambda x: x.view(count, -1, *x.shape[1:])[sel].flatten(0, 1)
+                mask_idx, inv = pick(mask_idx), None if inv is None else pick(inv)
                 # Gather targets per region chunk so the teacher grid is never duplicated count times.
                 tp = F.layer_norm(t["patches"], (D,))
-                patch_target = torch.cat([tp.gather(1, m[..., None].expand(-1, -1, D)) for m in mask_idx.chunk(count)])
+                patch_target = torch.cat([tp.gather(1, m[..., None].expand(-1, -1, D)) for m in mask_idx.chunk(predict_regions)])
                 # Queries are the backbone's own mask_token (trained by JEPA) + patch pos (detached, so only the encoder path trains it).
                 query_table = student_backbone.mask_token + student_backbone.patch_pos_embed(global_grid, global_grid).detach()
                 # Queries sit where each target patch lands in the student's (possibly rotated) frame; targets stay upright.
                 query_idx = mask_idx if inv is None else inv.gather(1, mask_idx)
                 queries = query_table.expand(mask_idx.shape[0], -1, -1).gather(1, query_idx[..., None].expand(-1, -1, D))
                 context_cls = {"student": sg["cls"], "teacher": t["cls"].repeat(count, 1), "none": None}[jepa_cfg["context_cls"]]
-                context = torch.cat([*([] if context_cls is None else [context_cls[:, None]]), sg["registers"], sg["patches"]], dim=1)
+                context = pick(torch.cat([*([] if context_cls is None else [context_cls[:, None]]), sg["registers"], sg["patches"]], dim=1))
                 jepa = F.smooth_l1_loss(student_predictor(context, queries), patch_target)
             jepa_loss = jepa_loss + jepa * count / R
             kde = kde + dino_cfg["kde_loss_weight"] * k_scale * sum(kde_loss(x, dino_cfg["kde_concentration"], dino_cfg["kde_radius"]) for x in sg["cls"].chunk(train_cfg["global_views"] * count)) / R
