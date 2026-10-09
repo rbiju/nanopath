@@ -85,6 +85,7 @@ dino:
   kde_concentration: 10.0
   kde_radius: 0.0 # chord distance on the unit sphere; CLS pairs closer than this attract, farther repel (0 = pure repulsion)
   iso_loss_weight: 0.0 # flattens the backbone CLS covariance spectrum (D / participation_ratio - 1); ramps in with LR warmup, 0 = off
+  cls_inv_weight: 0.0 # MSE of each student view's layer-normed backbone CLS to the teacher's two-global mean CLS; ramps in with LR warmup, 0 = off
   # I-JEPA patch regression; `type` selects masking + predictor, and train.py documents each type's keys.
   jepa:
     type: cross

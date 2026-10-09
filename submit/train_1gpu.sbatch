@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-#SBATCH --job-name=xarch_01_regions_streamlined_02
+#SBATCH --job-name=xarch_01_sigreg_w05_muown_inv
 #SBATCH --nodes=1
 #SBATCH --ntasks-per-node=1
 #SBATCH --gpus-per-task=1

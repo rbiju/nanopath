@@ -118,11 +118,11 @@ class GPUAugment(nn.Module):
 
 
 # Student-only GPU noise (the teacher never sees it), so the student must reach clean teacher targets from a perturbed crop. Runs on
-# normalised crop-major (slots * b, 3, H, W) views in float32 outside autocast; each op hits each crop with its own probability, in order:
+# normalised crop-major (slots * b, 3, H, W) views in float32 outside autocast; each op hits a random fraction p of the crops, in order:
 #   stain_mix: Reinhard transfer of LAB mean/std from another image's crop in the same slot (batches are unique-slide, so real site stains);
 #   hue: rotate every crop's hue by up to +-hue of the colour wheel (torchvision ColorJitter units, 0.02 = +-7 degrees);
 #   hed_jitter: HED stain jitter on every crop; blur_prob: Gaussian blur with sigma in blur_sigma;
-#   rescale: down- then up-sample by one random factor in [0.5, 1) per call (20x vs 40x scans); jpeg: recompress at quality 30-90;
+#   rescale: down- then up-sample by one factor from {0.5, 0.625, 0.75, 0.875} per call (20x vs 40x scans); jpeg: recompress at quality 30-90;
 #   noise: Gaussian sensor noise with per-crop sigma up to 0.03. stain_mix, rescale, jpeg and noise scrub the tile's site signature.
 class StudentAugment(nn.Module):
     def __init__(self, data, hed_jitter=0.0, blur_prob=0.0, blur_sigma=(0.0, 0.0), stain_mix=0.0, hue=0.0, rescale=0.0, jpeg=0.0, noise=0.0):
@@ -137,14 +137,15 @@ class StudentAugment(nn.Module):
         import kornia as K
         with torch.autocast(device_type=views.device.type, enabled=False):
             x = (views.float() * self.std + self.mean).clamp(0.0, 1.0)
-            n, size, ar = x.shape[0], x.shape[-1], torch.arange(views.shape[0], device=views.device)
-            # Donor = a different image (so a different slide) in the same slot; stats come from every crop before any op runs.
+            # Ops run in fixed 256-crop chunks, so heavy intermediates (LAB, JPEG DCT) never scale with the 12+ region copies per image.
+            n, size, ar, chunk = x.shape[0], x.shape[-1], torch.arange(views.shape[0], device=views.device), 256
+            # Donor = a different image (so a different slide) in the same slot; LAB stats come from every crop before any op runs.
             if self.probs[0] > 0:
-                lab = K.color.rgb_to_lab(x)
-                mu, sd = lab.mean((-2, -1), keepdim=True), lab.std((-2, -1), keepdim=True) + 1e-4
+                mu, sd = (torch.cat(t) for t in zip(*((lab.mean((-2, -1), keepdim=True), lab.std((-2, -1), keepdim=True) + 1e-4) for lab in map(K.color.rgb_to_lab, x.split(chunk)))))
                 donor = ar // b * b + (ar % b + torch.randint(1, b, (n,), device=x.device)) % b
-            scale = 0.5 + 0.5 * random.random()
-            ops = (lambda c, i: K.color.lab_to_rgb((lab[i] - mu[i]) / sd[i] * sd[donor[i]] + mu[donor[i]]),
+            # Rescale factor from a fixed set, so the downsampled buffer takes one of four shapes the allocator can reuse.
+            scale = random.choice((0.5, 0.625, 0.75, 0.875))
+            ops = (lambda c, i: K.color.lab_to_rgb((K.color.rgb_to_lab(c) - mu[i]) / sd[i] * sd[donor[i]] + mu[donor[i]]),
                    lambda c, i: K.enhance.adjust_hue(c, (2 * torch.rand(len(i), device=c.device) - 1) * self.hue * 2 * torch.pi),
                    lambda c, i: self.hed(c),
                    lambda c, i: K.filters.gaussian_blur2d(c, (9, 9), (self.blur_lo + torch.rand(len(i), 1, device=c.device) * (self.blur_hi - self.blur_lo)).expand(-1, 2),
@@ -152,11 +153,11 @@ class StudentAugment(nn.Module):
                    lambda c, i: F.interpolate(F.interpolate(c, scale_factor=scale, mode="bilinear", antialias=True), size=size, mode="bilinear"),
                    lambda c, i: K.enhance.jpeg_codec_differentiable(c, 30 + 60 * torch.rand(len(i), device=c.device)),
                    lambda c, i: (c + 0.03 * torch.rand(len(i), 1, 1, 1, device=c.device) * torch.randn_like(c)).clamp(0.0, 1.0))
-            # Run each op only on its selected crops (JPEG on every crop would be wasted compute).
+            # Each op hits exactly round(p * n) random crops (not a Bernoulli count), so buffer shapes repeat every step and the
+            # caching allocator reuses its blocks instead of fragmenting; randperm also avoids nonzero()'s host sync.
             for p, op in zip(self.probs, ops):
-                idx = (torch.rand(n, device=x.device) < p).nonzero().flatten()
-                if len(idx):
-                    x[idx] = op(x[idx], idx).clamp(0.0, 1.0)
+                for i in torch.randperm(n, device=x.device)[:round(p * n)].split(chunk):
+                    x[i] = op(x[i], i).clamp(0.0, 1.0)
             return ((x - self.mean) / self.std).to(views.dtype)
 
 
