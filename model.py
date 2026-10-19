@@ -10,6 +10,7 @@
 # (~15 lines) so we have zero runtime dependency on the dinov2 codebase. FactoredDINOHead swaps
 # the weight-normed layer for a Parameter prototype bank split into per-factor codebooks.
 
+import re
 from copy import deepcopy
 
 import torch
@@ -114,7 +115,12 @@ class ViT(nn.Module):
 
     def __init__(self, variant="dinov2_vits14_reg", drop_path_rate=0.0, variant_cfg=None):
         super().__init__()
-        cfg = variant_cfg or VIT_VARIANTS[variant]
+        # model.type suffixes pick the pooled-probe readout (probe_features); probe.py rebuilds the ViT from model.type, so the readout travels
+        # with the run config without touching the locked probe suite. `_patchmean` = mean output patch token; `_cls{n}` = the final-normed
+        # CLS of the last n blocks, concatenated (n * dim), which train.py also feeds the DINO head when dino.head_input is cls.
+        base, readout = re.fullmatch(r"(.+?)(_patchmean|_cls\d+)?", variant).groups()
+        self.patch_mean_readout, self.cls_layers = readout == "_patchmean", int(readout[4:]) if readout and readout.startswith("_cls") else 1
+        cfg = variant_cfg or VIT_VARIANTS[base]
         dim, depth, heads, pretrain_grid, patch, ffn, pos_has_cls, self.pretrained_url = cfg[:8]
         mlp_ratio, registers = 4.0, cfg[8] if len(cfg) > 8 else 4
         self.patch_size, self.registers, self.embed_dim = patch, registers, dim
@@ -173,14 +179,19 @@ class ViT(nn.Module):
     # useful when the 1-GPU batch of 128 (2 globals + 8 locals) does not fit in 80 GB.
     def forward(self, x, masks=None, checkpoint=False, keep_idx=None):
         x = self._prepare_tokens(x, masks, keep_idx)
-        for blk in self.blocks:
+        cls_taps = []
+        for i, blk in enumerate(self.blocks):
             if checkpoint and self.training:
                 x = torch.utils.checkpoint.checkpoint(blk, x, use_reentrant=False)
             else:
                 x = blk(x)
+            if i >= len(self.blocks) - self.cls_layers:
+                cls_taps.append(x[:, 0])
         x = self.norm(x)
         return {
             "cls": x[:, 0],
+            # Last cls_layers blocks' CLS through the shared final norm, concatenated; equals "cls" when cls_layers is 1.
+            "cls_layers": self.norm(torch.stack(cls_taps, 1)).flatten(1),
             "registers": x[:, 1 : 1 + self.registers],
             "patches": x[:, 1 + self.registers :],
         }
@@ -192,11 +203,13 @@ class ViT(nn.Module):
         return self(x, checkpoint=checkpoint)["patches"]
 
     def probe_features(self, x):
-        return self(x)["cls"]
+        out = self(x)
+        return out["patches"].mean(1) if self.patch_mean_readout else out["cls_layers"]
 
-    # Expanded checkpoints carry extra blocks and specialized ones `.cls.` keys; a plain ViT (probe.py, notebooks) rebuilds itself to match
-    # before loading. Expansion goes first: copies inherit their source's specialization, so specialized qkv stays a contiguous prefix.
+    # Expanded checkpoints carry extra blocks, extra registers, and specialized ones `.cls.` keys; a plain ViT (probe.py, notebooks) rebuilds
+    # itself to match before loading. Expansion goes first: copies inherit their source's specialization, so specialized qkv stays a contiguous prefix.
     def load_state_dict(self, state_dict, *args, **kwargs):
+        add_registers(self, state_dict["register_tokens"].shape[1] - self.registers)
         n_blocks = len({k.split(".")[1] for k in state_dict if k.startswith("blocks.")})
         if n_blocks > len(self.blocks):
             expand_blocks(self, n_blocks - len(self.blocks))
@@ -238,6 +251,15 @@ def expand_blocks(model, chunks):
         model.blocks.insert((i + 1) * (per + 1) - 1, blk)
         new.append(blk)
     return new
+
+
+# Appends n fresh register tokens (trunc-normal, std 0.02, the timm/DeiT CLS-token init) after the existing ones; registers carry no pos
+# embed, so nothing else in the ViT changes shape. n <= 0 is a no-op.
+def add_registers(model, n):
+    if n > 0:
+        new = nn.init.trunc_normal_(torch.empty(1, n, model.embed_dim, device=model.register_tokens.device), std=0.02)
+        model.register_tokens = nn.Parameter(torch.cat([model.register_tokens.data, new.to(model.register_tokens.dtype)], 1))
+        model.registers += n
 
 
 # Strict-load the model's declared pretrained weights; both halves of a Specialized layer load the same tensor, so step 0 matches DINOv2.

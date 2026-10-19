@@ -32,6 +32,7 @@ data:
 
 model:
   type: dinov2_vits14_reg
+  extra_registers: 0 # fresh trunc-normal register tokens appended after DINOv2's 4; 0 = pretrained registers only
   cls_specialization: null
   # cls_specialization:
   #   qkv_blocks: 4
@@ -56,6 +57,7 @@ train:
   persistent_workers: true
   unique_slide_batches: true # true = no two tiles from the same slide share a batch (tissue_thresh rejections resample within the slide)
   site_balance: 1.0 # tissue-source-site balance (needs unique_slide_batches): site share ~ site_tiles^(1 - x); 0 = tile-uniform, 1 = sites as equal as one-tile-per-slide allows
+  site_batches: false # every batch from one tissue source site (excludes unique_slide_batches; batches then repeat slides)
   max_train_samples: 1000000 # tile presentations; global/local crops still count as one sample
   max_train_flops: 1000000000000000000 # 1.0e18, the leaderboard FLOP budget
   log_every: 20
@@ -73,6 +75,7 @@ dino:
   optimizer: muon # adamw | muon | muown
   lr: 3.0e-4
   head_lr_mult: 1.0 # LR multiplier for the DINO head + JEPA predictor (randomly initialised); backbone keeps dino.lr
+  head_input: cls # what the DINO head reads: cls | patch_mean (mean of the visible output patch tokens), for student and teacher
   lr_min: 1.0e-6
   schedule_progress: samples # samples | pace: what drives every schedule (LR, WD, teacher temp, freeze, KDE, EMA); pace = legacy 0.1862 FLOP pace, so the arcs stop early
   adam_beta2: 0.999
@@ -115,6 +118,7 @@ dino:
     targets: 64
     target_decay: -0.5
     context_cls: none
+    context_registers: true # append the student's output registers to the JEPA predictor context
     dihedral: 0.5 # probability each student global copy gets a random 90-degree rotation/flip vs the upright teacher; 0 = off
     predict_regions: 4 # how many region copies (random each step) run the JEPA predictor; the rest only feed DINO
 

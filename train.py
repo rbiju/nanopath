@@ -30,8 +30,8 @@ import yaml
 from torch.utils.data import DataLoader, Subset
 from torch.utils.flop_counter import FlopCounterMode
 
-from dataloader import GPUAugment, StudentAugment, TCGATileDataset, TILE_SIZE, UniqueSlideBatchSampler
-from model import CrossJEPAPredictor, DINOHead, FactoredDINOHead, JEPAPredictor, ViT, expand_blocks, load_pretrained, specialize_cls_weights
+from dataloader import GPUAugment, SiteBatchSampler, StudentAugment, TCGATileDataset, TILE_SIZE, UniqueSlideBatchSampler
+from model import CrossJEPAPredictor, DINOHead, FactoredDINOHead, JEPAPredictor, ViT, add_registers, expand_blocks, load_pretrained, specialize_cls_weights
 from probe import (
     completed_probe_summary,
     collect_probe_results,
@@ -388,6 +388,8 @@ def main():
     if cls_spec is not None:
         specialize_cls_weights(student_backbone, int(cls_spec["qkv_blocks"]))
     student_backbone = load_pretrained(student_backbone)
+    # model.extra_registers appends that many fresh register tokens after DINOv2's 4 (0 = pretrained registers only).
+    add_registers(student_backbone, int(cfg["model"]["extra_registers"]))
     if expansion is not None:
         new_blocks = expand_blocks(student_backbone, int(expansion["chunks"]))
         for blk in student_backbone.blocks:
@@ -414,10 +416,12 @@ def main():
     head_args = {"weight_norm": {"hidden_dim", "bottleneck_dim"}, "factored": {"hidden_dim", "bottleneck_dim", "prototypes", "factors", "decorr_weight", "separate_mlps"}}
     if head_type not in head_args or set(head_cfg) != head_args[head_type]:
         raise ValueError(f"dino.head type={head_type!r} with keys {sorted(head_cfg)} invalid; expected one of {head_args}")
+    # The head reads n * embed_dim when it takes the CLS of a model.type ending in `_cls{n}` (last n blocks' CLS concatenated).
+    head_in_dim = student_backbone.embed_dim * (student_backbone.cls_layers if dino_cfg["head_input"] == "cls" else 1)
     if head_type == "weight_norm":
-        student_dino_head, codebook_size = DINOHead(student_backbone.embed_dim, 131072, int(head_cfg["hidden_dim"]), int(head_cfg["bottleneck_dim"]), 3).to(device), 131072
+        student_dino_head, codebook_size = DINOHead(head_in_dim, 131072, int(head_cfg["hidden_dim"]), int(head_cfg["bottleneck_dim"]), 3).to(device), 131072
     else:
-        student_dino_head = FactoredDINOHead(student_backbone.embed_dim, int(head_cfg["prototypes"]), int(head_cfg["hidden_dim"]), int(head_cfg["bottleneck_dim"]), 3, int(head_cfg["factors"]), bool(head_cfg["separate_mlps"])).to(device)
+        student_dino_head = FactoredDINOHead(head_in_dim, int(head_cfg["prototypes"]), int(head_cfg["hidden_dim"]), int(head_cfg["bottleneck_dim"]), 3, int(head_cfg["factors"]), bool(head_cfg["separate_mlps"])).to(device)
         codebook_size = int(head_cfg["prototypes"]) // int(head_cfg["factors"])
     decorr_weight = 0.0 if head_type == "weight_norm" else float(head_cfg["decorr_weight"])
     # dino.temp_scale multiplies both DINO temperatures: `auto` = sqrt(ln 131072 / ln K), since softmax sharpness is relative to ~1/sqrt(2 ln K)
@@ -449,12 +453,13 @@ def main():
     #          `count` contexts of `blocks` side x side squares per global view; cross-attention predictor regresses `targets` unseen patches.
     #          Every region type must hold the same blocks * side^2 tokens, so all copies stack into one student pass.
     #          context_cls picks the CLS the predictor reads: student (JEPA trains the student CLS), teacher (frozen EMA CLS of the full clean crop), or none.
+    #          context_registers: true appends the student's output registers to the predictor context; false leaves only the visible patches (+ context_cls).
     #          predict_regions: how many of the stacked region copies (picked at random each step) run the predictor; the rest only feed DINO.
     #   both:  dihedral is the probability that each student global copy gets a random non-identity 90-degree rotation/flip (teacher stays upright),
     #          so DINO and JEPA must match upright targets from rotated views; 0 = off.
     jepa_cfg = dict(dino_cfg["jepa"])
     jepa_type = jepa_cfg.pop("type")
-    jepa_args = {"block": {"depth", "width", "blocks", "block_scale", "dihedral"}, "cross": {"depth", "width", "context_regions", "targets", "target_decay", "context_cls", "dihedral", "predict_regions"}}
+    jepa_args = {"block": {"depth", "width", "blocks", "block_scale", "dihedral"}, "cross": {"depth", "width", "context_regions", "targets", "target_decay", "context_cls", "context_registers", "dihedral", "predict_regions"}}
     if jepa_type not in jepa_args or set(jepa_cfg) != jepa_args[jepa_type]:
         raise ValueError(f"dino.jepa type={jepa_type!r} with keys {sorted(jepa_cfg)} invalid; expected one of {jepa_args}")
     dihedral, predict_regions = float(jepa_cfg["dihedral"]), int(jepa_cfg.get("predict_regions", 0))
@@ -653,10 +658,13 @@ def main():
     }
     # train.unique_slide_batches swaps plain shuffling for a batch sampler that never puts two tiles from one slide in a batch;
     # train.site_balance (needs it) dials tissue-source-site sampling from tile-uniform (0) to every site equally often (1).
-    if train_cfg["site_balance"] > 0 and not train_cfg["unique_slide_batches"]:
-        raise ValueError("train.site_balance > 0 requires train.unique_slide_batches: true")
-    train_loader = (DataLoader(train_ds, batch_sampler=UniqueSlideBatchSampler(train_ds.slide_of, train_ds.site_of, batch_size, train_cfg["seed"], float(train_cfg["site_balance"])), **{k: v for k, v in loader_kwargs.items() if k not in ("batch_size", "drop_last")})
-                    if train_cfg["unique_slide_batches"] else DataLoader(train_ds, shuffle=True, **loader_kwargs))
+    # train.site_batches instead draws every batch from a single site (exclusive with unique_slide_batches: no site has 512 slides).
+    if train_cfg["site_balance"] > 0 and not train_cfg["unique_slide_batches"] or train_cfg["site_batches"] and train_cfg["unique_slide_batches"]:
+        raise ValueError("train.site_balance > 0 requires train.unique_slide_batches: true, and train.site_batches excludes it")
+    batch_sampler = (UniqueSlideBatchSampler(train_ds.slide_of, train_ds.site_of, batch_size, train_cfg["seed"], float(train_cfg["site_balance"])) if train_cfg["unique_slide_batches"]
+                     else SiteBatchSampler(train_ds.site_of, batch_size, train_cfg["seed"]) if train_cfg["site_batches"] else None)
+    train_loader = (DataLoader(train_ds, shuffle=True, **loader_kwargs) if batch_sampler is None
+                    else DataLoader(train_ds, batch_sampler=batch_sampler, **{k: v for k, v in loader_kwargs.items() if k not in ("batch_size", "drop_last")}))
     # The val split is stored slide-contiguous, so read a fixed random subset (seeded by split_seed, identical across runs and evals)
     # to give each val batch many slides; unshuffled batches held 1-2 slides and skewed every batch-level val metric.
     val_subset = torch.randperm(len(val_ds), generator=torch.Generator().manual_seed(cfg["data"]["split_seed"]))[:int(train_cfg["val_batches"]) * batch_size]
@@ -725,13 +733,17 @@ def main():
     # Compute (dino_loss, jepa_loss, kde, iso, decorr, bal) for one batch of (gf, lf) crops with the given mask groups + schedule
     # values; iso, decorr, and bal are unweighted so they double as diagnostics. Used by both the train step and evaluate() (no_grad).
     ln_flat = lambda x: F.layer_norm(x.float().flatten(1), x.flatten(1).shape[-1:])
+    # dino.head_input: what the DINO head (projector) reads from a backbone output, for student and teacher alike: the CLS token (the last
+    # n blocks' CLS concatenated for a `_cls{n}` model.type), or the mean of the output patch tokens (for region copies, only the kept context
+    # patches). KDE, isotropy, the cls_inv term and the JEPA context_cls stay on the final CLS.
+    head_in = {"cls": lambda o: o["cls_layers"], "patch_mean": lambda o: o["patches"].mean(1)}[dino_cfg["head_input"]]
 
     def compute_losses(gf, lf, b, mask_groups, t_temp, k_scale, ckpt=False):
         # Tensor schedule values do not specialize Sinkhorn to each temperature.
         t_temp = torch.tensor(t_temp, device=gf.device)
         with torch.no_grad():
             t = teacher_backbone(gf)
-            t_out = teacher_dino_head(t["cls"])
+            t_out = teacher_dino_head(head_in(t))
             t_cls = t_out[head_out].chunk(train_cfg["global_views"])
             # Invariance targets per image: layer-normed mean of the teacher's global views, for the backbone CLS and the raw head output.
             t_inv = [ln_flat(x.view(2, b, *x.shape[1:]).mean(0)) for x in (t["cls"], t_out[2])]
@@ -775,7 +787,7 @@ def main():
                 masks = None if masks is None else torch.zeros_like(masks).scatter_(1, inv, masks)
             sg = student_backbone(sv, masks=masks, checkpoint=ckpt, keep_idx=keep_idx)
             t_flat = t_prob.flatten(0, 1)
-            s_logits, s_chunks, s_raw = student_dino_head(sg["cls"])
+            s_logits, s_chunks, s_raw = student_dino_head(head_in(sg))
             global_loss = global_loss + cls_loss((s_logits, s_chunks, s_raw)[head_out], t_flat if count == 1 else t_flat.repeat(count, 1, 1)) * 2 * count / (2 * L + 2 * R)
             view_inv = view_inv + inv_mse(sg["cls"], s_raw, 2 * count)
             if keep_idx is None:
@@ -798,7 +810,7 @@ def main():
                 query_idx = mask_idx if inv is None else inv.gather(1, mask_idx)
                 queries = query_table.expand(mask_idx.shape[0], -1, -1).gather(1, query_idx[..., None].expand(-1, -1, D))
                 context_cls = {"student": sg["cls"], "teacher": t["cls"].repeat(count, 1), "none": None}[jepa_cfg["context_cls"]]
-                context = pick(torch.cat([*([] if context_cls is None else [context_cls[:, None]]), sg["registers"], sg["patches"]], dim=1))
+                context = pick(torch.cat([*([] if context_cls is None else [context_cls[:, None]]), *([sg["registers"]] if jepa_cfg["context_registers"] else []), sg["patches"]], dim=1))
                 jepa = F.smooth_l1_loss(student_predictor(context, queries), patch_target)
             jepa_loss = jepa_loss + jepa * count / R
             kde = kde + dino_cfg["kde_loss_weight"] * k_scale * sum(kde_loss(x, dino_cfg["kde_concentration"], dino_cfg["kde_radius"]) for x in sg["cls"].chunk(train_cfg["global_views"] * count)) / R
@@ -815,10 +827,10 @@ def main():
                 p_sum = p_sum + anchor_probs(s_logits)
         local_loss = 0.0
         if lf is not None:
-            sl_backbone = student_backbone(local_augment(lf, b), checkpoint=ckpt)["cls"]
-            sl_out = student_dino_head(sl_backbone)
+            sl_backbone = student_backbone(local_augment(lf, b), checkpoint=ckpt)
+            sl_out = student_dino_head(head_in(sl_backbone))
             sl_cls = sl_out[head_out]
-            view_inv = view_inv + inv_mse(sl_backbone, sl_out[2], L)
+            view_inv = view_inv + inv_mse(sl_backbone["cls"], sl_out[2], L)
             # CE is linear in targets, so compiled recipes sum the two teacher targets; MSE is not, but sigreg's two target slots hold the
             # same center, so it is 2 x MSE to that center. Eager recipes keep the original reduction order.
             local_loss = (cls_loss(sl_cls.view(L, b, *sl_cls.shape[1:]), t_prob[0]) * 2 * L if balance_type == "sigreg"
@@ -1130,6 +1142,7 @@ def main():
         "batch_size": batch_size,
         "unique_slide_batches": train_cfg["unique_slide_batches"],
         "site_balance": train_cfg["site_balance"],
+        "site_batches": train_cfg["site_batches"],
         "activation_memory_budget": train_cfg["activation_memory_budget"],
         "max_train_samples": max_train_samples,
         "max_train_flops": max_train_flops,
@@ -1163,9 +1176,11 @@ def main():
         "layerwise_decay": dino_cfg["layerwise_decay"],
         "weight_decay": dino_cfg["weight_decay"],
         "head_lr_mult": dino_cfg["head_lr_mult"],
+        "head_input": dino_cfg["head_input"],
         "teacher_momentum": dino_cfg["teacher_momentum"],
         "cls_specialization": cls_spec,
         "block_expansion": expansion,
+        "extra_registers": cfg["model"]["extra_registers"],
         "probe_target_samples": probe_targets,
         "probe_target_fractions": [None if max_train_samples == 0 else target / max_train_samples for target in probe_targets],
         **({} if probe_state is None else completed_probe_summary(output_dir)),

@@ -23,6 +23,7 @@ data:
 
 model:
   type: dinov2_vits14_reg
+  extra_registers: 0 # fresh trunc-normal register tokens appended after DINOv2's 4; 0 = pretrained registers only
   cls_specialization: null # or {qkv_blocks: 4, lr_mult: null}: CLS-only norms/LayerScales in every block + qkv in the first qkv_blocks; lr_mult null = follow layerwise decay
   block_expansion: null # or {chunks: 4, freeze_base: true, freeze_embeddings: false}: insert an identity-init block copy after every depth/chunks blocks; freeze_base trains only the new blocks; freeze_embeddings also freezes patch/pos embeds + tokens
 
@@ -40,6 +41,7 @@ train:
   persistent_workers: true
   unique_slide_batches: false # true = no two tiles from the same slide share a batch (tissue_thresh rejections resample within the slide)
   site_balance: 0.0 # tissue-source-site balance (needs unique_slide_batches): site share ~ site_tiles^(1 - x); 0 = tile-uniform, 1 = sites as equal as one-tile-per-slide allows
+  site_batches: false # every batch from one tissue source site (excludes unique_slide_batches; batches then repeat slides)
   max_train_samples: 1000000 # full-run sample cap; smoke normally reaches max_train_flops first
   max_train_flops: 5000000000000000 # 5.0e15 — short enough to finish in a few minutes
   log_every: 5
@@ -57,6 +59,7 @@ dino:
   optimizer: adamw # adamw, muon, or muown: Muon/Muown on hidden matrices (blocks + head MLP), AdamW on the rest
   lr: 1.0e-4
   head_lr_mult: 1.0 # LR multiplier for the DINO head + JEPA predictor (randomly initialised); backbone keeps dino.lr
+  head_input: cls # what the DINO head reads: cls | patch_mean (mean of the visible output patch tokens), for student and teacher
   lr_min: 1.0e-6
   schedule_progress: pace # samples | pace: what drives every schedule (LR, WD, teacher temp, freeze, KDE, EMA); pace = legacy 0.1862 FLOP pace, so the arcs stop early
   adam_beta2: 0.99

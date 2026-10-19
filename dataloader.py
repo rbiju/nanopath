@@ -156,7 +156,8 @@ class StudentAugment(nn.Module):
             # Each op hits exactly round(p * n) random crops (not a Bernoulli count), so buffer shapes repeat every step and the
             # caching allocator reuses its blocks instead of fragmenting; randperm also avoids nonzero()'s host sync.
             for p, op in zip(self.probs, ops):
-                for i in torch.randperm(n, device=x.device)[:round(p * n)].split(chunk):
+                k = round(p * n)  # split() of an empty selection still yields one empty chunk, so skip ops that hit no crops
+                for i in torch.randperm(n, device=x.device)[:k].split(chunk) if k else ():
                     x[i] = op(x[i], i).clamp(0.0, 1.0)
             return ((x - self.mean) / self.std).to(views.dtype)
 
@@ -190,6 +191,26 @@ class UniqueSlideBatchSampler(torch.utils.data.Sampler):
             yield order[starts[slides] + remaining[slides]].tolist()
             if self.refill:
                 remaining[slides] = torch.where(remaining[slides] == 0, counts[slides], remaining[slides])
+
+
+# Batch sampler where every batch comes from a single tissue source site: each epoch shuffles every site's tiles, cuts them into full
+# batches (a site's remainder is dropped, so sites with fewer than batch_size tiles never appear), then shuffles the batch order. Sites
+# supply batches in proportion to their tiles; with a median of 6 slides per site, batches repeat slides heavily.
+class SiteBatchSampler(torch.utils.data.Sampler):
+    def __init__(self, site_of, batch_size, seed):
+        self.site_of, self.batch_size, self.seed, self.epoch = torch.as_tensor(site_of, dtype=torch.long), batch_size, seed, 0
+
+    def __len__(self):
+        return int((torch.bincount(self.site_of) // self.batch_size).sum())
+
+    def __iter__(self):
+        g = torch.Generator().manual_seed(self.seed + self.epoch)
+        self.epoch += 1
+        perm = torch.randperm(len(self.site_of), generator=g)
+        order = perm[self.site_of[perm].argsort(stable=True)]  # tiles grouped by site, shuffled within each site
+        batches = [b for site in order.split(torch.bincount(self.site_of).tolist()) for b in site.split(self.batch_size) if len(b) == self.batch_size]
+        for i in torch.randperm(len(batches), generator=g).tolist():
+            yield batches[i].tolist()
 
 
 # Map-style TCGA tile dataset that emits global/local multi-view stacks for train.py.
