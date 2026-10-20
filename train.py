@@ -730,15 +730,15 @@ def main():
     def load_views(batch, key):
         return augment(batch[key].to(device, non_blocking=True)).transpose(0, 1).flatten(0, 1) if key in batch else None
 
-    # Compute (dino_loss, jepa_loss, kde, iso, decorr, bal) for one batch of (gf, lf) crops with the given mask groups + schedule
-    # values; iso, decorr, and bal are unweighted so they double as diagnostics. Used by both the train step and evaluate() (no_grad).
+    # Loss dict for one batch of (gf, lf) crops with the given mask groups + schedule values; every term but kde is unweighted so it doubles
+    # as a diagnostic, and "total" is the weighted sum that trains. Used by the train step, the FLOP probe, and evaluate() (no_grad).
     ln_flat = lambda x: F.layer_norm(x.float().flatten(1), x.flatten(1).shape[-1:])
     # dino.head_input: what the DINO head (projector) reads from a backbone output, for student and teacher alike: the CLS token (the last
     # n blocks' CLS concatenated for a `_cls{n}` model.type), or the mean of the output patch tokens (for region copies, only the kept context
     # patches). KDE, isotropy, the cls_inv term and the JEPA context_cls stay on the final CLS.
     head_in = {"cls": lambda o: o["cls_layers"], "patch_mean": lambda o: o["patches"].mean(1)}[dino_cfg["head_input"]]
 
-    def compute_losses(gf, lf, b, mask_groups, t_temp, k_scale, ckpt=False):
+    def compute_losses(gf, lf, b, mask_groups, t_temp, k_scale, warmup, ckpt=False):
         # Tensor schedule values do not specialize Sinkhorn to each temperature.
         t_temp = torch.tensor(t_temp, device=gf.device)
         with torch.no_grad():
@@ -761,7 +761,9 @@ def main():
                 center.lerp_(t_swap.float().mean(0), 0.1)
             t_prob = t_prob.view(2, b, *t_cls[0].shape[1:])
         L, R, D = train_cfg["local_views"], total_regions, student_backbone.embed_dim
-        # Each context region is one more student-teacher pair, so the multi-crop mean is over 2L + 2R pairs.
+        # Each context region is one more student-teacher pair, so DINO's multi-crop mean is over 2L + 2R pairs (a local pairs with both
+        # teacher views); SIGReg's single shared target makes each view one slot, as in LeJEPA, so its mean is over 2R + L.
+        n_pairs = 2 * R + L if balance_type == "sigreg" else 2 * L + 2 * R
         global_loss, jepa_loss, kde, iso, decorr, bal, p_sum, view_inv = 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0
         # Per-slot MSE of each student view to its image's t_inv target, as [backbone CLS, raw head output], averaged over the 2R + L view slots.
         inv_mse = lambda cls, raw, reps: torch.stack([(ln_flat(s) - y.repeat(reps, 1)).square().mean() for s, y in zip((cls, raw), t_inv)]) * reps / (2 * R + L)
@@ -778,7 +780,7 @@ def main():
                 # Running it on an index grid gives inv[c, p] = where original patch p lands, so context and queries move with the tissue.
                 elem = torch.where(torch.rand(len(sv), device=sv.device) < dihedral, torch.randint(1, 8, (len(sv),), device=sv.device), 0)
                 src = torch.arange(global_patches, device=sv.device).view(1, global_grid, global_grid).repeat(len(sv), 1, 1)
-                sv = sv.clone()  # never rotate gf in place: the teacher crop is reused by later mask groups
+                sv = sv.clone() if sv is gf else sv  # never rotate gf in place (identity augment, one copy); repeat/augment outputs are already fresh
                 for e in range(1, 8):
                     sel = elem == e
                     sv[sel], src[sel] = ((torch.rot90(z[sel], e % 4, (-2, -1)).flip(-1) if e >= 4 else torch.rot90(z[sel], e, (-2, -1))) for z in (sv, src))
@@ -788,7 +790,7 @@ def main():
             sg = student_backbone(sv, masks=masks, checkpoint=ckpt, keep_idx=keep_idx)
             t_flat = t_prob.flatten(0, 1)
             s_logits, s_chunks, s_raw = student_dino_head(head_in(sg))
-            global_loss = global_loss + cls_loss((s_logits, s_chunks, s_raw)[head_out], t_flat if count == 1 else t_flat.repeat(count, 1, 1)) * 2 * count / (2 * L + 2 * R)
+            global_loss = global_loss + cls_loss((s_logits, s_chunks, s_raw)[head_out], t_flat if count == 1 else t_flat.repeat(count, 1, 1)) * 2 * count / n_pairs
             view_inv = view_inv + inv_mse(sg["cls"], s_raw, 2 * count)
             if keep_idx is None:
                 patch_target = F.layer_norm(t["patches"].flatten(0, 1), (D,))[mask_idx]
@@ -831,11 +833,11 @@ def main():
             sl_out = student_dino_head(head_in(sl_backbone))
             sl_cls = sl_out[head_out]
             view_inv = view_inv + inv_mse(sl_backbone["cls"], sl_out[2], L)
-            # CE is linear in targets, so compiled recipes sum the two teacher targets; MSE is not, but sigreg's two target slots hold the
-            # same center, so it is 2 x MSE to that center. Eager recipes keep the original reduction order.
-            local_loss = (cls_loss(sl_cls.view(L, b, *sl_cls.shape[1:]), t_prob[0]) * 2 * L if balance_type == "sigreg"
+            # CE is linear in targets, so compiled recipes sum the two teacher targets; sigreg's two target slots hold the same center, so each
+            # local is one MSE to it. Eager recipes keep the original reduction order.
+            local_loss = (cls_loss(sl_cls.view(L, b, *sl_cls.shape[1:]), t_prob[0]) * L if balance_type == "sigreg"
                           else dino_ce_fn(sl_cls.view(L, b, *sl_cls.shape[1:]), t_prob.sum(0), student_temp) * L if train_cfg["compile"]
-                          else sum(cls_loss(x, y) for x in sl_cls.chunk(L) for y in t_prob)) / (2 * L + 2 * R)
+                          else sum(cls_loss(x, y) for x in sl_cls.chunk(L) for y in t_prob)) / n_pairs
             p_sum = p_sum if head_out else p_sum + anchor_probs(sl_cls)
         if head_out == 2:
             # SIGReg is averaged over every student view slot: each global region copy and each local crop.
@@ -844,9 +846,15 @@ def main():
             # ME-MAX (MSN): negative entropy of the student's mean prediction over every anchor view (globals + locals) in the batch, summed over factors.
             p_bar = p_sum / (b * (2 * R + (0 if lf is None else L)))
             bal = (p_bar * p_bar.clamp_min(1e-12).log()).sum()
-        # inv = [cls MSE (the cls_inv_weight loss), head MSE, cls ratio, head ratio]; a ratio divides the MSE by the target's across-image
-        # variance, so 0 = fully view-invariant and ~2 = no closer than a random image, comparable between the backbone CLS and the head.
-        return local_loss + global_loss, jepa_loss, kde, iso, decorr, bal, torch.cat([view_inv, view_inv / torch.stack([y.var(0).mean() for y in t_inv])])
+        # A ratio divides the invariance MSE by the target's across-image variance, so 0 = fully view-invariant and ~2 = no closer than a
+        # random image, comparable between the backbone CLS and the head.
+        view_inv = torch.cat([view_inv, view_inv / torch.stack([y.var(0).mean() for y in t_inv])])
+        out = {"dino": local_loss + global_loss, "jepa": jepa_loss, "kde": kde, "iso": iso, "decorr": decorr, "balance": bal,
+               **dict(zip(("cls_inv", "head_inv", "cls_inv_ratio", "head_inv_ratio"), view_inv))}
+        # Isotropy, factor decorrelation and CLS invariance ramp in with LR warmup so they don't reshape the pretrained space before the
+        # LR is live; the balance term is the DINO head's anti-collapse mechanism, so it is on from step 0.
+        out["total"] = out["dino"] + jepa_loss + kde + balance_weight * bal + warmup * (dino_cfg["iso_loss_weight"] * iso + decorr_weight * decorr + dino_cfg["cls_inv_weight"] * out["cls_inv"])
+        return out
 
     # Held-out validation pass: same DINO + JEPA + KDE + isotropy + decorrelation losses on `val_batches` of the val split.
     # Schedule terms (teacher_temp, kde_scale) drift over training, so read val curves as same-step
@@ -857,22 +865,20 @@ def main():
         py_rng, cpu_rng, cuda_rng = random.getstate(), torch.random.get_rng_state(), torch.cuda.get_rng_state(device)
         random.seed(train_cfg["seed"] + eval_step)
         torch.manual_seed(train_cfg["seed"] + eval_step)
-        sums = torch.zeros(10, device=device)
-        n_batches = 0
+        sums, n_batches = {}, 0
         for vb_idx, vbatch in enumerate(val_loader):
             if vb_idx >= int(train_cfg["val_batches"]):
                 break
             gf, lf = load_views(vbatch, "global_views"), load_views(vbatch, "local_views")
             b = vbatch["global_views"].shape[0]
-            with torch.no_grad(), autocast:
-                dino_l, jepa_l, kde_v, iso_v, decorr_v, bal_v, inv_v = compute_losses(gf, lf, b, draw_masks(b * train_cfg["global_views"]), eval_teacher_temp, eval_kde_scale)
-            total_v = dino_l + jepa_l + kde_v + balance_weight * bal_v + dino_cfg["iso_loss_weight"] * iso_v + decorr_weight * decorr_v + dino_cfg["cls_inv_weight"] * inv_v[0]
-            sums += torch.tensor([float(dino_l), float(jepa_l), float(kde_v), float(iso_v), float(decorr_v), float(bal_v), float(total_v), float(inv_v[0]), float(inv_v[2]), float(inv_v[3])], device=device)
+            with torch.no_grad(), autocast:  # warmup 1: val totals always weight the ramped terms fully
+                losses = compute_losses(gf, lf, b, draw_masks(b * train_cfg["global_views"]), eval_teacher_temp, eval_kde_scale, 1.0)
+            sums = {k: sums.get(k, 0.0) + float(v) for k, v in losses.items()}
             n_batches += 1
         random.setstate(py_rng)
         torch.random.set_rng_state(cpu_rng)
         torch.cuda.set_rng_state(cuda_rng, device)
-        return dict(zip(("dino", "jepa", "kde", "iso", "decorr", "balance", "total", "cls_inv", "cls_inv_ratio", "head_inv_ratio"), (sums / max(1, n_batches)).tolist()))
+        return {k: v / max(1, n_batches) for k, v in sums.items()}
 
     # Ingest completed probe result JSONs into metrics.jsonl and wandb.
     def log_probe_results():
@@ -968,8 +974,7 @@ def main():
                 probe_views = [None if v is None else v.view(-1, batch_size, *v.shape[1:])[:, :probe_b].flatten(0, 1) for v in (gf, lf)]
                 with FlopCounterMode(display=False) as probe_ctx, torch.compiler.set_stance("force_eager"):
                     with autocast:
-                        p_dino, p_jepa, p_kde, p_iso, p_decorr, p_bal, p_inv = compute_losses(*probe_views, probe_b, draw_masks(probe_b * train_cfg["global_views"]), teacher_temp, kde_scale, ckpt=activation_checkpointing)
-                        probe_loss = p_dino + p_jepa + p_kde + balance_weight * p_bal + warmup * (dino_cfg["iso_loss_weight"] * p_iso + decorr_weight * p_decorr + dino_cfg["cls_inv_weight"] * p_inv[0])
+                        probe_loss = compute_losses(*probe_views, probe_b, draw_masks(probe_b * train_cfg["global_views"]), teacher_temp, kde_scale, warmup, ckpt=activation_checkpointing)["total"]
                     probe_loss.backward()
                 for o in opts:
                     o.zero_grad(set_to_none=True)
@@ -977,16 +982,10 @@ def main():
                 torch.random.set_rng_state(rng[1])
                 torch.cuda.set_rng_state(rng[2], device)
             with autocast:
-                dino_loss_value, jepa_loss, kde, iso, decorr, bal, view_inv = compute_losses(
-                    gf, lf, batch_size, mask_groups, teacher_temp, kde_scale,
-                    ckpt=activation_checkpointing,
-                )
-                # Isotropy, factor decorrelation and CLS invariance ramp in with LR warmup so they don't reshape the pretrained space before the
-                # LR is live; the balance term is the DINO head's anti-collapse mechanism, so it is on from step 0.
-                total_loss = dino_loss_value + jepa_loss + kde + balance_weight * bal + warmup * (dino_cfg["iso_loss_weight"] * iso + decorr_weight * decorr + dino_cfg["cls_inv_weight"] * view_inv[0])
+                losses = compute_losses(gf, lf, batch_size, mask_groups, teacher_temp, kde_scale, warmup, ckpt=activation_checkpointing)
             for o in opts:
                 o.zero_grad(set_to_none=True)
-            total_loss.backward()
+            losses["total"].backward()
             grad_norm = nn.utils.clip_grad_norm_(
                 [*student_backbone.parameters(), *student_dino_head.parameters(), *student_predictor.parameters()],
                 dino_cfg["clip_grad"],
@@ -1010,16 +1009,7 @@ def main():
             visible_patch_presentations += visible_now
             train_flops += step_train_flops
             if should_log:
-                reduced = {
-                    "dino": float(dino_loss_value.detach()),
-                    "jepa": float(jepa_loss.detach()),
-                    "kde": float(kde.detach()),
-                    "iso": float(iso.detach()),
-                    "decorr": float(decorr.detach()),
-                    "balance": float(bal.detach()),
-                    "total": float(total_loss.detach()),
-                    **dict(zip(("cls_inv", "cls_inv_ratio", "head_inv_ratio"), view_inv.detach()[[0, 2, 3]].tolist())),
-                }
+                reduced = {k: float(v) for k, v in losses.items()}
                 step_seconds = time.monotonic() - batch_started_at  # Loss transfers wait for GPU completion.
                 unique_counts = flush_unique_counts()
                 now = time.time()
