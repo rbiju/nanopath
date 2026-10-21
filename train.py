@@ -178,6 +178,15 @@ def sigreg(z, n_dirs):
         return 2 * len(z) * torch.trapezoid(((x.cos().mean(0) - gauss) ** 2 + x.sin().mean(0) ** 2) * gauss, t).mean()
 
 
+# SACReg: KL(N(mu, Sigma) || N(0, I)) of an (N, D) batch's Gaussian fit per dimension, 0.5 (|mu|^2 + tr Sigma - logdet Sigma - D) / D: closed-form
+# centre, scale and isotropy (0 iff standard normal moments), on one scale for any D; the 1e-4 ridge keeps logdet finite when N <= D or a direction collapses.
+def sacreg(z):
+    with torch.autocast("cuda", enabled=False):
+        z = z.float()
+        cov = torch.cov(z.T)
+        return 0.5 * (z.mean(0).square().sum() + cov.trace() - torch.logdet(cov + 1e-4 * torch.eye(z.shape[1], device=z.device))) / z.shape[1] - 0.5
+
+
 # Weight masked-patch regression by each image's inverse mask count.
 def jepa_regression(student, teacher, weights):
     return F.smooth_l1_loss(student, teacher, reduction="none").mean(-1).mul(weights).sum()
@@ -251,18 +260,18 @@ def make_region_idx(batch, grid, device, n_blocks, side, k, decay):
 # block i gets lr * layerwise_decay^(depth - 1 - i); patch_embed gets the deepest decay
 # multiplied by patch_embed_lr_mult; biases and norms get no weight decay; the head's
 # final weight-norm last_layer parameters get an LR-freeze for the first dino.freeze_last_layer_fraction.
-# With `muon`, hidden matrices (transformer blocks + DINO head MLP) get group["muon"] = number of stacked sub-matrices
+# With `muon`, hidden matrices (transformer blocks + DINO head MLP + bias MLP) get group["muon"] = number of stacked sub-matrices
 # (fused qkv=3, kv=2, else 1); 0 means AdamW. Embeddings, tokens, norms, biases, proj_in/proj, last_layer, and CLS-specialized
 # (`.cls.`) matrices stay AdamW, the latter because their one-token-per-image gradients are too low-rank to orthogonalize.
 # `cls_lr_mult` (None = follow layer-wise decay) sets the LR of `.cls.` backbone copies; `head_lr_mult` scales the randomly initialised
 # DINO head and JEPA predictor, so they can fit harder while the pretrained backbone keeps its LR.
-def build_param_groups(student_backbone, student_dino_head, student_predictor, layerwise_decay, patch_embed_lr_mult, muon, head_lr_mult, cls_lr_mult=None):
+def build_param_groups(student_backbone, student_dino_head, student_predictor, bias_mlp, layerwise_decay, patch_embed_lr_mult, muon, head_lr_mult, cls_lr_mult=None):
     depth = len(student_backbone.blocks)
     # Coalesce params that share (lr_mult, wd_mult, last_layer) into a single group each (~30 groups
     # instead of one-per-param), so AdamW's foreach path fuses the step across many tensors rather than
     # launching per-parameter kernels. Per-param lr/wd are unchanged, so the optimization is numerically identical.
     coalesced = {}
-    modules = ((student_backbone, "backbone"), (student_dino_head, "dino_head"), (student_predictor, "jepa_predictor"))
+    modules = ((student_backbone, "backbone"), (student_dino_head, "dino_head"), (student_predictor, "jepa_predictor"), (bias_mlp, "bias_mlp"))
     for module, kind in modules:
         for name, p in module.named_parameters():
             if not p.requires_grad:
@@ -276,7 +285,7 @@ def build_param_groups(student_backbone, student_dino_head, student_predictor, l
                 lr_mult = (layerwise_decay ** depth) * patch_embed_lr_mult
             wd_mult = 0.0 if name.endswith("bias") or "norm" in name or p.ndim < 2 else 1.0
             split = 3 if "qkv" in name else 2 if name.endswith(".kv.weight") else 1
-            split = split if muon and p.ndim == 2 and ".cls." not in name and (name.startswith("blocks.") or kind == "dino_head" and name.startswith("mlp.")) else 0
+            split = split if muon and p.ndim == 2 and ".cls." not in name and (name.startswith("blocks.") or kind == "dino_head" and name.startswith("mlp.") or kind == "bias_mlp") else 0
             key = (lr_mult, wd_mult, "last_layer" in name or kind == "dino_head" and name == "prototypes", split)
             coalesced.setdefault(key, {"params": [], "lr_mult": lr_mult, "wd_mult": wd_mult, "last_layer": key[2], "muon": split})["params"].append(p)
     return list(coalesced.values())
@@ -424,6 +433,21 @@ def main():
         student_dino_head = FactoredDINOHead(head_in_dim, int(head_cfg["prototypes"]), int(head_cfg["hidden_dim"]), int(head_cfg["bottleneck_dim"]), 3, int(head_cfg["factors"]), bool(head_cfg["separate_mlps"])).to(device)
         codebook_size = int(head_cfg["prototypes"]) // int(head_cfg["factors"])
     decorr_weight = 0.0 if head_type == "weight_norm" else float(head_cfg["decorr_weight"])
+    # dino.bias_branch: null = off; {layer, input, hidden_dim} = a small MLP on the detached CLS (input: cls) or patch-token mean (patch_mean)
+    # after block `layer` (0-based), or straight out of patch_embed (layer: patch_embed, patch_mean only: the CLS there is a constant).
+    # It regresses the teacher's two-global mean raw head output with MSE on every student view; only that loss trains it, so its R² is how
+    # much target variance shallow, low-capacity features can explain. Its detached output is summed onto the student's raw head output, so
+    # the main branch is only asked for what the bias branch can't explain; off, it outputs zeros. Student-only (no EMA copy), head LR,
+    # Muon/Muown on its matrices, outside grad clipping; off is an empty Sequential, so param groups and checkpoints need no special case.
+    # dino.sacreg: {cls, head, bias} weights of SACReg on the backbone CLS (ramped in with LR warmup), the summed raw head output, and the
+    # bias branch output (which trains only bias_mlp); each is averaged over the student view slots, 0 = off (still logged).
+    bias_cfg = dino_cfg["bias_branch"]
+    if bias_cfg is not None and (set(bias_cfg) != {"layer", "input", "hidden_dim"} or bias_cfg["layer"] == "patch_embed" and bias_cfg["input"] != "patch_mean"):
+        raise ValueError(f"dino.bias_branch={bias_cfg!r} invalid; expected null or exactly layer, input, hidden_dim, with input: patch_mean at layer: patch_embed")
+    bias_mlp = nn.Sequential() if bias_cfg is None else nn.Sequential(
+        nn.LayerNorm(student_backbone.embed_dim), nn.Linear(student_backbone.embed_dim, int(bias_cfg["hidden_dim"])), nn.GELU(),
+        nn.Linear(int(bias_cfg["hidden_dim"]), int(head_cfg["bottleneck_dim"]))).to(device)
+    bias_layer = None if bias_cfg is None else bias_cfg["layer"]
     # dino.temp_scale multiplies both DINO temperatures: `auto` = sqrt(ln 131072 / ln K), since softmax sharpness is relative to ~1/sqrt(2 ln K)
     # and this keeps smaller codebooks as far from collapse (1.0 for weight_norm); a number fixes it (1.0 = unscaled).
     temp_scale = math.sqrt(math.log(131072) / math.log(codebook_size)) if dino_cfg["temp_scale"] == "auto" else float(dino_cfg["temp_scale"])
@@ -488,7 +512,7 @@ def main():
     # Param groups carry per-parameter LR/WD multipliers (LWD + patch_embed + biases-no-WD); dino.optimizer is adamw, muon, or muown,
     # and muon/muown keep AdamW for everything that isn't a hidden matrix, so opts = [AdamW], [AdamW, Muon], or [AdamW, Muown].
     muon = {"adamw": False, "muon": True, "muown": True}[dino_cfg["optimizer"]]
-    param_groups = build_param_groups(student_backbone, student_dino_head, student_predictor, dino_cfg["layerwise_decay"], dino_cfg["patch_embed_lr_mult"], muon, float(dino_cfg["head_lr_mult"]), None if cls_spec is None else cls_spec["lr_mult"])
+    param_groups = build_param_groups(student_backbone, student_dino_head, student_predictor, bias_mlp, dino_cfg["layerwise_decay"], dino_cfg["patch_embed_lr_mult"], muon, float(dino_cfg["head_lr_mult"]), None if cls_spec is None else cls_spec["lr_mult"])
     opt = torch.optim.AdamW([g for g in param_groups if not g["muon"]], lr=1.0, betas=(0.9, dino_cfg["adam_beta2"]), fused=train_cfg["fused_adamw"])
     hidden = [g for g in param_groups if g["muon"]]
     opts = [opt, Muown(hidden, train_cfg["compile"], dino_cfg["adam_beta2"]) if dino_cfg["optimizer"] == "muown" else Muon(hidden, train_cfg["compile"])] if muon else [opt]
@@ -538,6 +562,7 @@ def main():
         student_dino_head.load_state_dict(checkpoint["dino_head"])
         teacher_dino_head.load_state_dict(checkpoint["dino_head_ema"])
         student_predictor.load_state_dict(checkpoint["predictor"])
+        bias_mlp.load_state_dict(checkpoint.get("bias_mlp", {}))  # pre-bias-branch checkpoints only resume with it off
         center.copy_(checkpoint["center"])
         # The requested backend owns step placement, even when the saved backend differs.
         for group in checkpoint["opt"]["param_groups"]:
@@ -689,7 +714,7 @@ def main():
         payload = {"model": cpu_state(student_backbone), "model_ema": cpu_state(teacher_backbone), "step": next_step, "config": cfg}
         if not full:
             return payload
-        return {**payload, "dino_head": cpu_state(student_dino_head), "dino_head_ema": cpu_state(teacher_dino_head), "predictor": cpu_state(student_predictor), "center": center.cpu(),
+        return {**payload, "dino_head": cpu_state(student_dino_head), "dino_head_ema": cpu_state(teacher_dino_head), "predictor": cpu_state(student_predictor), "bias_mlp": cpu_state(bias_mlp), "center": center.cpu(),
                 "opt": opt.state_dict(), "muon": [o.state_dict() for o in opts[1:]], "examples_seen": examples_seen,
                 "visible_patch_presentations": visible_patch_presentations, "train_flops": train_flops, "wandb": wandb_meta}
 
@@ -747,6 +772,7 @@ def main():
             t_cls = t_out[head_out].chunk(train_cfg["global_views"])
             # Invariance targets per image: layer-normed mean of the teacher's global views, for the backbone CLS and the raw head output.
             t_inv = [ln_flat(x.view(2, b, *x.shape[1:]).mean(0)) for x in (t["cls"], t_out[2])]
+            t_bias = t_out[2].view(2, b, -1).mean(0).float()  # bias branch target: the raw (un-normed) two-global mean head output
             t_swap = torch.cat((t_cls[1], t_cls[0]))
             if balance_type == "sinkhorn":
                 t_prob = sinkhorn_fn(t_swap, t_temp)
@@ -764,9 +790,15 @@ def main():
         # Each context region is one more student-teacher pair, so DINO's multi-crop mean is over 2L + 2R pairs (a local pairs with both
         # teacher views); SIGReg's single shared target makes each view one slot, as in LeJEPA, so its mean is over 2R + L.
         n_pairs = 2 * R + L if balance_type == "sigreg" else 2 * L + 2 * R
-        global_loss, jepa_loss, kde, iso, decorr, bal, p_sum, view_inv = 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0
+        global_loss, jepa_loss, kde, iso, decorr, bal, p_sum, view_inv, bias, sac = 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0
         # Per-slot MSE of each student view to its image's t_inv target, as [backbone CLS, raw head output], averaged over the 2R + L view slots.
         inv_mse = lambda cls, raw, reps: torch.stack([(ln_flat(s) - y.repeat(reps, 1)).square().mean() for s, y in zip((cls, raw), t_inv)]) * reps / (2 * R + L)
+        # Bias branch output (N, bottleneck) for a backbone output: the MLP on the detached tap (never trains the backbone), or zeros when off.
+        bias_in = lambda o: (o["tap"][:, 0] if bias_cfg["input"] == "cls" else o["tap"][:, 1 + student_backbone.registers :].mean(1)).detach()
+        bias_out = lambda o: bias_mlp(bias_in(o)).float() if bias_cfg else o["cls"].new_zeros(len(o["cls"]), int(head_cfg["bottleneck_dim"]), dtype=torch.float32)
+        bias_mse = lambda out, reps: (out - t_bias.repeat(reps, 1)).square().mean() * reps / (2 * R + L)
+        # SACReg per batch of distinct images for each of [backbone CLS, summed raw head output, bias output (when on)], averaged over view slots.
+        slot_sac = lambda zs, n: torch.stack([sum(sacreg(x.flatten(1)) for x in z.chunk(n)) for z in zs]) / (2 * R + L)
         # Summed student softmax over the batch (F, K); detached unless memax trains on it, so a 131k-prototype head keeps no softmax graph.
         anchor_probs = lambda x: F.softmax((x if balance_type == "memax" else x.detach()).float() / student_temp, dim=-1).sum(0)
         # Student-vs-teacher CLS term: MSE on raw head outputs for sigreg, else DINO CE (cosine for simdino).
@@ -787,11 +819,16 @@ def main():
                 inv = src.flatten(1).argsort(1)
                 keep_idx = None if keep_idx is None else inv.gather(1, keep_idx)
                 masks = None if masks is None else torch.zeros_like(masks).scatter_(1, inv, masks)
-            sg = student_backbone(sv, masks=masks, checkpoint=ckpt, keep_idx=keep_idx)
+            sg = student_backbone(sv, masks=masks, checkpoint=ckpt, keep_idx=keep_idx, tap=bias_layer)
             t_flat = t_prob.flatten(0, 1)
             s_logits, s_chunks, s_raw = student_dino_head(head_in(sg))
+            # Product of experts: the main head is graded on raw + detached bias, so target variance the bias branch explains earns it nothing.
+            s_bias = bias_out(sg)
+            s_raw = s_raw + s_bias.detach().view_as(s_raw)
             global_loss = global_loss + cls_loss((s_logits, s_chunks, s_raw)[head_out], t_flat if count == 1 else t_flat.repeat(count, 1, 1)) * 2 * count / n_pairs
             view_inv = view_inv + inv_mse(sg["cls"], s_raw, 2 * count)
+            bias = bias + (bias_mse(s_bias, 2 * count) if bias_cfg else 0.0)
+            sac = sac + slot_sac((sg["cls"], s_raw, *([s_bias] if bias_cfg else [])), 2 * count)
             if keep_idx is None:
                 patch_target = F.layer_norm(t["patches"].flatten(0, 1), (D,))[mask_idx]
                 patch_prediction = student_predictor(sg["patches"])
@@ -829,10 +866,14 @@ def main():
                 p_sum = p_sum + anchor_probs(s_logits)
         local_loss = 0.0
         if lf is not None:
-            sl_backbone = student_backbone(local_augment(lf, b), checkpoint=ckpt)
-            sl_out = student_dino_head(head_in(sl_backbone))
-            sl_cls = sl_out[head_out]
-            view_inv = view_inv + inv_mse(sl_backbone["cls"], sl_out[2], L)
+            sl_backbone = student_backbone(local_augment(lf, b), checkpoint=ckpt, tap=bias_layer)
+            sl_logits, sl_chunks, sl_raw = student_dino_head(head_in(sl_backbone))
+            sl_bias = bias_out(sl_backbone)
+            sl_raw = sl_raw + sl_bias.detach().view_as(sl_raw)
+            sl_cls = (sl_logits, sl_chunks, sl_raw)[head_out]
+            view_inv = view_inv + inv_mse(sl_backbone["cls"], sl_raw, L)
+            bias = bias + (bias_mse(sl_bias, L) if bias_cfg else 0.0)
+            sac = sac + slot_sac((sl_backbone["cls"], sl_raw, *([sl_bias] if bias_cfg else [])), L)
             # CE is linear in targets, so compiled recipes sum the two teacher targets; sigreg's two target slots hold the same center, so each
             # local is one MSE to it. Eager recipes keep the original reduction order.
             local_loss = (cls_loss(sl_cls.view(L, b, *sl_cls.shape[1:]), t_prob[0]) * L if balance_type == "sigreg"
@@ -850,10 +891,15 @@ def main():
         # random image, comparable between the backbone CLS and the head.
         view_inv = torch.cat([view_inv, view_inv / torch.stack([y.var(0).mean() for y in t_inv])])
         out = {"dino": local_loss + global_loss, "jepa": jepa_loss, "kde": kde, "iso": iso, "decorr": decorr, "balance": bal,
-               **dict(zip(("cls_inv", "head_inv", "cls_inv_ratio", "head_inv_ratio"), view_inv))}
-        # Isotropy, factor decorrelation and CLS invariance ramp in with LR warmup so they don't reshape the pretrained space before the
-        # LR is live; the balance term is the DINO head's anti-collapse mechanism, so it is on from step 0.
-        out["total"] = out["dino"] + jepa_loss + kde + balance_weight * bal + warmup * (dino_cfg["iso_loss_weight"] * iso + decorr_weight * decorr + dino_cfg["cls_inv_weight"] * out["cls_inv"])
+               **dict(zip(("cls_inv", "head_inv", "cls_inv_ratio", "head_inv_ratio"), view_inv)),
+               # bias_r2: fraction of the target's across-image variance the bias branch explains (1 = all, 0 = no better than the mean).
+               **({} if bias_cfg is None else {"bias_mse": bias, "bias_r2": 1 - bias / t_bias.var(0).mean()}),
+               **dict(zip(("sac_cls", "sac_head", "sac_bias"), sac))}
+        # Isotropy, factor decorrelation, CLS invariance and CLS SACReg ramp in with LR warmup so they don't reshape the pretrained space before
+        # the LR is live; the balance term is the DINO head's anti-collapse mechanism, so it is on from step 0. Bias MSE/SACReg only reach bias_mlp.
+        sw = dino_cfg["sacreg"]
+        out["total"] = (out["dino"] + jepa_loss + kde + balance_weight * bal + bias + sw["head"] * sac[1] + sw["bias"] * sac[2:].sum()
+                        + warmup * (dino_cfg["iso_loss_weight"] * iso + decorr_weight * decorr + dino_cfg["cls_inv_weight"] * out["cls_inv"] + sw["cls"] * sac[0]))
         return out
 
     # Held-out validation pass: same DINO + JEPA + KDE + isotropy + decorrelation losses on `val_batches` of the val split.
@@ -986,7 +1032,7 @@ def main():
             for o in opts:
                 o.zero_grad(set_to_none=True)
             losses["total"].backward()
-            grad_norm = nn.utils.clip_grad_norm_(
+            grad_norm = nn.utils.clip_grad_norm_(  # bias_mlp is left out, so its separate loss never shrinks the main step
                 [*student_backbone.parameters(), *student_dino_head.parameters(), *student_predictor.parameters()],
                 dino_cfg["clip_grad"],
             )
@@ -1162,6 +1208,8 @@ def main():
         "temp_scale": temp_scale,
         "iso_loss_weight": dino_cfg["iso_loss_weight"],
         "cls_inv_weight": dino_cfg["cls_inv_weight"],
+        "bias_branch": dino_cfg["bias_branch"],
+        "sacreg": dino_cfg["sacreg"],
         "drop_path_rate": dino_cfg["drop_path_rate"],
         "layerwise_decay": dino_cfg["layerwise_decay"],
         "weight_decay": dino_cfg["weight_decay"],

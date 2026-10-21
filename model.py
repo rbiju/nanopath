@@ -177,9 +177,10 @@ class ViT(nn.Module):
     # Return semantic token groups used by train.py and probe.py; with `keep_idx`, `patches` holds only kept patches.
     # `checkpoint=True` re-runs each block under torch.utils.checkpoint to trade compute for memory;
     # useful when the 1-GPU batch of 128 (2 globals + 8 locals) does not fit in 80 GB.
-    def forward(self, x, masks=None, checkpoint=False, keep_idx=None):
+    # `tap` ("patch_embed" or a 0-based block index) also returns that layer's raw [cls, registers, patches] tokens as "tap" (None otherwise).
+    def forward(self, x, masks=None, checkpoint=False, keep_idx=None, tap=None):
         x = self._prepare_tokens(x, masks, keep_idx)
-        cls_taps = []
+        cls_taps, tapped = [], x if tap == "patch_embed" else None
         for i, blk in enumerate(self.blocks):
             if checkpoint and self.training:
                 x = torch.utils.checkpoint.checkpoint(blk, x, use_reentrant=False)
@@ -187,6 +188,7 @@ class ViT(nn.Module):
                 x = blk(x)
             if i >= len(self.blocks) - self.cls_layers:
                 cls_taps.append(x[:, 0])
+            tapped = x if i == tap else tapped
         x = self.norm(x)
         return {
             "cls": x[:, 0],
@@ -194,6 +196,7 @@ class ViT(nn.Module):
             "cls_layers": self.norm(torch.stack(cls_taps, 1)).flatten(1),
             "registers": x[:, 1 : 1 + self.registers],
             "patches": x[:, 1 + self.registers :],
+            "tap": tapped,
         }
 
     # Default probe contract: encode_image returns patches for segmentation
