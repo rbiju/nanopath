@@ -435,12 +435,13 @@ def main():
     decorr_weight = 0.0 if head_type == "weight_norm" else float(head_cfg["decorr_weight"])
     # dino.bias_branch: null = off; {layer, input, hidden_dim} = a small MLP on the detached CLS (input: cls) or patch-token mean (patch_mean)
     # after block `layer` (0-based), or straight out of patch_embed (layer: patch_embed, patch_mean only: the CLS there is a constant).
-    # It regresses the teacher's two-global mean raw head output with MSE on every student view; only that loss trains it, so its R² is how
-    # much target variance shallow, low-capacity features can explain. Its detached output is summed onto the student's raw head output, so
-    # the main branch is only asked for what the bias branch can't explain; off, it outputs zeros. Student-only (no EMA copy), head LR,
-    # Muon/Muown on its matrices, outside grad clipping; off is an empty Sequential, so param groups and checkpoints need no special case.
-    # dino.sacreg: {cls, head, bias} weights of SACReg on the backbone CLS (ramped in with LR warmup), the summed raw head output, and the
-    # bias branch output (which trains only bias_mlp); each is averaged over the student view slots, 0 = off (still logged).
+    # It reads the EMA teacher's tap on each clean global view and regresses the teacher's two-global mean raw head output with MSE; only that
+    # loss trains it, so its R² is how much target variance shallow, low-capacity features can explain. Its detached two-view mean is added
+    # to the student's raw head output for the target match only, so the main branch is only asked for what the bias branch can't explain;
+    # off, it outputs zeros. No EMA copy, head LR, Muon/Muown on its matrices, outside grad clipping; off is an empty Sequential, so param
+    # groups and checkpoints need no special case.
+    # dino.sacreg: {cls, head, bias} weights of SACReg on the backbone CLS (ramped in with LR warmup), the main-only raw head output (like
+    # SIGReg, the quantity the EMA teacher copies), and the bias branch output (which trains only bias_mlp); 0 = off (still logged).
     bias_cfg = dino_cfg["bias_branch"]
     if bias_cfg is not None and (set(bias_cfg) != {"layer", "input", "hidden_dim"} or bias_cfg["layer"] == "patch_embed" and bias_cfg["input"] != "patch_mean"):
         raise ValueError(f"dino.bias_branch={bias_cfg!r} invalid; expected null or exactly layer, input, hidden_dim, with input: patch_mean at layer: patch_embed")
@@ -767,7 +768,7 @@ def main():
         # Tensor schedule values do not specialize Sinkhorn to each temperature.
         t_temp = torch.tensor(t_temp, device=gf.device)
         with torch.no_grad():
-            t = teacher_backbone(gf)
+            t = teacher_backbone(gf, tap=bias_layer)
             t_out = teacher_dino_head(head_in(t))
             t_cls = t_out[head_out].chunk(train_cfg["global_views"])
             # Invariance targets per image: layer-normed mean of the teacher's global views, for the backbone CLS and the raw head output.
@@ -790,14 +791,16 @@ def main():
         # Each context region is one more student-teacher pair, so DINO's multi-crop mean is over 2L + 2R pairs (a local pairs with both
         # teacher views); SIGReg's single shared target makes each view one slot, as in LeJEPA, so its mean is over 2R + L.
         n_pairs = 2 * R + L if balance_type == "sigreg" else 2 * L + 2 * R
-        global_loss, jepa_loss, kde, iso, decorr, bal, p_sum, view_inv, bias, sac = 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0
+        global_loss, jepa_loss, kde, iso, decorr, bal, p_sum, view_inv, sac = 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0
         # Per-slot MSE of each student view to its image's t_inv target, as [backbone CLS, raw head output], averaged over the 2R + L view slots.
         inv_mse = lambda cls, raw, reps: torch.stack([(ln_flat(s) - y.repeat(reps, 1)).square().mean() for s, y in zip((cls, raw), t_inv)]) * reps / (2 * R + L)
-        # Bias branch output (N, bottleneck) for a backbone output: the MLP on the detached tap (never trains the backbone), or zeros when off.
-        bias_in = lambda o: (o["tap"][:, 0] if bias_cfg["input"] == "cls" else o["tap"][:, 1 + student_backbone.registers :].mean(1)).detach()
-        bias_out = lambda o: bias_mlp(bias_in(o)).float() if bias_cfg else o["cls"].new_zeros(len(o["cls"]), int(head_cfg["bottleneck_dim"]), dtype=torch.float32)
-        bias_mse = lambda out, reps: (out - t_bias.repeat(reps, 1)).square().mean() * reps / (2 * R + L)
-        # SACReg per batch of distinct images for each of [backbone CLS, summed raw head output, bias output (when on)], averaged over view slots.
+        # Bias branch, once per image from the teacher's clean global-view taps (gradient-free, so it never trains a backbone): each view's
+        # prediction trains bias_mlp, and their two-view mean b_bar is the per-image offset added (detached) to every student slot, so the
+        # main head's residual target t - b_bar is the same for all views of an image; zeros when off.
+        bias_views = (bias_mlp(t["tap"][:, 0] if bias_cfg["input"] == "cls" else t["tap"][:, 1 + teacher_backbone.registers :].mean(1)).float() if bias_cfg
+                      else t_bias.new_zeros(2 * b, t_bias.shape[1]))
+        b_bar = bias_views.detach().view(2, b, -1).mean(0)
+        # SACReg per batch of distinct images for each of [backbone CLS, main-only raw head output], averaged over view slots.
         slot_sac = lambda zs, n: torch.stack([sum(sacreg(x.flatten(1)) for x in z.chunk(n)) for z in zs]) / (2 * R + L)
         # Summed student softmax over the batch (F, K); detached unless memax trains on it, so a 131k-prototype head keeps no softmax graph.
         anchor_probs = lambda x: F.softmax((x if balance_type == "memax" else x.detach()).float() / student_temp, dim=-1).sum(0)
@@ -819,16 +822,15 @@ def main():
                 inv = src.flatten(1).argsort(1)
                 keep_idx = None if keep_idx is None else inv.gather(1, keep_idx)
                 masks = None if masks is None else torch.zeros_like(masks).scatter_(1, inv, masks)
-            sg = student_backbone(sv, masks=masks, checkpoint=ckpt, keep_idx=keep_idx, tap=bias_layer)
+            sg = student_backbone(sv, masks=masks, checkpoint=ckpt, keep_idx=keep_idx)
             t_flat = t_prob.flatten(0, 1)
             s_logits, s_chunks, s_raw = student_dino_head(head_in(sg))
-            # Product of experts: the main head is graded on raw + detached bias, so target variance the bias branch explains earns it nothing.
-            s_bias = bias_out(sg)
-            s_raw = s_raw + s_bias.detach().view_as(s_raw)
-            global_loss = global_loss + cls_loss((s_logits, s_chunks, s_raw)[head_out], t_flat if count == 1 else t_flat.repeat(count, 1, 1)) * 2 * count / n_pairs
-            view_inv = view_inv + inv_mse(sg["cls"], s_raw, 2 * count)
-            bias = bias + (bias_mse(s_bias, 2 * count) if bias_cfg else 0.0)
-            sac = sac + slot_sac((sg["cls"], s_raw, *([s_bias] if bias_cfg else [])), 2 * count)
+            # Product of experts: only the target match sees raw + b_bar, so target variance the bias branch explains earns the main head nothing;
+            # SIGReg and SACReg stay on the main-only raw output, the quantity the EMA teacher copies.
+            s_sum = s_raw + b_bar.repeat(2 * count, 1).view_as(s_raw)
+            global_loss = global_loss + cls_loss((s_logits, s_chunks, s_sum)[head_out], t_flat if count == 1 else t_flat.repeat(count, 1, 1)) * 2 * count / n_pairs
+            view_inv = view_inv + inv_mse(sg["cls"], s_sum, 2 * count)
+            sac = sac + slot_sac((sg["cls"], s_raw), 2 * count)
             if keep_idx is None:
                 patch_target = F.layer_norm(t["patches"].flatten(0, 1), (D,))[mask_idx]
                 patch_prediction = student_predictor(sg["patches"])
@@ -866,14 +868,12 @@ def main():
                 p_sum = p_sum + anchor_probs(s_logits)
         local_loss = 0.0
         if lf is not None:
-            sl_backbone = student_backbone(local_augment(lf, b), checkpoint=ckpt, tap=bias_layer)
+            sl_backbone = student_backbone(local_augment(lf, b), checkpoint=ckpt)
             sl_logits, sl_chunks, sl_raw = student_dino_head(head_in(sl_backbone))
-            sl_bias = bias_out(sl_backbone)
-            sl_raw = sl_raw + sl_bias.detach().view_as(sl_raw)
-            sl_cls = (sl_logits, sl_chunks, sl_raw)[head_out]
-            view_inv = view_inv + inv_mse(sl_backbone["cls"], sl_raw, L)
-            bias = bias + (bias_mse(sl_bias, L) if bias_cfg else 0.0)
-            sac = sac + slot_sac((sl_backbone["cls"], sl_raw, *([sl_bias] if bias_cfg else [])), L)
+            sl_sum = sl_raw + b_bar.repeat(L, 1).view_as(sl_raw)
+            sl_cls = (sl_logits, sl_chunks, sl_sum)[head_out]
+            view_inv = view_inv + inv_mse(sl_backbone["cls"], sl_sum, L)
+            sac = sac + slot_sac((sl_backbone["cls"], sl_raw), L)
             # CE is linear in targets, so compiled recipes sum the two teacher targets; sigreg's two target slots hold the same center, so each
             # local is one MSE to it. Eager recipes keep the original reduction order.
             local_loss = (cls_loss(sl_cls.view(L, b, *sl_cls.shape[1:]), t_prob[0]) * L if balance_type == "sigreg"
@@ -882,7 +882,7 @@ def main():
             p_sum = p_sum if head_out else p_sum + anchor_probs(sl_cls)
         if head_out == 2:
             # SIGReg is averaged over every student view slot: each global region copy and each local crop.
-            bal = (bal + (0.0 if lf is None else sum(sigreg(z.flatten(1), sigreg_slices) for z in sl_cls.chunk(L)))) / (train_cfg["global_views"] * R + (0 if lf is None else L))
+            bal = (bal + (0.0 if lf is None else sum(sigreg(z.flatten(1), sigreg_slices) for z in sl_raw.chunk(L)))) / (train_cfg["global_views"] * R + (0 if lf is None else L))
         if not head_out:
             # ME-MAX (MSN): negative entropy of the student's mean prediction over every anchor view (globals + locals) in the batch, summed over factors.
             p_bar = p_sum / (b * (2 * R + (0 if lf is None else L)))
@@ -892,13 +892,17 @@ def main():
         view_inv = torch.cat([view_inv, view_inv / torch.stack([y.var(0).mean() for y in t_inv])])
         out = {"dino": local_loss + global_loss, "jepa": jepa_loss, "kde": kde, "iso": iso, "decorr": decorr, "balance": bal,
                **dict(zip(("cls_inv", "head_inv", "cls_inv_ratio", "head_inv_ratio"), view_inv)),
-               # bias_r2: fraction of the target's across-image variance the bias branch explains (1 = all, 0 = no better than the mean).
-               **({} if bias_cfg is None else {"bias_mse": bias, "bias_r2": 1 - bias / t_bias.var(0).mean()}),
-               **dict(zip(("sac_cls", "sac_head", "sac_bias"), sac))}
+               **dict(zip(("sac_cls", "sac_head"), sac))}
+        # Bias branch losses on the teacher's two global views, reaching only bias_mlp: MSE to the per-image target and SACReg per view batch.
+        # bias_r2: fraction of the target's across-image variance it explains (1 = all, 0 = no better than the mean).
+        if bias_cfg:
+            out["bias_mse"] = (bias_views - t_bias.repeat(2, 1)).square().mean()
+            out["bias_r2"], out["sac_bias"] = 1 - out["bias_mse"] / t_bias.var(0).mean(), sum(sacreg(x) for x in bias_views.chunk(2)) / 2
         # Isotropy, factor decorrelation, CLS invariance and CLS SACReg ramp in with LR warmup so they don't reshape the pretrained space before
-        # the LR is live; the balance term is the DINO head's anti-collapse mechanism, so it is on from step 0. Bias MSE/SACReg only reach bias_mlp.
+        # the LR is live; the balance term is the DINO head's anti-collapse mechanism, so it is on from step 0.
         sw = dino_cfg["sacreg"]
-        out["total"] = (out["dino"] + jepa_loss + kde + balance_weight * bal + bias + sw["head"] * sac[1] + sw["bias"] * sac[2:].sum()
+        out["total"] = (out["dino"] + jepa_loss + kde + balance_weight * bal + sw["head"] * sac[1]
+                        + (out["bias_mse"] + sw["bias"] * out["sac_bias"] if bias_cfg else 0.0)
                         + warmup * (dino_cfg["iso_loss_weight"] * iso + decorr_weight * decorr + dino_cfg["cls_inv_weight"] * out["cls_inv"] + sw["cls"] * sac[0]))
         return out
 

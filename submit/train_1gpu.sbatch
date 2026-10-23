@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-#SBATCH --job-name=xarch_02_sacreg_bias_layer0
+#SBATCH --job-name=xarch_02_sacreg_biasv2_layer1_patchmean
 #SBATCH --nodes=1
 #SBATCH --ntasks-per-node=1
 #SBATCH --gpus-per-task=1
