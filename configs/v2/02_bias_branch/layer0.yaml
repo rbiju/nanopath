@@ -1,8 +1,8 @@
 project:
-  name: xarch_02_bias_layer0
+  name: xarch_02_biasv2_pf_f2
   family: nanopath
-  recipe_id: xarch_02_bias_layer0
-  output_dir: /data/$USER/nanopath/20261020-xarch_02_bias_layer0
+  recipe_id: xarch_02_biasv2_pf_f2
+  output_dir: /data/$USER/nanopath/20261024-xarch_02_biasv2_pf_f2
   wandb_dir: /data/$USER/nanopath/wandb
 
 data:
