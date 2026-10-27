@@ -156,8 +156,9 @@ class ViT(nn.Module):
         return self._interpolate_pos_embed(h, w)[:, int(self._pos_has_cls):]
 
     # Build [cls, registers, patches]; `masks` swaps selected patches for mask_token, `keep_idx` (B, V) drops
-    # every other patch after the pos embed so kept tokens retain their true grid positions.
-    def _prepare_tokens(self, x, masks=None, keep_idx=None):
+    # every other patch after the pos embed so kept tokens retain their true grid positions, unless `pos_idx` (B, V)
+    # gives each kept token another grid position to embed (e.g. a per-copy shifted frame).
+    def _prepare_tokens(self, x, masks=None, keep_idx=None, pos_idx=None):
         B, _, H, W = x.shape
         h, w = H // self.patch_size, W // self.patch_size
         x = self.patch_embed.proj(x).flatten(2).transpose(1, 2)
@@ -165,21 +166,22 @@ class ViT(nn.Module):
             x = torch.where(masks.unsqueeze(-1), self.mask_token.to(x.dtype).expand_as(x), x)
         cls = self.cls_token.expand(B, -1, -1)
         regs = self.register_tokens.expand(B, -1, -1)
+        pos = self._interpolate_pos_embed(h, w)
         if self._pos_has_cls:
-            x = torch.cat([cls, x], dim=1) + self._interpolate_pos_embed(h, w)
-            cls, x = x[:, :1], x[:, 1:]
-        else:
-            x = x + self._interpolate_pos_embed(h, w)
+            cls, pos = cls + pos[:, :1], pos[:, 1:]
+        x = x + pos if pos_idx is None else x
         if keep_idx is not None:
             x = x.gather(1, keep_idx[..., None].expand(-1, -1, x.shape[-1]))
+        if pos_idx is not None:
+            x = x + pos[0][pos_idx]
         return torch.cat([cls, regs, x], dim=1)
 
     # Return semantic token groups used by train.py and probe.py; with `keep_idx`, `patches` holds only kept patches.
     # `checkpoint=True` re-runs each block under torch.utils.checkpoint to trade compute for memory;
     # useful when the 1-GPU batch of 128 (2 globals + 8 locals) does not fit in 80 GB.
     # `tap` ("patch_embed" or a 0-based block index) also returns that layer's raw [cls, registers, patches] tokens as "tap" (None otherwise).
-    def forward(self, x, masks=None, checkpoint=False, keep_idx=None, tap=None):
-        x = self._prepare_tokens(x, masks, keep_idx)
+    def forward(self, x, masks=None, checkpoint=False, keep_idx=None, tap=None, pos_idx=None):
+        x = self._prepare_tokens(x, masks, keep_idx, pos_idx)
         cls_taps, tapped = [], x if tap == "patch_embed" else None
         for i, blk in enumerate(self.blocks):
             if checkpoint and self.training:

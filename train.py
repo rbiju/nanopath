@@ -243,8 +243,9 @@ def _axis_dist(pos, t, grid, side):
 # Cross JEPA context is n toroidal side x side blocks per crop, concatenated with overlaps kept so every crop has
 # n * side**2 tokens, plus k unseen targets outside their union. Target weights exp(-8 * decay * d) use Chebyshev
 # distance to the nearest block normalised per row: decay>0 hugs the context, decay<0 pushes deep.
-# Weighted sampling without replacement is one topk over Exp(1) / w keys.
-def make_region_idx(batch, grid, device, n_blocks, side, k, decay):
+# Weighted sampling without replacement is one topk over Exp(1) / w keys. kv extra targets are drawn uniformly from the
+# visible union (appended after the k unseen ones), so the predictor also regresses full-crop teacher tokens at seen positions.
+def make_region_idx(batch, grid, device, n_blocks, side, k, decay, kv=0):
     pos = torch.arange(grid, device=device)
     ty, tx = torch.randint(grid, (2, batch, n_blocks, 1), device=device)
     rows, cols = (ty + pos[:side]) % grid, (tx + pos[:side]) % grid
@@ -253,7 +254,8 @@ def make_region_idx(batch, grid, device, n_blocks, side, k, decay):
     d = d / d.amax(-1, keepdim=True).clamp(min=1.0)
     keys = torch.empty_like(d).exponential_() * torch.exp(8.0 * decay * d)
     keys.scatter_(1, keep, float("inf"))
-    return keep, keys.topk(k, dim=-1, largest=False).indices
+    vis = torch.full_like(d, float("inf")).scatter_(1, keep, torch.empty(keep.shape, device=device).exponential_())
+    return keep, torch.cat([keys.topk(k, dim=-1, largest=False).indices, vis.topk(kv, dim=-1, largest=False).indices], 1)
 
 
 # AdamW parameter groups with layer-wise LR decay on the backbone:
@@ -480,11 +482,14 @@ def main():
     #          context_cls picks the CLS the predictor reads: student (JEPA trains the student CLS), teacher (frozen EMA CLS of the full clean crop), or none.
     #          context_registers: true appends the student's output registers to the predictor context; false leaves only the visible patches (+ context_cls).
     #          predict_regions: how many of the stacked region copies (picked at random each step) run the predictor; the rest only feed DINO.
+    #          visible_targets: extra targets per copy drawn uniformly from the student's own visible patches (0 = unseen patches only).
+    #          student_frame: true embeds each copy's patches and JEPA queries in its own toroidal frame, whose (0, 0) is the top-left of the
+    #          copy's first block (in the student's possibly rotated view); false keeps the teacher crop's grid positions.
     #   both:  dihedral is the probability that each student global copy gets a random non-identity 90-degree rotation/flip (teacher stays upright),
     #          so DINO and JEPA must match upright targets from rotated views; 0 = off.
     jepa_cfg = dict(dino_cfg["jepa"])
     jepa_type = jepa_cfg.pop("type")
-    jepa_args = {"block": {"depth", "width", "blocks", "block_scale", "dihedral"}, "cross": {"depth", "width", "context_regions", "targets", "target_decay", "context_cls", "context_registers", "dihedral", "predict_regions"}}
+    jepa_args = {"block": {"depth", "width", "blocks", "block_scale", "dihedral"}, "cross": {"depth", "width", "context_regions", "targets", "target_decay", "context_cls", "context_registers", "dihedral", "predict_regions", "visible_targets", "student_frame"}}
     if jepa_type not in jepa_args or set(jepa_cfg) != jepa_args[jepa_type]:
         raise ValueError(f"dino.jepa type={jepa_type!r} with keys {sorted(jepa_cfg)} invalid; expected one of {jepa_args}")
     dihedral, predict_regions = float(jepa_cfg["dihedral"]), int(jepa_cfg.get("predict_regions", 0))
@@ -498,9 +503,10 @@ def main():
         # Targets come from outside the block union, so the no-overlap context size bounds k.
         max_targets = global_patches - max((n * side ** 2 for n, side, _ in context_regions), default=global_patches)
         if (not context_regions or any(not 0 < side <= global_grid or n < 1 or count < 1 for n, side, count in context_regions) or not 0 < int(jepa_cfg["targets"]) <= max_targets
-                or len({n * side ** 2 for n, side, _ in context_regions}) != 1 or not 0 < int(jepa_cfg["predict_regions"]) <= sum(c for *_, c in context_regions)):
+                or len({n * side ** 2 for n, side, _ in context_regions}) != 1 or not 0 < int(jepa_cfg["predict_regions"]) <= sum(c for *_, c in context_regions)
+                or not 0 <= int(jepa_cfg["visible_targets"]) <= min(side ** 2 for _, side, _ in context_regions)):
             raise ValueError(f"dino.jepa cross needs sides in 1..{global_grid}, blocks and counts >= 1, targets in 1..{max_targets}, equal blocks * side^2 "
-                             "across context_regions, and predict_regions in 1..sum(count)")
+                             "across context_regions, predict_regions in 1..sum(count), and visible_targets in 0..min(side^2) (the smallest possible union)")
         if jepa_cfg["context_cls"] not in {"student", "teacher", "none"}:
             raise ValueError(f"dino.jepa.context_cls={jepa_cfg['context_cls']!r} invalid; expected student, teacher, or none")
         student_predictor = CrossJEPAPredictor(student_backbone.embed_dim, int(jepa_cfg["depth"]), int(jepa_cfg["width"])).to(device)
@@ -748,7 +754,7 @@ def main():
         if jepa_type == "block":
             masks, mask_idx, mask_w = make_block_mask(n_crops, global_grid, device, int(jepa_cfg["blocks"]), float(jepa_cfg["block_scale"]))
             return [(1, None, mask_idx, masks, mask_w)]
-        draws = [make_region_idx(n_crops * count, global_grid, device, n, side, int(jepa_cfg["targets"]), float(jepa_cfg["target_decay"])) for n, side, count in context_regions]
+        draws = [make_region_idx(n_crops * count, global_grid, device, n, side, int(jepa_cfg["targets"]), float(jepa_cfg["target_decay"]), int(jepa_cfg["visible_targets"])) for n, side, count in context_regions]
         return [(total_regions, *(torch.cat(x) for x in zip(*draws)), None, None)]
 
     # Augment a collated (B, V, 3, H, W) view stack and flatten crop-major, so [crop0_img0, crop0_img1, ..., crop1_img0, ...]
@@ -802,6 +808,8 @@ def main():
         b_bar = bias_views.detach().view(2, b, -1).mean(0)
         # SACReg per batch of distinct images for each of [backbone CLS, main-only raw head output], averaged over view slots.
         slot_sac = lambda zs, n: torch.stack([sum(sacreg(x.flatten(1)) for x in z.chunk(n)) for z in zs]) / (2 * R + L)
+        # Grid index p in the toroidal frame whose origin is o = (row, col) per copy: (p - o) mod the grid on each axis.
+        to_frame = lambda p, o: (p // global_grid - o[:, :1]) % global_grid * global_grid + (p % global_grid - o[:, 1:]) % global_grid
         # Summed student softmax over the batch (F, K); detached unless memax trains on it, so a 131k-prototype head keeps no softmax graph.
         anchor_probs = lambda x: F.softmax((x if balance_type == "memax" else x.detach()).float() / student_temp, dim=-1).sum(0)
         # Student-vs-teacher CLS term: MSE on raw head outputs for sigreg, else DINO CE (cosine for simdino).
@@ -822,7 +830,17 @@ def main():
                 inv = src.flatten(1).argsort(1)
                 keep_idx = None if keep_idx is None else inv.gather(1, keep_idx)
                 masks = None if masks is None else torch.zeros_like(masks).scatter_(1, inv, masks)
-            sg = student_backbone(sv, masks=masks, checkpoint=ckpt, keep_idx=keep_idx)
+            origin, pos_idx = None, None
+            if keep_idx is not None and jepa_cfg["student_frame"]:
+                # A copy's first block is its first side^2 kept patches; it spans a contiguous toroidal run of rows and of columns, whose start
+                # (the occupied index whose predecessor is empty) is the block's top-left in the student's view, even after a dihedral move.
+                starts = []
+                for k, (_, side, _) in zip(keep_idx.split([len(gf) * c for *_, c in context_regions]), context_regions):
+                    occ = [torch.zeros(len(k), global_grid, dtype=torch.bool, device=k.device).scatter_(1, a, True) for a in (k[:, :side ** 2] // global_grid, k[:, :side ** 2] % global_grid)]
+                    starts.append(torch.stack([(m & ~m.roll(1, 1)).int().argmax(1) for m in occ], 1))
+                origin = torch.cat(starts)
+                pos_idx = to_frame(keep_idx, origin)
+            sg = student_backbone(sv, masks=masks, checkpoint=ckpt, keep_idx=keep_idx, pos_idx=pos_idx)
             t_flat = t_prob.flatten(0, 1)
             s_logits, s_chunks, s_raw = student_dino_head(head_in(sg))
             # Product of experts: only the target match sees raw + b_bar, so target variance the bias branch explains earns the main head nothing;
@@ -841,7 +859,7 @@ def main():
                 # Only a random predict_regions of the count copies (same picks for every image) run the predictor, so its activations scale with that, not count.
                 sel = torch.randperm(count, device=gf.device)[:predict_regions]
                 pick = lambda x: x.view(count, -1, *x.shape[1:])[sel].flatten(0, 1)
-                mask_idx, inv = pick(mask_idx), None if inv is None else pick(inv)
+                mask_idx, inv, origin = pick(mask_idx), None if inv is None else pick(inv), None if origin is None else pick(origin)
                 # Gather targets per region chunk so the teacher grid is never duplicated count times.
                 tp = F.layer_norm(t["patches"], (D,))
                 patch_target = torch.cat([tp.gather(1, m[..., None].expand(-1, -1, D)) for m in mask_idx.chunk(predict_regions)])
@@ -849,6 +867,7 @@ def main():
                 query_table = student_backbone.mask_token + student_backbone.patch_pos_embed(global_grid, global_grid).detach()
                 # Queries sit where each target patch lands in the student's (possibly rotated) frame; targets stay upright.
                 query_idx = mask_idx if inv is None else inv.gather(1, mask_idx)
+                query_idx = query_idx if origin is None else to_frame(query_idx, origin)  # student_frame: queries shift with their copy's patches
                 queries = query_table.expand(mask_idx.shape[0], -1, -1).gather(1, query_idx[..., None].expand(-1, -1, D))
                 context_cls = {"student": sg["cls"], "teacher": t["cls"].repeat(count, 1), "none": None}[jepa_cfg["context_cls"]]
                 context = pick(torch.cat([*([] if context_cls is None else [context_cls[:, None]]), *([sg["registers"]] if jepa_cfg["context_registers"] else []), sg["patches"]], dim=1))

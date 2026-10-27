@@ -126,6 +126,8 @@ dino:
     context_registers: true # append the student's output registers to the JEPA predictor context
     dihedral: 0.0 # probability each student global copy gets a random 90-degree rotation/flip vs the upright teacher; 0 = off
     predict_regions: 3 # how many region copies (random each step) run the JEPA predictor; the rest only feed DINO
+    visible_targets: 0 # extra JEPA targets per region copy drawn from the student's visible patches; 0 = unseen patches only
+    student_frame: false # true = each region copy's patches and JEPA queries use its own toroidal frame, (0, 0) at its first block's top-left
 
 probe:
   enabled: true
