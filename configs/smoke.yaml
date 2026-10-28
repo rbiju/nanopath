@@ -95,6 +95,7 @@ dino:
     blocks: 4
     block_scale: 0.1
     dihedral: 0.0 # probability each student global copy gets a random 90-degree rotation/flip vs the upright teacher; 0 = off
+    loss: {type: smooth_l1} # smooth_l1 | jem (cross/window; adds head + balance, see train.py)
 
 probe:
   enabled: true
