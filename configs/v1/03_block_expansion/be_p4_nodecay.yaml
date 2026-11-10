@@ -28,6 +28,7 @@ data:
 model:
   type: dinov2_vits14_reg
   extra_registers: 0 # fresh trunc-normal register tokens appended after DINOv2's 4; 0 = pretrained registers only
+  cls_tokens: null # null = DINOv2's single CLS; {count, decorr_weight}: count concatenated CLS tokens, warmup-ramped pairwise cross-correlation weight (+ per-token KDE)
   cls_specialization: null
   # cls_specialization:
   #   qkv_blocks: 4
@@ -73,6 +74,7 @@ dino:
   lr_min: 1.0e-6
   schedule_progress: samples # samples | pace: what drives every schedule (LR, WD, teacher temp, freeze, KDE, EMA); pace = legacy 0.1862 FLOP pace, so the arcs stop early
   adam_beta2: 0.999
+  muon_momentum: 0.95 # Nesterov momentum of the Muon/Muown hidden-matrix updates
   weight_decay: [0.013, 0.067] # cosine [start, end] over schedule_progress; decoupled, so each step shrinks weights by lr * wd
   teacher_momentum: [0.994, 1.0] # teacher EMA cosine [start, end] over schedule_progress at a 128-image batch; rescaled per step for other batch sizes
   warmup_fraction: 0.0909

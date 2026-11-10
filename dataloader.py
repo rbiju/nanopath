@@ -87,10 +87,13 @@ class HEDJitter(nn.Module):
         return torch.exp(log_rgb).clamp_(0.0, 1.0).movedim(-1, -3)
 
 
+# Per-view GPU photometric augmentation of uint8 (B, V, 3, H, W) crops: HED jitter, colour jitter, then grayscale, blur and solarize, each with
+# its own per-view probability (data.grayscale, data.blur_prob, data.solarize; defaults 0.1 / 0.35 / 0, the original recipe).
 class GPUAugment(nn.Module):
     def __init__(self, data):
         super().__init__()
         self.hed = HEDJitter(data["hed_jitter"]) if data["hed_jitter"] > 0 else nn.Identity()
+        self.p_gray, self.p_blur, self.p_solarize = (float(data.get(k, d)) for k, d in (("grayscale", 0.1), ("blur_prob", 0.35), ("solarize", 0.0)))
         for name, value in [("mean", data["mean"]), ("std", data["std"]),
                             ("jitter", [data["color_jitter"], data["color_jitter"], data["color_jitter_saturation"]])]:
             self.register_buffer(name, torch.tensor(value).view(1, 3, 1, 1))
@@ -110,10 +113,11 @@ class GPUAugment(nn.Module):
             saturation = K.enhance.adjust_saturation_with_gray_subtraction(x, factors[:, 2, 0, 0])
             op = order[:, position, None, None, None]
             x = torch.where(op == 0, brightness, torch.where(op == 1, contrast, saturation))
-        x = torch.where(torch.rand(n, 1, 1, 1, device=x.device) < 0.1, K.color.rgb_to_grayscale(x), x)
+        x = torch.where(torch.rand(n, 1, 1, 1, device=x.device) < self.p_gray, K.color.rgb_to_grayscale(x), x)
         sigma = (0.1 + torch.rand(n, 1, device=x.device) * 1.7).expand(-1, 2)
         blurred = K.filters.gaussian_blur2d(x, (9, 9), sigma, border_type="reflect", separable=True)
-        x = torch.where(torch.rand(n, 1, 1, 1, device=x.device) < 0.35, blurred, x)
+        x = torch.where(torch.rand(n, 1, 1, 1, device=x.device) < self.p_blur, blurred, x)
+        x = torch.where(torch.rand(n, 1, 1, 1, device=x.device) < self.p_solarize, torch.where(x >= 0.5, 1.0 - x, x), x)
         return ((x - self.mean) / self.std).reshape(shape)
 
 

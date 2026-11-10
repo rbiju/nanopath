@@ -11,6 +11,7 @@
 # the weight-normed layer for a Parameter prototype bank split into per-factor codebooks.
 
 import re
+from collections import OrderedDict
 from copy import deepcopy
 
 import torch
@@ -89,18 +90,14 @@ class Block(nn.Module):
         self.ls1 = LayerScale(dim)
         self.drop_path1 = DropPath(drop_path_p)
         self.norm2 = nn.LayerNorm(dim, eps=1e-6)
-        self.mlp = SwiGLU(dim, hidden) if ffn == "swiglu" else nn.Sequential()
-        if ffn == "mlp":
-            self.mlp.fc1 = nn.Linear(dim, hidden, bias=True)
-            self.mlp.fc2 = nn.Linear(hidden, dim, bias=True)
+        # GELU MLP as a callable Sequential (keys mlp.fc1/mlp.fc2, act has no params), so a Specialized wrapper can run either copy whole.
+        self.mlp = SwiGLU(dim, hidden) if ffn == "swiglu" else nn.Sequential(OrderedDict(fc1=nn.Linear(dim, hidden), act=nn.GELU(), fc2=nn.Linear(hidden, dim)))
         self.ls2 = LayerScale(dim)
         self.drop_path2 = DropPath(drop_path_p)
 
-    def _ff(self, x): return self.mlp(x) if isinstance(self.mlp, SwiGLU) else self.mlp.fc2(F.gelu(self.mlp.fc1(x)))
-
     def forward(self, x):
         x = x + self.drop_path1(self.ls1(self.attn(self.norm1(x))))
-        x = x + self.drop_path2(self.ls2(self._ff(self.norm2(x))))
+        x = x + self.drop_path2(self.ls2(self.mlp(self.norm2(x))))
         return x
 
 
@@ -123,7 +120,7 @@ class ViT(nn.Module):
         cfg = variant_cfg or VIT_VARIANTS[base]
         dim, depth, heads, pretrain_grid, patch, ffn, pos_has_cls, self.pretrained_url = cfg[:8]
         mlp_ratio, registers = 4.0, cfg[8] if len(cfg) > 8 else 4
-        self.patch_size, self.registers, self.embed_dim = patch, registers, dim
+        self.patch_size, self.registers, self.embed_dim, self.n_cls = patch, registers, dim, 1  # n_cls grows via add_cls_tokens
         self._pretrain_grid, self._pos_has_cls = pretrain_grid, pos_has_cls
         self.patch_embed = nn.Module()
         self.patch_embed.proj = nn.Conv2d(3, dim, kernel_size=patch, stride=patch, bias=True)
@@ -182,22 +179,23 @@ class ViT(nn.Module):
     # `tap` ("patch_embed" or a 0-based block index) also returns that layer's raw [cls, registers, patches] tokens as "tap" (None otherwise).
     def forward(self, x, masks=None, checkpoint=False, keep_idx=None, tap=None, pos_idx=None):
         x = self._prepare_tokens(x, masks, keep_idx, pos_idx)
-        cls_taps, tapped = [], x if tap == "patch_embed" else None
+        n, cls_taps, tapped = self.n_cls, [], x if tap == "patch_embed" else None
         for i, blk in enumerate(self.blocks):
             if checkpoint and self.training:
                 x = torch.utils.checkpoint.checkpoint(blk, x, use_reentrant=False)
             else:
                 x = blk(x)
             if i >= len(self.blocks) - self.cls_layers:
-                cls_taps.append(x[:, 0])
+                cls_taps.append(x[:, :n])
             tapped = x if i == tap else tapped
         x = self.norm(x)
         return {
-            "cls": x[:, 0],
-            # Last cls_layers blocks' CLS through the shared final norm, concatenated; equals "cls" when cls_layers is 1.
+            "cls": x[:, :n].flatten(1),  # the n CLS tokens concatenated (B, n * dim): the representation every CLS loss and probe reads
+            "cls_tokens": x[:, :n],
+            # Last cls_layers blocks' CLS tokens through the shared final norm, concatenated; equals "cls" when cls_layers is 1.
             "cls_layers": self.norm(torch.stack(cls_taps, 1)).flatten(1),
-            "registers": x[:, 1 : 1 + self.registers],
-            "patches": x[:, 1 + self.registers :],
+            "registers": x[:, n : n + self.registers],
+            "patches": x[:, n + self.registers :],
             "tap": tapped,
         }
 
@@ -212,35 +210,40 @@ class ViT(nn.Module):
         return out["patches"].mean(1) if self.patch_mean_readout else out["cls_layers"]
 
     # Expanded checkpoints carry extra blocks, extra registers, and specialized ones `.cls.` keys; a plain ViT (probe.py, notebooks) rebuilds
-    # itself to match before loading. Expansion goes first: copies inherit their source's specialization, so specialized qkv stays a contiguous prefix.
+    # itself to match before loading. Expansion goes first: copies inherit their source's specialization, so specialized qkv/proj+MLP stay contiguous prefixes.
     def load_state_dict(self, state_dict, *args, **kwargs):
+        add_cls_tokens(self, state_dict["cls_token"].shape[1] - self.n_cls)
         add_registers(self, state_dict["register_tokens"].shape[1] - self.registers)
         n_blocks = len({k.split(".")[1] for k in state_dict if k.startswith("blocks.")})
         if n_blocks > len(self.blocks):
             expand_blocks(self, n_blocks - len(self.blocks))
         if any(".cls." in k for k in state_dict):
-            specialize_cls_weights(self, sum(f"blocks.{i}.attn.qkv.cls.weight" in state_dict for i in range(len(self.blocks))))
+            specialize_cls_weights(self, *(sum(f"blocks.{i}.attn.{m}.cls.weight" in state_dict for i in range(len(self.blocks))) for m in ("qkv", "proj")))
         return super().load_state_dict(state_dict, *args, **kwargs)
 
 
-# Runs a deep-copied `cls` layer on token 0 and the original `patch` layer on registers + patches, so attention still sees one sequence.
+# Runs a deep-copied `cls` layer on the first n (CLS) tokens and the original `patch` layer on registers + patches, so attention still sees one sequence.
 class Specialized(nn.Module):
-    def __init__(self, layer):
+    def __init__(self, layer, n=1):
         super().__init__()
-        self.patch, self.cls = layer, deepcopy(layer)
+        self.patch, self.cls, self.n = layer, deepcopy(layer), n
 
     def forward(self, x):
-        return torch.cat([self.cls(x[:, :1]), self.patch(x[:, 1:])], dim=1)
+        return torch.cat([self.cls(x[:, : self.n]), self.patch(x[:, self.n :])], dim=1)
 
 
-# CLS/patch weight specialization: CLS gets its own LayerNorms + LayerScales in every block and its own qkv in the first `qkv_blocks`; idempotent.
-def specialize_cls_weights(model, qkv_blocks):
+# CLS/patch weight specialization: CLS gets its own LayerNorms + LayerScales in every block, its own qkv in the first `qkv_blocks`, and its own
+# attention output projection + MLP in the first `mlp_blocks` (so there it only shares the attention context with patches); idempotent.
+def specialize_cls_weights(model, qkv_blocks, mlp_blocks):
+    S = lambda m: Specialized(m, model.n_cls)
     for i, blk in enumerate(model.blocks):
         if isinstance(blk.norm1, Specialized):
             continue
-        blk.norm1, blk.norm2, blk.ls1, blk.ls2 = (Specialized(m) for m in (blk.norm1, blk.norm2, blk.ls1, blk.ls2))
+        blk.norm1, blk.norm2, blk.ls1, blk.ls2 = (S(m) for m in (blk.norm1, blk.norm2, blk.ls1, blk.ls2))
         if i < qkv_blocks:
-            blk.attn.qkv = Specialized(blk.attn.qkv)
+            blk.attn.qkv = S(blk.attn.qkv)
+        if i < mlp_blocks:
+            blk.attn.proj, blk.mlp = S(blk.attn.proj), S(blk.mlp)
     return model
 
 
@@ -251,8 +254,10 @@ def expand_blocks(model, chunks):
     new, per = [], len(model.blocks) // chunks
     for i in range(chunks):
         blk = deepcopy(model.blocks[(i + 1) * per - 1 + i])
-        for m in (blk.attn.proj, blk.mlp.w3 if isinstance(blk.mlp, SwiGLU) else blk.mlp.fc2):
-            nn.init.zeros_(m.weight), nn.init.zeros_(m.bias)
+        # Output layers by name, so both copies of a Specialized proj/MLP get zeroed too.
+        for name, m in blk.named_modules():
+            if isinstance(m, nn.Linear) and any(s in name for s in ("attn.proj", "fc2", "w3")):
+                nn.init.zeros_(m.weight), nn.init.zeros_(m.bias)
         model.blocks.insert((i + 1) * (per + 1) - 1, blk)
         new.append(blk)
     return new
@@ -265,6 +270,18 @@ def add_registers(model, n):
         new = nn.init.trunc_normal_(torch.empty(1, n, model.embed_dim, device=model.register_tokens.device), std=0.02)
         model.register_tokens = nn.Parameter(torch.cat([model.register_tokens.data, new.to(model.register_tokens.dtype)], 1))
         model.registers += n
+
+
+# Appends n CLS tokens, each the first CLS plus trunc-normal noise (std 0.02): step 0 stays DINOv2-like and the noise breaks their symmetry.
+# They share the CLS pos embed and any CLS-specialized weights (Specialized.n follows n_cls). n <= 0 is a no-op.
+def add_cls_tokens(model, n):
+    if n > 0:
+        new = model.cls_token.data[:, :1].repeat(1, n, 1) + nn.init.trunc_normal_(torch.empty(1, n, model.embed_dim, device=model.cls_token.device), std=0.02)
+        model.cls_token = nn.Parameter(torch.cat([model.cls_token.data, new.to(model.cls_token.dtype)], 1))
+        model.n_cls += n
+        for m in model.modules():
+            if isinstance(m, Specialized):
+                m.n = model.n_cls
 
 
 # Strict-load the model's declared pretrained weights; both halves of a Specialized layer load the same tensor, so step 0 matches DINOv2.

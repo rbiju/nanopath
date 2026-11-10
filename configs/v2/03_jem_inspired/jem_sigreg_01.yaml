@@ -28,6 +28,7 @@ data:
 model:
   type: dinov2_vits14_reg
   extra_registers: 0 # fresh trunc-normal register tokens appended after DINOv2's 4; 0 = pretrained registers only
+  cls_tokens: null # null = DINOv2's single CLS; {count, decorr_weight}: count concatenated CLS tokens, warmup-ramped pairwise cross-correlation weight (+ per-token KDE)
   cls_specialization: null
   # cls_specialization:
   #   qkv_blocks: 4
@@ -74,6 +75,7 @@ dino:
   lr_min: 1.0e-6
   schedule_progress: samples # samples | pace: what drives every schedule (LR, WD, teacher temp, freeze, KDE, EMA); pace = legacy 0.1862 FLOP pace, so the arcs stop early
   adam_beta2: 0.999
+  muon_momentum: 0.95 # Nesterov momentum of the Muon/Muown hidden-matrix updates
   weight_decay: [0.04, 0.2] # cosine [start, end] over schedule_progress; decoupled, so each step shrinks weights by lr * wd
   teacher_momentum: [0.994, 1.0] # teacher EMA cosine [start, end] over schedule_progress at a 128-image batch; rescaled per step for other batch sizes
   warmup_fraction: 0.0909
@@ -113,10 +115,11 @@ dino:
     type: window
     teacher_side: 12
     student_views:
-      - {side: 10, count: 1, keep: 0.75, min_overlap: 36, targets: 32}
-      - {side: 6, count: 4, keep: 0.75, min_overlap: 9, targets: 8}
+      - {side: 10, count: 1, mask_side: 5, min_overlap: 36, targets: 32}
+      - {side: 6, count: 4, mask_side: 3, min_overlap: 9, targets: 8}
     dihedral: 0.0
-    loss: 
+    student_frame: true # true = each student window uses its own frame, (0, 0) at its top-left; false = master-crop positions (this run also had the teacher in its own frame; the teacher now always keeps master-crop positions)
+    loss:
       type: jem 
       head: 
         hidden_dim: 2048
@@ -124,8 +127,12 @@ dino:
         prototypes: 1024
         factors: 2
         separate_mlps: true
+        decorr_weight: 0.0 # cross-factor code-assignment MI penalty, warmup-ramped; 0 = off
+        kde_weight: 0.0 # pure-repulsion KDE on each codebook's unit prototypes; 0 = off
+        kde_concentration: 10.0 # vMF concentration of the prototype KDE; higher = repulsion only between near-duplicate prototypes
       balance: 
         type: mi
+        weight: 1.0
 
 probe:
   enabled: true

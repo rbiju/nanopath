@@ -31,7 +31,7 @@ from torch.utils.data import DataLoader, Subset
 from torch.utils.flop_counter import FlopCounterMode
 
 from dataloader import GPUAugment, SiteBatchSampler, StudentAugment, TCGATileDataset, TILE_SIZE, UniqueSlideBatchSampler
-from model import CrossJEPAPredictor, DINOHead, FactoredDINOHead, JEPAPredictor, ViT, add_registers, expand_blocks, load_pretrained, specialize_cls_weights
+from model import CrossJEPAPredictor, DINOHead, FactoredDINOHead, JEPAPredictor, ViT, add_cls_tokens, add_registers, expand_blocks, load_pretrained, specialize_cls_weights
 from probe import (
     completed_probe_summary,
     collect_probe_results,
@@ -159,8 +159,8 @@ def dino_ce(student, teacher, temp):
     return -(teacher * (student if temp is None else F.log_softmax(student / temp, dim=-1))).sum((-2, -1)).mean()
 
 
-# SimDINO coding rate of L2-normalized (N, F, d) chunks, per dimension and summed over factors: 0.5 logdet(I + d / (N eps^2) Z^T Z) / d grows
-# as the batch spans more directions (~0.8 when isotropic at eps 0.5), so its per-sample gradient is on the cosine alignment's scale.
+# SimDINO coding rate of (N, F, d) chunks, L2-normalized (cosine) or raw (mse, where logdet's growth with scale balances the MSE's), per dimension
+# and summed over factors: 0.5 logdet(I + d / (N eps^2) Z^T Z) / d grows as the batch spans more directions (~0.8 when isotropic unit chunks at eps 0.5).
 def coding_rate(z, eps=0.5):
     with torch.autocast("cuda", enabled=False):
         n, _, d = z.shape
@@ -210,8 +210,8 @@ def isotropy_loss(x):
         return x.shape[1] * c.square().sum() / c.diagonal().sum().square() - 1
 
 
-# Cross-factor redundancy of (N, F, d) head chunks: squared cross-correlation between each factor pair over the batch, per dimension
-# (~d/N when factors are independent, ~canonical-corr mass when one chunk is a linear copy of another); 0 for a single factor.
+# Cross-factor redundancy of (N, F, d) head chunks or multi-CLS tokens: squared cross-correlation between each factor pair over the batch, per
+# dimension (~d/N when factors are independent, ~canonical-corr mass when one chunk is a linear copy of another); 0 for a single factor.
 def factor_decorrelation(z):
     with torch.autocast("cuda", enabled=False):
         z = z.float()
@@ -259,21 +259,26 @@ def make_region_idx(batch, grid, device, n_blocks, side, k, decay, kv=0):
 
 
 # Window JEPA placement of n student windows of `side` against teacher windows with top-left corners tc (n, 2) and side t_side: each corner is
-# uniform over the placements overlapping the teacher window by >= min_overlap patches; n_keep random window patches stay visible, and k targets
-# come from the overlap, masked patches first (visible keys get +1, so they only fill the remainder). Returns master-grid indices of each
-# window (n, side^2) and of its kept patches (n, n_keep), and each target's column within the window (n, k).
-def make_window_idx(tc, grid, t_side, side, n_keep, min_overlap, k):
+# uniform over the placements overlapping the teacher window by >= min_overlap patches; one mask_side x mask_side square is masked (the rest stay
+# visible), rolled to a uniform offset on the window's torus, and k targets are drawn uniformly from the overlap, masked or visible alike (so
+# ~mask_side^2 / side^2 of them are masked). `corners` consecutive equal chunks of rows share one corner draw (n = one per window; the copy count =
+# batch-shared layouts, given shared tc); masks and targets stay per row.
+# Returns master-grid indices of each window (n, side^2) and of its kept patches (n, side^2 - mask_side^2), and each target's column within the window (n, k).
+def make_window_idx(tc, grid, t_side, side, mask_side, min_overlap, k, corners):
     n, ar, p = len(tc), torch.arange(grid, device=tc.device), grid - side + 1
     span = lambda t: (torch.minimum(t[:, None] + t_side, ar[:p] + side) - torch.maximum(t[:, None], ar[:p])).clamp(min=0)  # per-axis overlap (n, p)
     area = (span(tc[:, 0])[:, :, None] * span(tc[:, 1])[:, None, :]).flatten(1)
-    corner = torch.rand(area.shape, device=tc.device).masked_fill(area < min_overlap, 2.0).argmin(1)
+    u = torch.rand(corners, 1, area.shape[1], device=tc.device).expand(-1, n // corners, -1).flatten(0, 1)
+    corner = u.masked_fill(area < min_overlap, 2.0).argmin(1)
     win = ((corner // p)[:, None, None] + ar[:side, None]) * grid + (corner % p)[:, None, None] + ar[:side]
     r, c = win.flatten(1) // grid, win.flatten(1) % grid
     in_t = (r >= tc[:, :1]) & (r < tc[:, :1] + t_side) & (c >= tc[:, 1:]) & (c < tc[:, 1:] + t_side)
-    order = torch.rand(n, side * side, device=tc.device).argsort(1)
-    keys = (torch.rand(in_t.shape, device=tc.device) + torch.zeros_like(in_t).scatter_(1, order[:, :n_keep], True)).masked_fill(~in_t, float("inf"))
+    # Cell (r, c), shifted back by the roll, is masked if both rolled coordinates fall in the square's first mask_side rows and columns.
+    rr, cc = (ar[:side, None] - torch.randint(side, (n, 1, 1), device=tc.device)) % side, (ar[:side] - torch.randint(side, (n, 1, 1), device=tc.device)) % side
+    order = ((rr < mask_side) & (cc < mask_side)).flatten(1).int().argsort(dim=1, stable=True)  # visible patches first, so they lead `order`
+    keys = torch.rand(in_t.shape, device=tc.device).masked_fill(~in_t, float("inf"))
     win = win.flatten(1)
-    return win, win.gather(1, order[:, :n_keep]), keys.topk(k, dim=1, largest=False).indices
+    return win, win.gather(1, order[:, : side * side - mask_side * mask_side]), keys.topk(k, dim=1, largest=False).indices
 
 
 # AdamW parameter groups with layer-wise LR decay on the backbone:
@@ -326,18 +331,18 @@ def newton_schulz(G):
     return X.mT if G.shape[-2] > G.shape[-1] else X
 
 
-# Muon: Nesterov momentum (0.95) orthogonalized per sub-matrix, so every direction of a weight moves equally.
+# Muon: Nesterov momentum (dino.muon_momentum) orthogonalized per sub-matrix, so every direction of a weight moves equally.
 # The 0.2*sqrt(max(m, n)) scale matches AdamW's update RMS (Moonlight), so dino.lr, layerwise decay, and the WD schedule carry over.
 class Muon(torch.optim.Optimizer):
-    def __init__(self, params, compile_ns): super().__init__(params, {"lr": 1.0, "weight_decay": 0.0}); self.ns = torch.compile(newton_schulz, disable=not compile_ns)
+    def __init__(self, params, compile_ns, momentum): super().__init__(params, {"lr": 1.0, "weight_decay": 0.0}); self.ns, self.mom = torch.compile(newton_schulz, disable=not compile_ns), momentum
 
     @torch.no_grad()
     def step(self):
         for group in self.param_groups:
             for p in group["params"]:
                 buf = self.state[p].setdefault("momentum_buffer", torch.zeros_like(p))
-                buf.lerp_(p.grad, 0.05)
-                G = p.grad.lerp(buf, 0.95).view(group["muon"], -1, p.shape[1])
+                buf.lerp_(p.grad, 1 - self.mom)
+                G = p.grad.lerp(buf, self.mom).view(group["muon"], -1, p.shape[1])
                 update = self.ns(G.bfloat16()).reshape_as(p).to(p.dtype)
                 p.mul_(1 - group["lr"] * group["weight_decay"]).add_(update, alpha=-group["lr"] * 0.2 * max(G.shape[-2:]) ** 0.5)
 
@@ -346,7 +351,7 @@ class Muon(torch.optim.Optimizer):
 # Muon (same momentum, sub-matrix split, and RMS scale as Muon above) steps the direction v, bias-corrected Adam steps the row magnitudes g,
 # then W is recomposed in place. Decoupled WD shrinks W afterwards and g is resynced to the new row norms, keeping ||W_i|| == g_i.
 class Muown(torch.optim.Optimizer):
-    def __init__(self, params, compile_ns, beta2): super().__init__(params, {"lr": 1.0, "weight_decay": 0.0}); self.ns, self.beta2 = torch.compile(newton_schulz, disable=not compile_ns), beta2
+    def __init__(self, params, compile_ns, beta2, momentum): super().__init__(params, {"lr": 1.0, "weight_decay": 0.0}); self.ns, self.beta2, self.mom = torch.compile(newton_schulz, disable=not compile_ns), beta2, momentum
 
     @torch.no_grad()
     def step(self):
@@ -363,8 +368,8 @@ class Muown(torch.optim.Optimizer):
                 u = p / g
                 grad_g = (p.grad * u).sum(1, keepdim=True)
                 grad_v = (g / st["v_norm"]) * (p.grad - u * grad_g)
-                buf.lerp_(grad_v, 0.05)
-                G = grad_v.lerp(buf, 0.95).view(group["muon"], -1, p.shape[1])
+                buf.lerp_(grad_v, 1 - self.mom)
+                G = grad_v.lerp(buf, self.mom).view(group["muon"], -1, p.shape[1])
                 v = (u * st["v_norm"]).add_(self.ns(G.bfloat16()).reshape_as(p).to(p.dtype), alpha=-lr * 0.2 * max(G.shape[-2:]) ** 0.5)
                 st["m_g"].lerp_(grad_g, 0.1)
                 st["v_g"].lerp_(grad_g.square(), 1 - self.beta2)
@@ -403,11 +408,12 @@ def main():
     torch.backends.cuda.matmul.allow_tf32 = True
     torch.backends.cudnn.allow_tf32 = True
     variant = cfg["model"]["type"]
-    # model.cls_specialization: null keeps the plain ViT; {qkv_blocks, lr_mult} gives CLS its own norms/LayerScales (all blocks) and qkv (first qkv_blocks).
+    # model.cls_specialization: null keeps the plain ViT; {qkv_blocks, mlp_blocks, lr_mult} gives CLS its own norms/LayerScales (all blocks), qkv
+    # (first qkv_blocks), and attention output projection + MLP (first mlp_blocks).
     # lr_mult: null keeps the CLS copies on layer-wise decay like their patch twins; a number bypasses it with lr * lr_mult.
     cls_spec = cfg["model"]["cls_specialization"]
-    if cls_spec is not None and set(cls_spec) != {"qkv_blocks", "lr_mult"}:
-        raise ValueError(f"model.cls_specialization keys {sorted(cls_spec)} invalid; expected null or exactly qkv_blocks, lr_mult")
+    if cls_spec is not None and set(cls_spec) != {"qkv_blocks", "mlp_blocks", "lr_mult"}:
+        raise ValueError(f"model.cls_specialization keys {sorted(cls_spec)} invalid; expected null or exactly qkv_blocks, mlp_blocks, lr_mult")
     # model.block_expansion: null keeps DINOv2's depth; {chunks, freeze_base, freeze_embeddings} inserts `chunks` identity-initialized block
     # copies (one per depth/chunks blocks); freeze_base: true trains only those new blocks among the transformer blocks, and
     # freeze_embeddings: true also freezes patch_embed, pos_embed, and the cls/register/mask tokens, so backward stops at the first new block.
@@ -416,10 +422,18 @@ def main():
         raise ValueError(f"model.block_expansion keys {sorted(expansion)} invalid; expected null or exactly chunks, freeze_base, freeze_embeddings")
     student_backbone = ViT(variant=variant, drop_path_rate=dino_cfg["drop_path_rate"])
     if cls_spec is not None:
-        specialize_cls_weights(student_backbone, int(cls_spec["qkv_blocks"]))
+        specialize_cls_weights(student_backbone, int(cls_spec["qkv_blocks"]), int(cls_spec["mlp_blocks"]))
     student_backbone = load_pretrained(student_backbone)
     # model.extra_registers appends that many fresh register tokens after DINOv2's 4 (0 = pretrained registers only).
     add_registers(student_backbone, int(cfg["model"]["extra_registers"]))
+    # model.cls_tokens: null keeps DINOv2's one CLS; {count, decorr_weight} runs `count` CLS tokens (extras copied from the pretrained one + noise),
+    # concatenated into the representation every CLS loss, the DINO head and every probe read. decorr_weight (warmup-ramped) penalizes their
+    # cross-token correlation (factor_decorrelation), and each token also gets its own KDE (dino.kde_loss_weight), so no token can go constant.
+    cls_tok = cfg["model"]["cls_tokens"]
+    if cls_tok is not None and set(cls_tok) != {"count", "decorr_weight"}:
+        raise ValueError(f"model.cls_tokens keys {sorted(cls_tok)} invalid; expected null or exactly count, decorr_weight")
+    add_cls_tokens(student_backbone, 0 if cls_tok is None else int(cls_tok["count"]) - 1)
+    cls_decorr_weight, n_cls = 0.0 if cls_tok is None else float(cls_tok["decorr_weight"]), student_backbone.n_cls
     if expansion is not None:
         new_blocks = expand_blocks(student_backbone, int(expansion["chunks"]))
         for blk in student_backbone.blocks:
@@ -446,8 +460,8 @@ def main():
     head_args = {"weight_norm": {"hidden_dim", "bottleneck_dim"}, "factored": {"hidden_dim", "bottleneck_dim", "prototypes", "factors", "decorr_weight", "separate_mlps"}}
     if head_type not in head_args or set(head_cfg) != head_args[head_type]:
         raise ValueError(f"dino.head type={head_type!r} with keys {sorted(head_cfg)} invalid; expected one of {head_args}")
-    # The head reads n * embed_dim when it takes the CLS of a model.type ending in `_cls{n}` (last n blocks' CLS concatenated).
-    head_in_dim = student_backbone.embed_dim * (student_backbone.cls_layers if dino_cfg["head_input"] == "cls" else 1)
+    # The head reads layers * n_cls * embed_dim when it takes the CLS of a model.type ending in `_cls{layers}` (last blocks' CLS tokens concatenated).
+    head_in_dim = student_backbone.embed_dim * (student_backbone.cls_layers * n_cls if dino_cfg["head_input"] == "cls" else 1)
     if head_type == "weight_norm":
         student_dino_head, codebook_size = DINOHead(head_in_dim, 131072, int(head_cfg["hidden_dim"]), int(head_cfg["bottleneck_dim"]), 3).to(device), 131072
     else:
@@ -466,8 +480,9 @@ def main():
     bias_cfg = dino_cfg["bias_branch"]
     if bias_cfg is not None and (set(bias_cfg) != {"layer", "input", "hidden_dim"} or bias_cfg["layer"] == "patch_embed" and bias_cfg["input"] != "patch_mean"):
         raise ValueError(f"dino.bias_branch={bias_cfg!r} invalid; expected null or exactly layer, input, hidden_dim, with input: patch_mean at layer: patch_embed")
+    bias_in = student_backbone.embed_dim * (n_cls if bias_cfg is not None and bias_cfg["input"] == "cls" else 1)
     bias_mlp = nn.Sequential() if bias_cfg is None else nn.Sequential(
-        nn.LayerNorm(student_backbone.embed_dim), nn.Linear(student_backbone.embed_dim, int(bias_cfg["hidden_dim"])), nn.GELU(),
+        nn.LayerNorm(bias_in), nn.Linear(bias_in, int(bias_cfg["hidden_dim"])), nn.GELU(),
         nn.Linear(int(bias_cfg["hidden_dim"]), int(head_cfg["bottleneck_dim"]))).to(device)
     bias_layer = None if bias_cfg is None else bias_cfg["layer"]
     # dino.temp_scale multiplies both DINO temperatures: `auto` = sqrt(ln 131072 / ln K), since softmax sharpness is relative to ~1/sqrt(2 ln K)
@@ -478,18 +493,20 @@ def main():
     #   center: {}. DINO v1: teacher logits minus an EMA (momentum 0.9) of their batch mean, then the sharpened softmax.
     #   memax: {weight}. MSN: teacher softmax at a fixed 0.025 temperature, no balancing; weight * -entropy of the student's batch-mean
     #          prediction (all global + local views) spreads prototype use. The `balance` log is this negative entropy for every non-SimDINO type.
-    #   simdino: {weight}. Prototypes unused: student head chunks align (cosine) to the teacher's, and weight * -coding_rate prevents collapse.
+    #   simdino: {weight, objective}. Prototypes unused; weight * -coding_rate prevents collapse. objective cosine: student head chunks align to the
+    #          other global's teacher chunks. objective mse: raw outputs regress the teacher views' mean like sigreg, with coding rate on raw chunks.
     #   sigreg: {weight, slices}. LeJEPA: prototypes unused; every student view's raw head output regresses (MSE) the mean of the teacher's two
     #          global-view outputs, and weight * SIGReg over `slices` fresh random directions pushes each view-batch toward an isotropic Gaussian.
     balance_cfg = dict(dino_cfg["balance"])
     balance_type = balance_cfg.pop("type")
-    balance_args = {"sinkhorn": set(), "center": set(), "memax": {"weight"}, "simdino": {"weight"}, "sigreg": {"weight", "slices"}}
+    balance_args = {"sinkhorn": set(), "center": set(), "memax": {"weight"}, "simdino": {"weight", "objective"}, "sigreg": {"weight", "slices"}}
     if balance_type not in balance_args or set(balance_cfg) != balance_args[balance_type]:
         raise ValueError(f"dino.balance type={balance_type!r} with keys {sorted(balance_cfg)} invalid; expected one of {balance_args}")
     balance_weight = float(balance_cfg.get("weight", 0.0))
     sigreg_slices = int(balance_cfg.get("slices", 0))
     student_temp = None if balance_type in ("simdino", "sigreg") else 0.1 * temp_scale
-    head_out = {"simdino": 1, "sigreg": 2}.get(balance_type, 0)  # DINO heads return (logits, normalized chunks, raw chunks)
+    mse = balance_type == "sigreg" or balance_cfg.get("objective") == "mse"  # raw head outputs regress one shared per-image target
+    head_out = 2 if mse else {"simdino": 1}.get(balance_type, 0)  # DINO heads return (logits, normalized chunks, raw chunks)
     center = torch.zeros(1 if head_type == "weight_norm" else int(head_cfg["factors"]), codebook_size, device=device)
     global_grid = train_cfg["global_size"] // student_backbone.patch_size
     global_patches = global_grid ** 2
@@ -504,50 +521,70 @@ def main():
     #          visible_targets: extra targets per copy drawn uniformly from the student's own visible patches (0 = unseen patches only).
     #          student_frame: true embeds each copy's patches and JEPA queries in its own toroidal frame, whose (0, 0) is the top-left of the
     #          copy's first block (in the student's possibly rotated view); false keeps the teacher crop's grid positions.
-    #   window: {teacher_side, student_views: [{side, count, keep, min_overlap, targets}, ...], dihedral}. One master crop per image
-    #          (train.global_views: 1, local_views: 0). The teacher sees one random teacher_side^2 window; each student view encodes a side^2 window
-    #          overlapping it by >= min_overlap patches, with all but round(keep * side^2) random patches swapped for mask_token (iBOT-style: no
-    #          predictor, the encoder's own output tokens at `targets` overlap positions, masked patches first, meet the teacher's). Every window
-    #          (teacher too) is embedded in its own frame with its top-left at (0, 0), and each view type is one stacked student pass.
+    #   window: {teacher_side, student_views: [{side, count, mask_side, min_overlap, targets}, ...], dihedral, student_frame}. One master crop per image
+    #          (train.local_views: 0); train.global_views > 1 adds independently augmented global crops that only the teacher sees, each through
+    #          its own random teacher window, and the CLS targets and bias-branch input average them with the master window. The teacher sees
+    #          one random teacher_side^2 window; each student view encodes a side^2 window
+    #          overlapping it by >= min_overlap patches, with one toroidally rolled mask_side x mask_side square (0 = unmasked) swapped for mask_token (iBOT-style: no
+    #          predictor, the encoder's own output tokens at `targets` uniformly drawn overlap positions, masked or visible, meet the teacher's). student_frame:
+    #          true embeds each student window in its own frame with its top-left at (0, 0); false keeps the master crop's grid positions and shares
+    #          one window layout (teacher + every student copy) across the batch, redrawn each step (needs dihedral: 0). The teacher window always
+    #          keeps master-crop positions. Each view type is one stacked student pass.
     #   both:  dihedral is the probability that each student global copy gets a random non-identity 90-degree rotation/flip (teacher stays upright),
     #          so DINO and JEPA must match upright targets from rotated views; 0 = off.
     #   loss:  how predictions meet the teacher's patch tokens. {type: smooth_l1}: smooth-L1 to the layer-normed tokens. {type: jem (cross/window),
-    #          head: {hidden_dim, bottleneck_dim, prototypes, factors, separate_mlps}, balance: {type: sinkhorn} | {type: mi, weight}}: a separate
-    #          factored patch head (with an EMA teacher copy) turns predictions and teacher tokens into per-factor prototype distributions matched
-    #          by CE; sinkhorn balances the teacher's codes over the step's targets at the DINO temperatures (rescaled to its codebook), while mi
-    #          uses a fixed 0.1 for both softmaxes and adds weight * (mean per-patch entropy - entropy of the mean) of the student's predictions.
+    #          head: {hidden_dim, bottleneck_dim, prototypes, factors, separate_mlps, decorr_weight, kde_weight, kde_concentration}, balance: {type: sinkhorn} | {type: mi, weight}
+    #          | {type: residual, weight, image_weight, temp}}: a separate factored patch head (with an EMA teacher copy) turns predictions and teacher tokens
+    #          into per-factor prototype distributions matched by CE; sinkhorn balances the teacher's codes over the step's targets at the DINO temperatures
+    #          (rescaled to its codebook), while mi uses a fixed 0.1 for both softmaxes and adds weight * (mean per-patch entropy - entropy of the mean) of
+    #          the student's predictions. residual (window only) is mi plus a CLS prior that explains away image-level content: the patch logits only predict
+    #          the targets multiplied by the prior, and image_weight rewards entropy of their code mix within each image;
+    #          temp replaces mi's fixed 0.1 for both softmaxes (lower = sharper teacher targets and student predictions).
+    #          decorr_weight (warmup-ramped, 0 = off) penalizes the mutual information between factor pairs' code assignments; kde_weight (0 = off)
+    #          is a pure-repulsion KDE at kde_concentration on each codebook's unit prototypes, so codes spread over the sphere instead of duplicating.
     jepa_cfg = dict(dino_cfg["jepa"])
     jepa_type, loss_cfg = jepa_cfg.pop("type"), jepa_cfg.pop("loss")
+    # dino.jepa.masked_weight (window): the patch loss is masked_weight * mean over masked targets + (1 - masked_weight) * mean over visible ones (JEM).
+    masked_weight = float(jepa_cfg.pop("masked_weight", 0.8))
     jepa_args = {"block": {"depth", "width", "blocks", "block_scale", "dihedral"}, "cross": {"depth", "width", "context_regions", "targets", "target_decay", "context_cls", "context_registers", "dihedral", "predict_regions", "visible_targets", "student_frame"},
-                 "window": {"teacher_side", "student_views", "dihedral"}}
+                 "window": {"teacher_side", "student_views", "dihedral", "student_frame"}}
     if jepa_type not in jepa_args or set(jepa_cfg) != jepa_args[jepa_type]:
         raise ValueError(f"dino.jepa type={jepa_type!r} with keys {sorted(jepa_cfg)} invalid; expected one of {jepa_args}")
     jem = loss_cfg["type"] == "jem"
     if (loss_cfg["type"] not in ("smooth_l1", "jem") or set(loss_cfg) != ({"type", "head", "balance"} if jem else {"type"})
-            or jem and (jepa_type == "block" or set(loss_cfg["head"]) != {"hidden_dim", "bottleneck_dim", "prototypes", "factors", "separate_mlps"}
-                        or loss_cfg["balance"] not in ({"type": "sinkhorn"}, {"type": "mi", "weight": loss_cfg["balance"].get("weight")}))):
+            or jem and (jepa_type == "block" or set(loss_cfg["head"]) != {"hidden_dim", "bottleneck_dim", "prototypes", "factors", "separate_mlps", "decorr_weight", "kde_weight", "kde_concentration"}
+                        or loss_cfg["balance"] not in ({"type": "sinkhorn"}, {"type": "mi", "weight": loss_cfg["balance"].get("weight")}, {"type": "residual", **{k: loss_cfg["balance"].get(k) for k in ("weight", "image_weight", "temp")}})
+                        or loss_cfg["balance"]["type"] == "residual" and jepa_type != "window")):
         raise ValueError(f"dino.jepa.loss={loss_cfg!r} invalid; expected {{type: smooth_l1}} or {{type: jem, head: {{hidden_dim, bottleneck_dim, prototypes, factors, "
-                         "separate_mlps}, balance: {type: sinkhorn} | {type: mi, weight}}} (jem needs cross or window)")
+                         "separate_mlps, decorr_weight, kde_weight, kde_concentration}, balance: {type: sinkhorn} | {type: mi, weight} | {type: residual, weight, image_weight, temp}}} (jem needs cross or window; residual needs window)")
+    # The residual balance's CLS prior MLP is its own module like bias_mlp, so its CE never shrinks the main clipped step.
+    jem_prior = jem and loss_cfg["balance"]["type"] == "residual"
+    prior_mlp = nn.Sequential() if not jem_prior else nn.Sequential(
+        nn.LayerNorm(student_backbone.embed_dim * n_cls), nn.Linear(student_backbone.embed_dim * n_cls, int(loss_cfg["head"]["hidden_dim"])), nn.GELU(),
+        nn.Linear(int(loss_cfg["head"]["hidden_dim"]), int(loss_cfg["head"]["bottleneck_dim"]))).to(device)
     if jem:
         jh = loss_cfg["head"]
         student_dino_head.patch_head = FactoredDINOHead(student_backbone.embed_dim, int(jh["prototypes"]), int(jh["hidden_dim"]), int(jh["bottleneck_dim"]), 3, int(jh["factors"]), bool(jh["separate_mlps"])).to(device)
         jem_scale = math.sqrt(math.log(131072) / math.log(int(jh["prototypes"]) // int(jh["factors"]))) if dino_cfg["temp_scale"] == "auto" else float(dino_cfg["temp_scale"])
         jem_sinkhorn = loss_cfg["balance"]["type"] == "sinkhorn"
         jem_mi = 0.0 if jem_sinkhorn else float(loss_cfg["balance"]["weight"])
+        jem_image, jem_temp = (float(loss_cfg["balance"]["image_weight"]), float(loss_cfg["balance"]["temp"])) if jem_prior else (0.0, 0.1)
+        jem_decorr_weight, jem_kde_weight, jem_kde_conc = float(jh["decorr_weight"]), float(jh["kde_weight"]), float(jh["kde_concentration"])
     dihedral, predict_regions = float(jepa_cfg["dihedral"]), int(jepa_cfg.get("predict_regions", 0))
     if jepa_type == "block":
         context_regions = [(1, global_grid, 1)]
         student_predictor = JEPAPredictor(student_backbone.embed_dim, int(jepa_cfg["depth"]), int(jepa_cfg["width"])).to(device)
     elif jepa_type == "window":
-        t_side, view_keys = int(jepa_cfg["teacher_side"]), {"side", "count", "keep", "min_overlap", "targets"}
+        t_side, view_keys = int(jepa_cfg["teacher_side"]), {"side", "count", "mask_side", "min_overlap", "targets"}
         if any(set(v) != view_keys for v in jepa_cfg["student_views"]):
             raise ValueError(f"dino.jepa.student_views entries must have exactly the keys {sorted(view_keys)}")
-        # (side, count, kept patches, min_overlap, targets) per student view type
-        student_views = [(int(v["side"]), int(v["count"]), round(float(v["keep"]) * int(v["side"]) ** 2), int(v["min_overlap"]), int(v["targets"])) for v in jepa_cfg["student_views"]]
-        if (train_cfg["global_views"] != 1 or train_cfg["local_views"] != 0 or not 0 < t_side <= global_grid or not student_views
-                or any(not 0 < s <= global_grid or c < 1 or not 0 < nk <= s * s or not 0 < k <= o <= min(s, t_side) ** 2 for s, c, nk, o, k in student_views)):
-            raise ValueError(f"dino.jepa window needs train.global_views: 1, train.local_views: 0, sides in 1..{global_grid}, counts >= 1, keep leaving "
-                             "1..side^2 patches, and 0 < targets <= min_overlap <= min(side, teacher_side)^2")
+        # (side, count, mask_side, min_overlap, targets) per student view type
+        student_views = [(int(v["side"]), int(v["count"]), int(v["mask_side"]), int(v["min_overlap"]), int(v["targets"])) for v in jepa_cfg["student_views"]]
+        if (train_cfg["global_views"] < 1 or train_cfg["local_views"] != 0 or not 0 < t_side <= global_grid or not student_views
+                or any(not 0 < s <= global_grid or c < 1 or not 0 <= b < s or not 0 < k <= o <= min(s, t_side) ** 2 for s, c, b, o, k in student_views)
+                or not jepa_cfg["student_frame"] and float(jepa_cfg["dihedral"]) > 0):
+            raise ValueError(f"dino.jepa window needs train.global_views >= 1, train.local_views: 0, sides in 1..{global_grid}, counts >= 1, "
+                             "0 <= mask_side < side, 0 < targets <= min_overlap <= min(side, teacher_side)^2, and dihedral: 0 with student_frame: false")
         context_regions = [(1, s, c) for s, c, *_ in student_views]  # only the counts matter downstream
         student_predictor = nn.Identity()  # no predictor: the encoder predicts its own mask tokens
     else:
@@ -574,10 +611,10 @@ def main():
     # Param groups carry per-parameter LR/WD multipliers (LWD + patch_embed + biases-no-WD); dino.optimizer is adamw, muon, or muown,
     # and muon/muown keep AdamW for everything that isn't a hidden matrix, so opts = [AdamW], [AdamW, Muon], or [AdamW, Muown].
     muon = {"adamw": False, "muon": True, "muown": True}[dino_cfg["optimizer"]]
-    param_groups = build_param_groups(student_backbone, student_dino_head, student_predictor, bias_mlp, dino_cfg["layerwise_decay"], dino_cfg["patch_embed_lr_mult"], muon, float(dino_cfg["head_lr_mult"]), None if cls_spec is None else cls_spec["lr_mult"])
+    param_groups = build_param_groups(student_backbone, student_dino_head, student_predictor, nn.ModuleList([bias_mlp, prior_mlp]), dino_cfg["layerwise_decay"], dino_cfg["patch_embed_lr_mult"], muon, float(dino_cfg["head_lr_mult"]), None if cls_spec is None else cls_spec["lr_mult"])
     opt = torch.optim.AdamW([g for g in param_groups if not g["muon"]], lr=1.0, betas=(0.9, dino_cfg["adam_beta2"]), fused=train_cfg["fused_adamw"])
     hidden = [g for g in param_groups if g["muon"]]
-    opts = [opt, Muown(hidden, train_cfg["compile"], dino_cfg["adam_beta2"]) if dino_cfg["optimizer"] == "muown" else Muon(hidden, train_cfg["compile"])] if muon else [opt]
+    opts = [opt, Muown(hidden, train_cfg["compile"], dino_cfg["adam_beta2"], dino_cfg["muon_momentum"]) if dino_cfg["optimizer"] == "muown" else Muon(hidden, train_cfg["compile"], dino_cfg["muon_momentum"])] if muon else [opt]
     step = 0
     batch_size = int(train_cfg["batch_size"])
     max_train_samples = int(train_cfg["max_train_samples"])
@@ -625,6 +662,7 @@ def main():
         teacher_dino_head.load_state_dict(checkpoint["dino_head_ema"])
         student_predictor.load_state_dict(checkpoint["predictor"])
         bias_mlp.load_state_dict(checkpoint.get("bias_mlp", {}))  # pre-bias-branch checkpoints only resume with it off
+        prior_mlp.load_state_dict(checkpoint.get("prior_mlp", {}))  # same for pre-residual checkpoints
         center.copy_(checkpoint["center"])
         # The requested backend owns step placement, even when the saved backend differs.
         for group in checkpoint["opt"]["param_groups"]:
@@ -728,6 +766,8 @@ def main():
         raise ValueError(f"data.student_augment / data.local_augment keys must be a subset of {sorted(aug_keys)}")
     if "student_augment" in cfg["data"]:
         student_augment = StudentAugment(cfg["data"], **cfg["data"]["student_augment"]).to(device)
+    # data.independent_views (needs train.gpu_augment): student copies get their own GPUAugment draw from the raw crop instead of the teacher's pixels.
+    independent_views = bool(cfg["data"].get("independent_views", False))
     if "local_augment" in cfg["data"]:
         local_augment = StudentAugment(cfg["data"], **cfg["data"]["local_augment"]).to(device)
     train_ds = TCGATileDataset(cfg, is_train=True)
@@ -748,7 +788,9 @@ def main():
     # train.site_batches instead draws every batch from a single site (exclusive with unique_slide_batches: no site has 512 slides).
     if train_cfg["site_balance"] > 0 and not train_cfg["unique_slide_batches"] or train_cfg["site_batches"] and train_cfg["unique_slide_batches"]:
         raise ValueError("train.site_balance > 0 requires train.unique_slide_batches: true, and train.site_batches excludes it")
-    batch_sampler = (UniqueSlideBatchSampler(train_ds.slide_of, train_ds.site_of, batch_size, train_cfg["seed"], float(train_cfg["site_balance"])) if train_cfg["unique_slide_batches"]
+    # train.batch_indices replays an offline [steps, batch_size] .npy of dataset positions in order, overriding both; resume skips batches already trained.
+    batch_sampler = (np.load(train_cfg["batch_indices"])[examples_seen // batch_size :].tolist() if train_cfg.get("batch_indices")
+                     else UniqueSlideBatchSampler(train_ds.slide_of, train_ds.site_of, batch_size, train_cfg["seed"], float(train_cfg["site_balance"])) if train_cfg["unique_slide_batches"]
                      else SiteBatchSampler(train_ds.site_of, batch_size, train_cfg["seed"]) if train_cfg["site_batches"] else None)
     train_loader = (DataLoader(train_ds, shuffle=True, **loader_kwargs) if batch_sampler is None
                     else DataLoader(train_ds, batch_sampler=batch_sampler, **{k: v for k, v in loader_kwargs.items() if k not in ("batch_size", "drop_last")}))
@@ -776,7 +818,7 @@ def main():
         payload = {"model": cpu_state(student_backbone), "model_ema": cpu_state(teacher_backbone), "step": next_step, "config": cfg}
         if not full:
             return payload
-        return {**payload, "dino_head": cpu_state(student_dino_head), "dino_head_ema": cpu_state(teacher_dino_head), "predictor": cpu_state(student_predictor), "bias_mlp": cpu_state(bias_mlp), "center": center.cpu(),
+        return {**payload, "dino_head": cpu_state(student_dino_head), "dino_head_ema": cpu_state(teacher_dino_head), "predictor": cpu_state(student_predictor), "bias_mlp": cpu_state(bias_mlp), "prior_mlp": cpu_state(prior_mlp), "center": center.cpu(),
                 "opt": opt.state_dict(), "muon": [o.state_dict() for o in opts[1:]], "examples_seen": examples_seen,
                 "visible_patch_presentations": visible_patch_presentations, "train_flops": train_flops, "wandb": wandb_meta}
 
@@ -816,15 +858,23 @@ def main():
             masks, mask_idx, mask_w = make_block_mask(n_crops, global_grid, device, int(jepa_cfg["blocks"]), float(jepa_cfg["block_scale"]))
             return {}, [{"count": 1, "keep": None, "q_pos": mask_idx, "masks": masks, "mask_w": mask_w}]
         if jepa_type == "window":
-            tc, ar = torch.randint(global_grid - t_side + 1, (n_crops, 2), device=device), torch.arange(t_side, device=device)
+            # student_frame: false shares one layout (teacher corner + one corner per student copy) across the batch, so a copy's window column
+            # is the same master-crop position in every image; masks and targets stay per image. Every global crop (master first, then a
+            # teacher-only extra) gets its own independent teacher corner, so the two teacher views don't share position embeddings.
+            shared, m = not jepa_cfg["student_frame"], n_crops // train_cfg["global_views"]
+            draws = train_cfg["global_views"] if shared else n_crops
+            tc = torch.randint(global_grid - t_side + 1, (draws, 1, 2), device=device).expand(-1, n_crops // draws, -1).flatten(0, 1)
+            ar = torch.arange(t_side, device=device)
             idx_t = ((tc[:, :1, None] + ar[:, None]) * global_grid + tc[:, 1:, None] + ar).flatten(1)
-            slot = torch.full((n_crops, global_patches), -1, dtype=torch.long, device=device).scatter_(1, idx_t, torch.arange(t_side ** 2, device=device).expand(n_crops, -1))
+            # Student windows, targets and slots only concern the master crop's teacher window (the first m rows).
+            slot = torch.full((m, global_patches), -1, dtype=torch.long, device=device).scatter_(1, idx_t[:m], torch.arange(t_side ** 2, device=device).expand(m, -1))
             groups = []
-            for side, count, n_keep, min_overlap, k in student_views:
-                win, kept, t_col = make_window_idx(tc.repeat(count, 1), global_grid, t_side, side, n_keep, min_overlap, k)
+            for side, count, mask_side, min_overlap, k in student_views:
+                win, kept, t_col = make_window_idx(tc[:m].repeat(count, 1), global_grid, t_side, side, mask_side, min_overlap, k, count if shared else m * count)
                 masks = torch.zeros(len(win), global_patches, dtype=torch.bool, device=device).scatter_(1, win, True).scatter_(1, kept, False)
-                groups.append({"count": count, "win": win, "keep": win, "masks": masks, "t_col": t_col, "t_tok": slot.repeat(count, 1).gather(1, win.gather(1, t_col))})
-            return {"keep_idx": idx_t, "pos_idx": to_frame(idx_t, tc)}, groups
+                groups.append({"count": count, "win": win, "keep": win, "masks": masks, "t_col": t_col, "t_tok": slot.repeat(count, 1).gather(1, win.gather(1, t_col)),
+                               "t_msk": masks.gather(1, win.gather(1, t_col))})  # whether each target was masked for the student
+            return {"keep_idx": idx_t}, groups  # the teacher window always keeps its master-crop grid positions
         draws = [make_region_idx(n_crops * count, global_grid, device, n, side, int(jepa_cfg["targets"]), float(jepa_cfg["target_decay"]), int(jepa_cfg["visible_targets"])) for n, side, count in context_regions]
         keep, q_pos = (torch.cat(x) for x in zip(*draws))
         return {}, [{"count": total_regions, "keep": keep, "q_pos": q_pos}]
@@ -842,15 +892,22 @@ def main():
     # patches). KDE, isotropy, the cls_inv term and the JEPA context_cls stay on the final CLS.
     head_in = {"cls": lambda o: o["cls_layers"], "patch_mean": lambda o: o["patches"].mean(1)}[dino_cfg["head_input"]]
 
-    def compute_losses(gf, lf, b, mask_groups, t_temp, k_scale, warmup, ckpt=False):
+    def compute_losses(gf, lf, b, mask_groups, t_temp, k_scale, warmup, ckpt=False, graw=None):
         teacher_kw, groups = mask_groups
         # V teacher views per image: the two globals, or one window for jepa window (whose CLS terms then pair every student view with it).
-        V = train_cfg["global_views"]
+        V = 1 if jepa_type == "window" else train_cfg["global_views"]
         # Tensor schedule values do not specialize Sinkhorn to each temperature.
         t_temp = torch.tensor(t_temp, device=gf.device)
         with torch.no_grad():
             t = teacher_backbone(gf, tap=bias_layer, **teacher_kw)
             t_out = teacher_dino_head(head_in(t))
+            if jepa_type == "window":
+                # One stacked teacher pass over the master window and any teacher-only extra crops' windows (own corners, same teacher_side^2
+                # patches). CLS targets (head outputs, backbone CLS) and the bias tap average all the views; the tap average is only read as
+                # its CLS or patch mean, so the bias input weights every view equally. JEM targets stay on the master window.
+                avg = lambda x: x.view(-1, b, *x.shape[1:]).mean(0)
+                t_out = [avg(x) for x in t_out]
+                t = {"cls": avg(t["cls"]), "patches": t["patches"][:b], "tap": avg(t["tap"]) if bias_cfg else None}
             t_cls = t_out[head_out].chunk(V)
             # Invariance targets per image: layer-normed mean of the teacher's views, for the backbone CLS and the raw head output.
             t_inv = [ln_flat(x.view(V, b, *x.shape[1:]).mean(0)) for x in (t["cls"], t_out[2])]
@@ -858,40 +915,46 @@ def main():
             t_swap = torch.cat(t_cls[::-1])  # each global slot targets the other global's teacher (a lone teacher window targets every view)
             if balance_type == "sinkhorn":
                 t_prob = sinkhorn_fn(t_swap, t_temp)
+            elif mse:  # LeJEPA target: mean of the teacher views' raw outputs, in every global slot
+                t_prob = torch.stack(t_cls).mean(0).repeat(V, 1, 1)
             elif balance_type == "simdino":
                 t_prob = t_swap
-            elif balance_type == "sigreg":  # LeJEPA target: mean of the teacher views' raw outputs, in every global slot
-                t_prob = torch.stack(t_cls).mean(0).repeat(V, 1, 1)
             else:  # memax never moves the center off 0, leaving the plain sharpened softmax
                 t_prob = F.softmax((t_swap.float() - center) / t_temp, dim=-1)
             # Update after use, as in DINO; evaluate() puts the student in eval mode, so val batches never move the center.
             if balance_type == "center" and student_backbone.training:
                 center.lerp_(t_swap.float().mean(0), 0.1)
             t_prob = t_prob.view(V, b, *t_cls[0].shape[1:])
+        gf = gf[:b] if jepa_type == "window" else gf  # students only ever cut windows from the master crop
         L, R, D = train_cfg["local_views"], total_regions, student_backbone.embed_dim
         S = V * R + L  # student view slots per image: every global copy of every teacher view, plus the locals
         # Each context region is one more student-teacher pair, so DINO's multi-crop mean is over V(R + L) pairs (a local pairs with every
-        # teacher view); SIGReg's single shared target makes each view one slot, as in LeJEPA, so its mean is over the S slots.
-        n_pairs = S if balance_type == "sigreg" else V * (R + L)
-        global_loss, jepa_loss, kde, iso, decorr, bal, p_sum, view_inv, sac, jem_bal, jem_ent = 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0
+        # teacher view); MSE's single shared target makes each view one slot, as in LeJEPA, so its mean is over the S slots.
+        n_pairs = S if mse else V * (R + L)
+        global_loss, jepa_loss, kde, iso, decorr, bal, p_sum, view_inv, sac, jem_bal, jem_ent, jem_dec = 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0
+        jem_img, jem_prior_ce, jem_prior_kl, kde_tok, cls_decorr, tok_std = 0.0, 0.0, 0.0, 0.0, 0.0, 0.0
         # Per-slot MSE of each student view to its image's t_inv target, as [backbone CLS, raw head output], averaged over the S view slots.
         inv_mse = lambda cls, raw, reps: torch.stack([(ln_flat(s) - y.repeat(reps, 1)).square().mean() for s, y in zip((cls, raw), t_inv)]) * reps / S
         # Bias branch, once per image from the teacher's clean view taps (gradient-free, so it never trains a backbone): each view's prediction
         # trains bias_mlp, and their mean b_bar is the per-image offset added (detached) to every student slot, so the main head's residual
         # target t - b_bar is the same for all views of an image; zeros when off.
-        bias_views = (bias_mlp(t["tap"][:, 0] if bias_cfg["input"] == "cls" else t["tap"][:, 1 + teacher_backbone.registers :].mean(1)).float() if bias_cfg
+        bias_views = (bias_mlp(t["tap"][:, :n_cls].flatten(1) if bias_cfg["input"] == "cls" else t["tap"][:, n_cls + teacher_backbone.registers :].mean(1)).float() if bias_cfg
                       else t_bias.new_zeros(V * b, t_bias.shape[1]))
         b_bar = bias_views.detach().view(V, b, -1).mean(0)
         # SACReg per batch of distinct images for each of [backbone CLS, main-only raw head output], averaged over view slots.
         slot_sac = lambda zs, n: torch.stack([sum(sacreg(x.flatten(1)) for x in z.chunk(n)) for z in zs]) / S
         # Summed student softmax over the batch (F, K); detached unless memax trains on it, so a 131k-prototype head keeps no softmax graph.
         anchor_probs = lambda x: F.softmax((x if balance_type == "memax" else x.detach()).float() / student_temp, dim=-1).sum(0)
-        # Student-vs-teacher CLS term: MSE on raw head outputs for sigreg, else DINO CE (cosine for simdino).
-        cls_loss = (lambda s, y: (s.float() - y.float()).square().mean()) if balance_type == "sigreg" else (lambda s, y: dino_ce_fn(s, y, student_temp))
+        # Student-vs-teacher CLS term: MSE on raw head outputs for sigreg and simdino mse, else DINO CE (cosine for simdino).
+        cls_loss = (lambda s, y: (s.float() - y.float()).square().mean()) if mse else (lambda s, y: dino_ce_fn(s, y, student_temp))
         for g in groups:
             count, keep_idx, masks = g["count"], g["keep"], g.get("masks")
-            # Each region copy draws its own student noise; the teacher and JEPA targets stay on the clean crop.
-            sv = student_augment(gf if count == 1 else gf.repeat(count, 1, 1, 1), b)
+            # Each region copy draws its own student noise on the teacher's pixels or, given the raw crops graw (data.independent_views),
+            # its own full GPUAugment pass, so teacher and every student copy see independent photometric augmentations.
+            src = gf if count == 1 else gf.repeat(count, 1, 1, 1)
+            if graw is not None:
+                src = augment(graw.transpose(0, 1).flatten(0, 1)[: len(gf)].repeat(count, 1, 1, 1)[:, None])[:, 0]
+            sv = student_augment(src, b)
             inv = None
             if dihedral > 0:
                 # Element e of D4 (rot90 by e % 4, then a flip when e >= 4) per copy; 224 px = 16 x 16 whole patches, so it permutes patches exactly.
@@ -906,7 +969,7 @@ def main():
                 keep_idx = None if keep_idx is None else inv.gather(1, keep_idx)
                 masks = None if masks is None else torch.zeros_like(masks).scatter_(1, inv, masks)
             origin, pos_idx = None, None
-            if jepa_type == "window":
+            if jepa_type == "window" and jepa_cfg["student_frame"]:
                 # A window's frame origin is its top-left in the student's (possibly rotated) view; windows never wrap, so it's the min row/col.
                 win = g["win"] if inv is None else inv.gather(1, g["win"])
                 origin = torch.stack([win // global_grid, win % global_grid], 2).amin(1)
@@ -938,8 +1001,9 @@ def main():
                 jepa = jepa_loss_fn(patch_prediction, patch_target, g["mask_w"]) / max(1, b * V)
             elif jepa_type == "window":
                 # No predictor: masked window patches entered the encoder as mask_token, so its own output tokens at the targets are the predictions.
+                # pred keeps every window token (the jem regularizer uses them all); the losses pick the t_col target columns below.
                 # Teacher tokens are gathered per copy chunk by their slot in the teacher window, so they're never duplicated count times.
-                pred = sg["patches"].gather(1, g["t_col"][..., None].expand(-1, -1, D))
+                pred = sg["patches"]
                 patch_target = torch.cat([t["patches"].gather(1, m[..., None].expand(-1, -1, D)) for m in g["t_tok"].chunk(count)])
             else:
                 # Only a random predict_regions of the count copies (same picks for every image) run the predictor, so its activations scale with
@@ -955,39 +1019,74 @@ def main():
                 query_idx = q_pos if inv is None else inv.gather(1, q_pos)
                 query_idx = query_idx if origin is None else to_frame(query_idx, origin)  # own-frame views: queries shift with their copy's patches
                 queries = query_table.expand(q_pos.shape[0], -1, -1).gather(1, query_idx[..., None].expand(-1, -1, D))
-                context_cls = {"student": sg["cls"], "teacher": t["cls"].repeat(count, 1), "none": None}[jepa_cfg["context_cls"]]
-                context = pick(torch.cat([*([] if context_cls is None else [context_cls[:, None]]), *([sg["registers"]] if jepa_cfg["context_registers"] else []), sg["patches"]], dim=1))
+                context_cls = {"student": sg["cls_tokens"], "teacher": t["cls"].repeat(count, 1).unflatten(1, (n_cls, -1)), "none": None}[jepa_cfg["context_cls"]]
+                context = pick(torch.cat([*([] if context_cls is None else [context_cls]), *([sg["registers"]] if jepa_cfg["context_registers"] else []), sg["patches"]], dim=1))
                 pred = student_predictor(context, queries)
             # The prediction mechanism for cross/window: (pred, patch_target) are the student's predictions and the teacher's raw output tokens.
             if keep_idx is not None:
+                # Window targets are the t_col columns of its (N, side^2, ...) tokens; cross predictions are already one row per target.
+                take = (lambda x: x) if jepa_type != "window" else lambda x: x.gather(1, g["t_col"].view(*g["t_col"].shape, *[1] * (x.dim() - 2)).expand(-1, -1, *x.shape[2:]))
                 if not jem:
-                    jepa = F.smooth_l1_loss(pred, F.layer_norm(patch_target, (D,)))
+                    per = F.smooth_l1_loss(take(pred), F.layer_norm(patch_target, (D,)), reduction="none").mean(-1).flatten()
                 else:
                     # JEM: student patch head on predictions vs its EMA copy on the teacher tokens, per-factor prototype CE. sinkhorn uses the DINO
-                    # temperatures rescaled to the patch codebook; mi fixes both student and teacher at 0.1 (the mi term sharpens instead).
-                    s_pl = student_dino_head.patch_head(pred.flatten(0, 1))[0]
-                    s_temp = 0.1 * jem_scale if jem_sinkhorn else 0.1
+                    # temperatures rescaled to the patch codebook; mi fixes both student and teacher at 0.1, residual at its temp (the mi term sharpens instead).
+                    s_all = student_dino_head.patch_head(pred.flatten(0, 1))[0].unflatten(0, pred.shape[:-1])
+                    s_pl = take(s_all).flatten(0, -3)
+                    s_temp = 0.1 * jem_scale if jem_sinkhorn else jem_temp
                     with torch.no_grad():
                         t_pl = teacher_dino_head.patch_head(patch_target.flatten(0, 1))[0]
-                        q = sinkhorn_fn(t_pl, t_temp / temp_scale * jem_scale) if jem_sinkhorn else F.softmax(t_pl.float() / 0.1, dim=-1)
-                    jepa = dino_ce_fn(s_pl, q, s_temp)
-                    # Entropy of the batch-mean prediction (high = codes in use) and mean per-patch entropy (low = confident codes), summed over factors;
-                    # their difference is the mi regularizer, logged as a diagnostic under sinkhorn (where it gets no gradient).
-                    p = F.softmax((s_pl.detach() if jem_sinkhorn else s_pl).float() / s_temp, dim=-1)
-                    h_mean = -(p.mean(0) * p.mean(0).clamp_min(1e-12).log()).sum()
-                    jem_bal = jem_bal + (-(p * p.clamp_min(1e-12).log()).sum(-1).mean(0).sum() - h_mean) * count / R
-                    jem_ent = jem_ent + h_mean.detach() * count / R
+                        q = sinkhorn_fn(t_pl, t_temp / temp_scale * jem_scale) if jem_sinkhorn else F.softmax(t_pl.float() / jem_temp, dim=-1)
+                    if jem_prior:
+                        # CLS prior c: raw MLP output on the patch prototypes, fit to each row's mean target code mix (the best constant under CE); both inputs are detached, so this CE trains only prior_mlp.
+                        protos = F.normalize(student_dino_head.patch_head.prototypes.detach(), dim=-1).view(s_all.shape[2], s_all.shape[3], -1)
+                        c = torch.einsum("bfd,fkd->bfk", prior_mlp(sg["cls"].detach()).view(len(pred), protos.shape[0], -1), protos)
+                        jem_prior_ce = jem_prior_ce + dino_ce_fn(c, q.unflatten(0, patch_target.shape[:2]).mean(1), s_temp) * count / R
+                        log_c = F.log_softmax(c.float() / s_temp, dim=-1)
+                        jem_prior_kl = jem_prior_kl + (log_c.exp() * (log_c + math.log(log_c.shape[-1]))).sum((-2, -1)).mean().detach() * count / R
+                        # Multiplying softmax(s) by softmax(c) adds logits, so the patch logits s converge to log(q / q_mean): only what differs from the image.
+                        s_pl = s_pl + c.detach().repeat_interleave(patch_target.shape[1], 0)
+                    per = -(q * F.log_softmax(s_pl.float() / s_temp, dim=-1)).sum((-2, -1))  # one CE per target
+                    # Marginal entropy (high = codes in use) minus mean per-patch entropy (low = confident codes), summed over factors, is the mi
+                    # regularizer (a diagnostic under sinkhorn, where it gets no gradient). Window: every window token, with the marginal taken per
+                    # position and its entropy averaged uniformly, so mapping position to code earns nothing. Positions are student-frame ones (columns
+                    # sorted by pos_idx, pooled over copies) or, with the batch-shared layout, each copy's columns (rows become images, positions
+                    # become (copy, column)). Cross: one marginal pooled over all targets.
+                    p = F.softmax(s_all.float() / s_temp, dim=-1)
+                    # Code mix over a row's tokens: a whole image on one code scores 0, the case the per-position marginal below can't penalize. Uses s alone, without the prior.
+                    jem_img = jem_img - (p.mean(1) * p.mean(1).clamp_min(1e-12).log()).sum((-2, -1)).mean() * count / R
+                    p = (p.flatten(0, 1).unsqueeze(1) if jepa_type != "window" else p.unflatten(0, (count, -1)).transpose(0, 1).flatten(1, 2) if pos_idx is None
+                         else p.gather(1, pos_idx.argsort(1)[..., None, None].expand_as(p)))
+                    h_m = -(p.mean(0) * p.mean(0).clamp_min(1e-12).log()).sum(-1)  # (positions, F) marginal entropy per factor
+                    pb, h_f = (p.detach(), h_m.detach()) if jem_sinkhorn else (p, h_m)
+                    jem_bal = jem_bal + (-(pb * pb.clamp_min(1e-12).log()).sum(-1).mean((0, 1)).sum() - h_f.sum(-1).mean()) * count / R
+                    jem_ent = jem_ent + h_f.sum(-1).mean().detach() * count / R
+                    # Cross-factor decorrelation (trained under either balance): mutual information between each factor pair's code assignments at
+                    # the same position, I(A; B) = H(A) + H(B) - H(A, B) with joint mean_n p_A outer p_B (positions, K, K); 0 = independent splits.
+                    h_joint = lambda J: -(J * J.clamp_min(1e-12).log()).sum((-2, -1))
+                    pair_mi = lambda i, j: h_m[:, i] + h_m[:, j] - h_joint(torch.einsum("npa,npb->pab", p[:, :, i], p[:, :, j]) / len(p))
+                    pairs = [(i, j) for i in range(p.shape[2]) for j in range(i + 1, p.shape[2])]
+                    jem_dec = jem_dec + sum((pair_mi(i, j).mean() for i, j in pairs), p.new_zeros(())) / max(1, len(pairs)) * count / R
+                # Window: weighted means over masked and visible targets (a side with no targets adds 0); cross: plain mean over its targets.
+                msk = g["t_msk"].flatten() if jepa_type == "window" else None
+                jepa = (per.mean() if msk is None else masked_weight * (per * msk).sum() / msk.sum().clamp_min(1)
+                        + (1 - masked_weight) * (per * ~msk).sum() / (~msk).sum().clamp_min(1))
             jepa_loss = jepa_loss + jepa * count / R
-            kde = kde + dino_cfg["kde_loss_weight"] * k_scale * sum(kde_loss(x, dino_cfg["kde_concentration"], dino_cfg["kde_radius"]) for x in sg["cls"].chunk(train_cfg["global_views"] * count)) / R
+            kde = kde + dino_cfg["kde_loss_weight"] * k_scale * sum(kde_loss(x, dino_cfg["kde_concentration"], dino_cfg["kde_radius"]) for x in sg["cls"].chunk(V * count)) / R
+            if n_cls > 1:
+                # Multi-CLS: every token also spreads its own images (same weight and ramp), and token pairs pay their cross-correlation.
+                kde_tok = kde_tok + dino_cfg["kde_loss_weight"] * k_scale * sum(kde_loss(z, dino_cfg["kde_concentration"], dino_cfg["kde_radius"]) for x in sg["cls_tokens"].chunk(V * count) for z in x.unbind(1)) / (n_cls * R)
+                cls_decorr = cls_decorr + sum(factor_decorrelation(x) for x in sg["cls_tokens"].chunk(V * count)) / (V * R)
+                tok_std = sg["cls_tokens"].detach().float().std(0).mean(-1).min()
             # Isotropy acts on backbone CLS, in front of the DINO head, so the head can still collapse its bottleneck for prototype matching.
-            iso = iso + sum(isotropy_loss(x) for x in sg["cls"].chunk(train_cfg["global_views"] * count)) / (train_cfg["global_views"] * R)
+            iso = iso + sum(isotropy_loss(x) for x in sg["cls"].chunk(V * count)) / (V * R)
             # Factor decorrelation acts on the head's per-factor bottleneck chunks, per batch of distinct images, so factored codebooks stop copying each other.
-            decorr = decorr + sum(factor_decorrelation(x) for x in s_chunks.chunk(train_cfg["global_views"] * count)) / (train_cfg["global_views"] * R)
+            decorr = decorr + sum(factor_decorrelation(x) for x in s_chunks.chunk(V * count)) / (V * R)
             # Balance term per batch of distinct images: SimDINO's negative coding rate, SIGReg (summed here, averaged below), else ME-MAX's predictions.
-            if head_out == 1:
-                bal = bal + sum(-coding_rate(z) for z in s_chunks.chunk(train_cfg["global_views"] * count)) / (train_cfg["global_views"] * R)
-            elif head_out == 2:
-                bal = bal + sum(sigreg(z.flatten(1), sigreg_slices) for z in s_raw.chunk(train_cfg["global_views"] * count))
+            if balance_type == "simdino":
+                bal = bal + sum(-coding_rate(z) for z in (s_raw if mse else s_chunks).chunk(V * count)) / (V * R)
+            elif balance_type == "sigreg":
+                bal = bal + sum(sigreg(z.flatten(1), sigreg_slices) for z in s_raw.chunk(V * count))
             else:
                 p_sum = p_sum + anchor_probs(s_logits)
         local_loss = 0.0
@@ -998,13 +1097,13 @@ def main():
             sl_cls = (sl_logits, sl_chunks, sl_sum)[head_out]
             view_inv = view_inv + inv_mse(sl_backbone["cls"], sl_sum, L)
             sac = sac + slot_sac((sl_backbone["cls"], sl_raw), L)
-            # CE is linear in targets, so compiled recipes sum the two teacher targets; sigreg's two target slots hold the same center, so each
+            # CE is linear in targets, so compiled recipes sum the two teacher targets; MSE's two target slots hold the same center, so each
             # local is one MSE to it. Eager recipes keep the original reduction order.
-            local_loss = (cls_loss(sl_cls.view(L, b, *sl_cls.shape[1:]), t_prob[0]) * L if balance_type == "sigreg"
+            local_loss = (cls_loss(sl_cls.view(L, b, *sl_cls.shape[1:]), t_prob[0]) * L if mse
                           else dino_ce_fn(sl_cls.view(L, b, *sl_cls.shape[1:]), t_prob.sum(0), student_temp) * L if train_cfg["compile"]
                           else sum(cls_loss(x, y) for x in sl_cls.chunk(L) for y in t_prob)) / n_pairs
             p_sum = p_sum if head_out else p_sum + anchor_probs(sl_cls)
-        if head_out == 2:
+        if balance_type == "sigreg":
             # SIGReg is averaged over every student view slot: each global region copy and each local crop.
             bal = (bal + (0.0 if lf is None else sum(sigreg(z.flatten(1), sigreg_slices) for z in sl_raw.chunk(L)))) / S
         if not head_out:
@@ -1014,11 +1113,20 @@ def main():
         # A ratio divides the invariance MSE by the target's across-image variance, so 0 = fully view-invariant and ~2 = no closer than a
         # random image, comparable between the backbone CLS and the head.
         view_inv = torch.cat([view_inv, view_inv / torch.stack([y.var(0).mean() for y in t_inv])])
+        # JEM prototype KDE: batch-independent repulsion within each factor's codebook (rows are grouped by factor, as in FactoredDINOHead).
+        ph = student_dino_head.patch_head if jem else None
+        jem_kde = sum(kde_loss(p, jem_kde_conc, 0.0) for p in ph.prototypes.unflatten(0, (ph.factors, -1))) / ph.factors if jem else 0.0
         out = {"dino": local_loss + global_loss, "jepa": jepa_loss, "kde": kde, "iso": iso, "decorr": decorr, "balance": bal,
                **dict(zip(("cls_inv", "head_inv", "cls_inv_ratio", "head_inv_ratio"), view_inv)),
                **dict(zip(("sac_cls", "sac_head"), sac)),
-               # jem_balance: mean per-patch entropy - entropy of the mean (the mi term); jem_entropy: entropy of the mean (low = code collapse).
-               **({"jem_balance": jem_bal, "jem_entropy": jem_ent} if jem else {})}
+               # jem_balance: mean per-patch entropy - entropy of the mean (the mi term); jem_entropy: entropy of the mean (low = code collapse);
+               # jem_decorr: cross-factor assignment MI (high = factors duplicate each other); jem_image_entropy: code mix within an image (low = image-level codes);
+               # jem_kde: prototype crowding (lower = codes more spread).
+               **({"jem_balance": jem_bal, "jem_entropy": jem_ent, "jem_decorr": jem_dec, "jem_image_entropy": jem_img, "jem_kde": jem_kde} if jem else {}),
+               # jem_prior_ce: the prior's CE to the mean target code mix; jem_prior_kl: its KL from uniform (near 0 = the prior has faded).
+               **({"jem_prior_ce": jem_prior_ce, "jem_prior_kl": jem_prior_kl} if jem_prior else {}),
+               # Multi-CLS: per-token KDE, mean pairwise cross-correlation (cls_decorr), and the smallest per-token batch std of the last global view group (near 0 = a dead token).
+               **({"kde_tokens": kde_tok, "cls_decorr": cls_decorr, "cls_token_std_min": tok_std} if n_cls > 1 else {})}
         # Bias branch losses on the teacher's views, reaching only bias_mlp: MSE to the per-image target and SACReg per view batch.
         # bias_r2: fraction of the target's across-image variance it explains (1 = all, 0 = no better than the mean).
         if bias_cfg:
@@ -1027,9 +1135,10 @@ def main():
         # Isotropy, factor decorrelation, CLS invariance and CLS SACReg ramp in with LR warmup so they don't reshape the pretrained space before
         # the LR is live; the balance term is the DINO head's anti-collapse mechanism, so it is on from step 0, as is JEM's mi term.
         sw = dino_cfg["sacreg"]
-        out["total"] = (out["dino"] + jepa_loss + kde + balance_weight * bal + sw["head"] * sac[1] + (jem_mi * jem_bal if jem else 0.0)
+        out["total"] = (out["dino"] + jepa_loss + kde + kde_tok + balance_weight * bal + sw["head"] * sac[1] + (jem_mi * jem_bal - jem_image * jem_img + jem_prior_ce + jem_kde_weight * jem_kde if jem else 0.0)
                         + (out["bias_mse"] + sw["bias"] * out["sac_bias"] if bias_cfg else 0.0)
-                        + warmup * (dino_cfg["iso_loss_weight"] * iso + decorr_weight * decorr + dino_cfg["cls_inv_weight"] * out["cls_inv"] + sw["cls"] * sac[0]))
+                        + warmup * (dino_cfg["iso_loss_weight"] * iso + decorr_weight * decorr + cls_decorr_weight * cls_decorr + dino_cfg["cls_inv_weight"] * out["cls_inv"] + sw["cls"] * sac[0]
+                                    + (jem_decorr_weight * jem_dec if jem else 0.0)))
         return out
 
     # Held-out validation pass: same DINO + JEPA + KDE + isotropy + decorrelation losses on `val_batches` of the val split.
@@ -1047,8 +1156,9 @@ def main():
                 break
             gf, lf = load_views(vbatch, "global_views"), load_views(vbatch, "local_views")
             b = vbatch["global_views"].shape[0]
+            graw = vbatch["global_views"].to(device) if independent_views else None
             with torch.no_grad(), autocast:  # warmup 1: val totals always weight the ramped terms fully
-                losses = compute_losses(gf, lf, b, draw_masks(b * train_cfg["global_views"]), eval_teacher_temp, eval_kde_scale, 1.0)
+                losses = compute_losses(gf, lf, b, draw_masks(b * train_cfg["global_views"]), eval_teacher_temp, eval_kde_scale, 1.0, graw=graw)
             sums = {k: sums.get(k, 0.0) + float(v) for k, v in losses.items()}
             n_batches += 1
         random.setstate(py_rng)
@@ -1119,7 +1229,8 @@ def main():
             for key, batch_key in (("sample", "sample_idx"), ("slide", "slide_id"), ("patient", "patient_id")):
                 pending_ids[key].update(int(x) for x in batch[batch_key].tolist())
             gf, lf = load_views(batch, "global_views"), load_views(batch, "local_views")
-            visible_now = batch_size * (train_cfg["global_views"] * visible_global_patches + train_cfg["local_views"] * local_patches)
+            graw = batch["global_views"].to(device, non_blocking=True) if independent_views else None
+            visible_now = batch_size * ((1 if jepa_type == "window" else train_cfg["global_views"]) * visible_global_patches + train_cfg["local_views"] * local_patches)
             # dino.schedule_progress drives every schedule below: `samples` runs each over the full sample budget, while `pace` keeps the
             # legacy sample progress at the block baseline's FLOP pace (0.1862 of the budget at the 1M cap), so FLOP-cheaper architectures
             # share one trajectory and the arcs deliberately stop early. Real FLOPs still enforce the cap either way.
@@ -1150,7 +1261,8 @@ def main():
                 probe_views = [None if v is None else v.view(-1, batch_size, *v.shape[1:])[:, :probe_b].flatten(0, 1) for v in (gf, lf)]
                 with FlopCounterMode(display=False) as probe_ctx, torch.compiler.set_stance("force_eager"):
                     with autocast:
-                        probe_loss = compute_losses(*probe_views, probe_b, draw_masks(probe_b * train_cfg["global_views"]), teacher_temp, kde_scale, warmup, ckpt=activation_checkpointing)["total"]
+                        probe_loss = compute_losses(*probe_views, probe_b, draw_masks(probe_b * train_cfg["global_views"]), teacher_temp, kde_scale, warmup, ckpt=activation_checkpointing,
+                                                    graw=None if graw is None else graw[:probe_b])["total"]
                     probe_loss.backward()
                 for o in opts:
                     o.zero_grad(set_to_none=True)
@@ -1158,7 +1270,7 @@ def main():
                 torch.random.set_rng_state(rng[1])
                 torch.cuda.set_rng_state(rng[2], device)
             with autocast:
-                losses = compute_losses(gf, lf, batch_size, mask_groups, teacher_temp, kde_scale, warmup, ckpt=activation_checkpointing)
+                losses = compute_losses(gf, lf, batch_size, mask_groups, teacher_temp, kde_scale, warmup, ckpt=activation_checkpointing, graw=graw)
             for o in opts:
                 o.zero_grad(set_to_none=True)
             losses["total"].backward()
@@ -1228,7 +1340,7 @@ def main():
                     "teacher_temp": teacher_temp,
                     "teacher_momentum": m,
                     "kde_scale": kde_scale,
-                    "cls_participation_ratio": student_backbone.embed_dim / (reduced["iso"] + 1),  # batch-capped at 127 for 128 images
+                    "cls_participation_ratio": student_backbone.embed_dim * n_cls / (reduced["iso"] + 1),  # batch-capped at 127 for 128 images
                     "batch_size": batch_size,
                     "examples_seen": examples_seen,
                     "visible_patch_presentations": visible_patch_presentations,
@@ -1330,6 +1442,7 @@ def main():
         "lr": dino_cfg["lr"],
         "schedule_progress": dino_cfg["schedule_progress"],
         "adam_beta2": dino_cfg["adam_beta2"],
+        "muon_momentum": dino_cfg["muon_momentum"],
         "kde_loss_weight": dino_cfg["kde_loss_weight"],
         "kde_concentration": dino_cfg["kde_concentration"],
         "kde_radius": dino_cfg["kde_radius"],
@@ -1349,6 +1462,7 @@ def main():
         "cls_specialization": cls_spec,
         "block_expansion": expansion,
         "extra_registers": cfg["model"]["extra_registers"],
+        "cls_tokens": cls_tok,
         "probe_target_samples": probe_targets,
         "probe_target_fractions": [None if max_train_samples == 0 else target / max_train_samples for target in probe_targets],
         **({} if probe_state is None else completed_probe_summary(output_dir)),
